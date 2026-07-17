@@ -1,12 +1,17 @@
 {
   "name": "SerenityDev",
   "displayName": "Serenity Dev",
-  "description": "Local Python Agent interface running on llama.cpp with Ollama backend.",
+  "description": "Local Python Agent interface running on llama.cpp with llama-server backend.",
   "version": "0.0.1",
   "publisher": "GhostHeartZer0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GhostHeartZer0/SerenityDev.git"
+  },
   "icon": "serenity_icon.png",
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.107.0",
+    "Antigravity IDE": "^2.0.0"
   },
   "categories": [
     "Other"
@@ -18,7 +23,25 @@
       {
         "id": "serenitydev.assistant",
         "name": "serenity",
-        "description": "SerenityDev Agent Core"
+        "description": "SerenityDev Agent Core",
+        "commands": [
+          {
+            "name": "explore",
+            "description": "Read-only exploration of the codebase to understand the query"
+          },
+          {
+            "name": "plan",
+            "description": "Formulate a detailed execution plan without changing files"
+          },
+          {
+            "name": "execute",
+            "description": "Modify files and apply code updates based on the prompt"
+          },
+          {
+            "name": "agent",
+            "description": "Autonomous multi-agent execution on an as-needed basis"
+          }
+        ]
       }
     ],
     "languageModelChatProviders": [
@@ -51,7 +74,17 @@
         "command": "serenity.showMenu",
         "title": "Serenity: Open Server Status Control Panel"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Serenity Dev",
+      "properties": {
+        "serenitydev.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to the Python interpreter used to run the Serenity server."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -71,9 +104,10 @@
     "axios": "^1.6.0"
   },
   "devDependencies": {
-    "@types/vscode": "^1.120.0",
+    "@types/vscode": "^1.107.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
+    "@types/Antigravity IDE": "^2.0.0",
     "typescript-eslint": "^8.56.1",
     "eslint": "^9.39.3",
     "esbuild": "^0.27.3",
