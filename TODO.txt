@@ -1,0 +1,183 @@
+Created At: 2026-07-17T20:37:54Z
+Last Updated: 2026-07-17T20:39:00Z
+File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
+
+=========================================
+ACTIVE TODO ITEMS & PRIORITIES
+=========================================
+
+[Done] 1. resolve llm output is massdumping instead of streaming response.
+   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.]
+
+[Done] 2. kv cache compression settings (add to UI and verify it works / changes)
+
+[Done] 3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq
+
+[Done] 4. implement terminal command whitelist / blacklist filtering in devserver for run_command:
+   Allowed commands (true):
+     - "cd": true
+     - "echo": true
+     - "ls": true
+     - "dir": true
+     - "pwd": true
+     - "cat": true
+     - "head": true
+     - "tail": true
+     - "findstr": true
+     - "wc": true
+     - "tr": true
+     - "cut": true
+     - "cmp": true
+     - "which": true
+     - "basename": true
+     - "dirname": true
+     - "realpath": true
+     - "readlink": true
+     - "stat": true
+     - "file": true
+     - "od": true
+     - "du": true
+     - "df": true
+     - "sleep": true
+     - "nl": true
+     - "grep": true
+     - "column": true
+     - "date": true
+     - "find": true
+     - "rg": true
+     - "sed": true
+     - "sort": true
+     - "tree": true
+     - "xxd": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+status\\b/": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+log\\b/": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+show\\b/": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+diff\\b/": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+ls-files\\b/": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+grep\\b/": true
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+branch\\b/": true
+     - "/^docker\\s+(ps|images|info|version|inspect|logs|top|stats|port|diff|search|events)\\b/": true
+     - "/^docker\\s+(container|image|network|volume|context|system)\\s+(ls|ps|inspect|history|show|df|info)\\b/": true
+     - "/^docker\\s+compose\\s+(ps|ls|top|logs|images|config|version|port|events)\\b/": true
+     - "Get-ChildItem": true
+     - "Get-Content": true
+     - "Get-Date": true
+     - "Get-Random": true
+     - "Get-Location": true
+     - "Set-Location": true
+     - "Write-Host": true
+     - "Write-Output": true
+     - "Out-String": true
+     - "Split-Path": true
+     - "Join-Path": true
+     - "Start-Sleep": true
+     - "Where-Object": true
+     - "/^Select-[a-z0-9]/i": true
+     - "/^Measure-[a-z0-9]/i": true
+     - "/^Compare-[a-z0-9]/i": true
+     - "/^Format-[a-z0-9]/i": true
+     - "/^Sort-[a-z0-9]/i": true
+     - "/^npm\\s+(ls|list|outdated|view|info|show|explain|why|root|prefix|bin|search|doctor|fund|repo|bugs|docs|home|help(-search)?)\\b/": true
+     - "/^npm\\s+config\\s+(list|get)\\b/": true
+     - "/^npm\\s+pkg\\s+get\\b/": true
+     - "/^npm\\s+audit$/": true
+     - "/^npm\\s+cache\\s+verify\\b/": true
+     - "/^yarn\\s+(list|outdated|info|why|bin|help|versions)\\b/": true
+     - "/^yarn\\s+licenses\\b/": true
+     - "/^yarn\\s+audit\\b(?!.*\\bfix\\b)/": true
+     - "/^yarn\\s+config\\s+(list|get)\\b/": true
+     - "/^yarn\\s+cache\\s+dir\\b/": true
+     - "/^pnpm\\s+(ls|list|outdated|why|root|bin|doctor)\\b/": true
+     - "/^pnpm\\s+licenses\\b/": true
+     - "/^pnpm\\s+audit\\b(?!.*\\bfix\\b)/": true
+     - "/^pnpm\\s+config\\s+(list|get)\\b/": true
+     - "npm ci": true
+     - "/^yarn\\s+install\\s+--frozen-lockfile\\b/": true
+     - "/^pnpm\\s+install\\s+--frozen-lockfile\\b/": true
+     - "column": true
+     - "date": true
+     - "find": true
+     - "rg": true
+     - "sed": true
+     - "sort": true
+     - "tree": true
+     - "/^xxd$/": true
+     - "/^xxd\\b(\\s+-\\S+)*\\s+[^-\\s]\\S*$/": true
+   Blocked commands (false):
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+log\\b.*\\s--output(=|\\s|$)/": false
+     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+branch\\b.*\\s-(d|D|m|M|-delete|-force)\\b/": false
+     - "/^column\\b.*\\s-c\\s+[0-9]{4,}/": false
+     - "/^date\\b.*\\s(-s|--set)\\b/": false
+     - "/^find\\b.*\\s-(delete|exec|execdir|fprint|fprintf|fls|ok|okdir)\\b/": false
+     - "/^rg\\b.*\\s(--pre|--hostname-bin)\\b/": false
+     - "/^sed\\b.*\\s(-[a-zA-Z]*(e|f)[a-zA-Z]*|--expression|--file)\\b/": false
+     - "/^sed\\b.*s\\/.*\\/.*\\/[ew]/": false
+     - "/^sed\\b.*;W/": false
+     - "/^sort\\b.*\\s-(o|S)\\b/": false
+     - "/^tree\\b.*\\s-o\\b/": false
+     - "rm": false
+     - "rmdir": false
+     - "del": false
+     - "Remove-Item": false
+     - "ri": false
+     - "rd": false
+     - "erase": false
+     - "dd": false
+     - "ps": false
+     - "top": false
+     - "Stop-Process": false
+     - "spps": false
+     - "curl": false
+     - "wget": false
+
+[Done] 5. High and Low modes, split logic in two:
+   - gemma-4-26B-A4B (High) explains everything it does, uses thinking to the max, as many tokens and tool uses as needed to solve the issue with utmost accuracy. Prioritizes self-optimizable pipeline: research - plan - worker selections - permission (if necessary) - execution - test.
+   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test.
+
+[Done] 6. ensure for each task and worker the temp and such is set properly thruout.
+
+7. https://github.com/thedavidweng/gork-build clone repo for insights and merging. use it to improve this codebase.
+
+8. fix the extension icon not showing up in VSCode.
+
+[Done] "when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints."
+
+[TBD] make auto-pushing verified updates a thing. 
+
+[TBD] auto-log git changes before pushing.
+
+[TBD] test and learn gemma-4 params. figure out: what works best for coding? what has the lowest probability of skipping the response / what parameters provide the most complete and accurate response?
+
+[TBD] introduce workspace-specific buckets for proper queue decongestion
+
+[TBD] clearing irrelevant queue congestion
+
+[TBD] for main.py (serenitydevserver.py): decide upon relevancy, consider an auto-param adjustment mode that does NOT override settings, but creates a temp state that bases off the persona settings, but adjusts (ie. lowers temp for coding, adjusts for content flow being multimodal, text, analysis and data handling, etc.)
+
+[TBD] add git commands to harness (Note: harness/tests currently exist in SerenityPC workspace)
+
+[Last] update README and create LICENSE.md
+
+=========================================
+HISTORICAL REFERENCE & LOGS
+=========================================
+(The following transcript logs represent a timed-out attempt to execute TODO #13 in the SerenityPC workspace)
+
+I got this:
+SerenityDev: Gemma-4 Active Planning Pipeline Initialized. Ready for queries.
+You: TODO #13: MoE Mapping, Gemma-4 Parameter Optimization, and Git Tests Background We will address the tasks under TODO #13: Map MoE router sizes by enhancing the GGUF metadata parsing logic to read the total experts and active experts, then reporting them in the Dynamic VRAM report. Optimize Gemma-4 parameters (especially for coding/reasoning) by specifying ideal presets (lower temperature, low/no repeat penalty, and appropriate min_p) to reduce generation skipping and improve accuracy. Add git commands to the Wringer harness to evaluate code/scripting capabilities on standard developer flows. Proposed Changes 1. MoE Router Mapping in GGUF Parsers We will update calculate_dynamic_gpu_layers in: main.py System/tests/benchmarks/wringer/Wringer.py System/tests/benchmarks/debate/Debate.py Changes in calculate_dynamic_gpu_layers: Scan the entire KV metadata list (instead of breaking immediately on .block_count) to extract .expert_count and .expert_used_count. Update the print statement/report to output Model Type: Mixture of Experts (MoE) and MoE Router Map: X/Y experts active per token when a router is found. 2. Git Command Evaluation in Wringer Test Suite We will add Git-specific questions to: System/tests/benchmarks/wringer/Wringer.py Questions to add: Level 2 (Developer / Search tasks) "How do I undo the last local commit in git without losing my changes?" "Write a git command to discard all unstaged changes in the working directory." Level 3 (Scripting / Complex Developer Tasks) "Draft a bash script that automatically pulls the latest main, runs tests, and pushes to origin if successful." Level 5 (Advanced Coding / Logic) "Explain how git rebasing works compared to git merging, detailing pros and cons for a team workflow." Matching answers will be added to the reference answer key. 3. Gemma-4 Parameter Optimization & Study We will document the learned parameters for Gemma-4 in a new notes file: System/tests/benchmarks/wringer/gemma4_param_notes.md Key Findings / Coding Presets: Temperature: 0.3 to 0.5 for coding, rather than 1.0. Low temperature prevents divergence and incomplete code blocks. Repeat Penalty: 1.0 (disabled) or 1.05. High repeat penalty breaks syntax repetition (such as repeated import, def, for, spaces, brackets), causing early termination/skipping. Min P: 0.05 to 0.1 to filter out low-probability junk tokens while preserving multiple candidate paths. Stop Tokens: Ensure and <|end_of_turn|> are registered. Verification Plan Automated Tests Run python -m py_compile on modified Python scripts. Run Wringer tests on a test model to verify the new questions are evaluated.
+⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
+⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
+⚙️ [Orchestrator] Header stripped to fit Copilot Chat limit. Answer 1055 chars.
+⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
+⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
+SerenityDev: ### Implementation Checklist #### Phase 1: GGUF Metadata Update - [ ] Update `calculate_dynamic_gpu_layers` in `main.py`. - [ ] Update `calculate_dynamic_gpu_layers` in `Wringer.py`. - [ ] Update `calculate_dynamic_gpu_layers` in `Debate.py`. - [ ] Verify that non-MoE models do not trigger "MoE Router Map" errors. #### Phase 2: Wringer Test Expansion - [ ] Add Level 2 Git questions to `Wringer.py`. - [ ] Add Level 3 Git scripting questions to `Wringer.py`. - [ ] Add Level 5 Git logic questions to `Wringer.py`. - [ ] Update the reference answer key for all new questions. - [ ] Run `python -m py_compile` on all modified files. #### Phase 3: Documentation - [ ] Create `System/tests/benchmarks/wringer/gemma4_param_notes.md`. - [ ] Document the specific `temperature`, `repeat_penalty`, and `min_p` settings for Gemma-4 coding benchmarks. #### Phase 4: Verification - [ ] Execute Wringer harness against a known MoE model (e.g., Mixtral) to verify metadata reporting. - [ ] Execute Wringer harness against Gemma-4 to verify Git question accuracy.
+🗺️ Plan Step Count: 0
+Worker: gemma-4-26B-A4B
+You: proceed with changes
+⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
+⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
+⚙️ [Orchestrator] Header stripped to fit Copilot Chat limit. Answer 1055 chars.
+⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
+⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
+❌ Error: timeout of 180000ms exceeded

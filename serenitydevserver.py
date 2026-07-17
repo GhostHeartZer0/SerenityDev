@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import logging
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
@@ -18,10 +19,10 @@ import signal
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 # Configuration Constants
-OLLAMA_BASE = "http://localhost:11434"
-OLLAMA_URL = f"{OLLAMA_BASE}/api/generate"
-OLLAMA_TAGS_URL = f"{OLLAMA_BASE}/api/tags"
-OLLAMA_PS_URL = f"{OLLAMA_BASE}/api/ps"
+LLAMA_SERVER_BASE = "http://localhost:8080"
+LLAMA_SERVER_URL = f"{LLAMA_SERVER_BASE}/v1/completions"
+LLAMA_SERVER_CHAT_URL = f"{LLAMA_SERVER_BASE}/v1/chat/completions"
+llama_server_process = None
 
 # Model Mapping Config
 SUPERVISOR_MODEL = "gemma-4-26B-A4B"
@@ -32,8 +33,12 @@ W4_MODEL = "qwen3.6-27B"           # Additional specialized worker
 FIM_MODEL = "codegemma-2b"         # Inline Autocomplete
 
 AUTOSWAP_TIMEOUT = 240.0            # Seconds before swapping back to Supervisor VRAM
-CONTEXT_WINDOW = 128000             # Increased to 128k for larger context window
+CONTEXT_WINDOW = int(os.environ.get("SERENITY_CONTEXT_WINDOW", "16384")) # Configurable context window (default 16k)
 MAX_RESPONSE_LENGTH = 1200          # Character limit for responses to Copilot Chat (~300 tokens, safe limit for VS Code Copilot)
+
+# KV Cache Compression Settings
+cache_type_k = "f16"
+cache_type_v = "f16"
 
 # Global State Management
 inference_lock = asyncio.Lock()
@@ -61,55 +66,58 @@ except ImportError:
 def resolve_gguf_path(model_name: str) -> Optional[str]:
     if not model_name:
         return None
+        
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 1. Check dynamic JSON directory mapping
+    json_path = os.path.join(base_dir, "models.json")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                model_map = json.load(f)
+                if model_name in model_map:
+                    mapped_path = model_map[model_name]
+                    if os.path.exists(mapped_path):
+                        return mapped_path
+        except Exception as e:
+            log_message(f"[Models] Error reading models.json: {e}")
+
+    # 2. Check absolute path directly
     if os.path.exists(model_name):
         return model_name
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    targets = {
-        "gemma-4-26B-A4B": "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
-        "qwen3.6-35B-A3B": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
-        "qwen3.6-27B": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-        "codegemma-7b-it": "codegemma-7b-it-f16.gguf",
-        "codegemma-2b": "codegemma-2b-f16.gguf"
-    }
-    clean_name = model_name.split(':')[0]
-    if clean_name in targets:
-        local_path = os.path.join(base_dir, targets[clean_name])
-        if os.path.exists(local_path):
-            return local_path
-    try:
-        manifest_dir = os.path.expanduser("~/.ollama/models/manifests/registry.ollama.ai/library")
-        for folder in os.listdir(manifest_dir):
-            if folder.lower() == clean_name.lower() or clean_name.lower().startswith(folder.lower()):
-                manifest_path = os.path.join(manifest_dir, folder, "latest")
-                if os.path.exists(manifest_path):
-                    with open(manifest_path, "r", encoding="utf-8") as f:
-                        manifest = json.load(f)
-                    for layer in manifest.get("layers", []):
-                        if layer.get("mediaType") == "application/vnd.ollama.image.model":
-                            digest = layer.get("digest", "")
-                            if digest:
-                                blob_name = digest.replace(":", "-")
-                                blob_path = os.path.expanduser(f"~/.ollama/models/blobs/{blob_name}")
-                                if os.path.exists(blob_path):
-                                    return blob_path
-    except Exception as e:
-        log_message(f"[Llama-CPP] Error resolving manifest: {e}")
+        
+    # 3. Check local models directory
+    models_dir = os.path.join(base_dir, "models")
+    target_file = f"{model_name}.gguf" if not model_name.endswith('.gguf') else model_name
+    
+    if os.path.exists(os.path.join(models_dir, target_file)):
+        return os.path.join(models_dir, target_file)
+        
+    for root, _, files in os.walk(models_dir):
+        if target_file in files:
+            return os.path.join(root, target_file)
+            
     return None
 
-def unload_ollama_models():
-    """Unloads all models from Ollama VRAM to prevent VRAM memory collisions."""
+active_llama_server_model_name = None
+
+def unload_llama_server():
+    """Stops the llama-server process to free VRAM."""
+    global llama_server_process, active_llama_server_model_name
     try:
-        installed = get_installed_models()
-        if installed:
-            log_message(f"[Llama-CPP] Unloading Ollama models {installed} from VRAM...")
-            with httpx.Client(timeout=3.0) as client:
-                for m in installed:
-                    try:
-                        client.post(OLLAMA_URL, json={"model": m, "keep_alive": 0})
-                    except Exception:
-                        pass
+        if llama_server_process is not None:
+            log_message("[Llama-Server] Stopping active llama-server process to free VRAM...")
+            llama_server_process.terminate()
+            llama_server_process.wait(timeout=5)
+            llama_server_process = None
+            log_message("[Llama-Server] Successfully terminated.")
     except Exception as e:
-        log_message(f"[Llama-CPP] Warning unloading Ollama models: {e}")
+        log_message(f"[Llama-Server] Warning killing llama-server: {e}")
+        if llama_server_process is not None:
+            llama_server_process.kill()
+            llama_server_process = None
+    finally:
+        active_llama_server_model_name = None
 
 def unload_llama_model():
     """Explicitly unloads the direct llama-cpp-python model to clear VRAM."""
@@ -128,13 +136,118 @@ def unload_llama_model():
             pass
         log_message("[Llama-CPP] Direct model offloaded successfully.")
 
+async def start_llama_server(model_name: str, n_ctx: int):
+    """Starts the llama-server subprocess if using API fallback."""
+    global llama_server_process, active_llama_server_model_name
+    
+    unload_llama_server() # This will kill existing server if any
+    
+    gguf_path = resolve_gguf_path(model_name)
+    if not gguf_path:
+        raise ValueError(f"Could not resolve GGUF path for model: {model_name}")
+        
+    try:
+        gpu_layers, offload_kqv = calculate_dynamic_gpu_layers(model_name, n_ctx)
+        if gpu_layers <= 0:
+            gpu_layers = 1
+    except Exception as e:
+        log_message(f"[Llama-Server] Error calculating GPU layers: {e}. Falling back to 4 layers.")
+        gpu_layers = 4
+        offload_kqv = True
+
+    log_message(f"[Llama-Server] Starting server for {model_name} from {gguf_path} (n_ctx={n_ctx}, gpu_layers={gpu_layers}, offload_kqv={offload_kqv})...")
+    
+    cmd = [
+        "llama-server",
+        "-m", gguf_path,
+        "-c", str(n_ctx),
+        "-ngl", str(gpu_layers),
+        "--port", "8080",
+        "--host", "127.0.0.1",
+        "-fa" # flash attention
+    ]
+    if cache_type_k and cache_type_k != "f16":
+        cmd.extend(["--cache-type-k", cache_type_k])
+    if cache_type_v and cache_type_v != "f16":
+        cmd.extend(["--cache-type-v", cache_type_v])
+        
+    if not offload_kqv:
+        cmd.append("-nkvo")
+
+    
+    import subprocess
+    try:
+        # Popen to run in background
+        llama_server_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        # Poll health status to ensure it's ready
+        log_message("[Llama-Server] Server process spawned. Polling health check...")
+        import urllib.request
+        import urllib.error
+        
+        healthy = False
+        for i in range(45):
+            await asyncio.sleep(1.0)
+
+            try:
+                req = urllib.request.Request(f"{LLAMA_SERVER_BASE}/health")
+                with urllib.request.urlopen(req, timeout=1.0) as response:
+                    if response.status == 200:
+                        healthy = True
+                        break
+            except Exception:
+                try:
+                    req = urllib.request.Request(f"{LLAMA_SERVER_BASE}/v1/models")
+                    with urllib.request.urlopen(req, timeout=1.0) as response:
+                        if response.status == 200:
+                            healthy = True
+                            break
+                except Exception:
+                    pass
+        
+        if healthy:
+            log_message("[Llama-Server] Server is healthy and responding.")
+            active_llama_server_model_name = model_name
+        else:
+            log_message("[Llama-Server] Warning: Server failed health check after 45 seconds, proceeding anyway.")
+            active_llama_server_model_name = model_name
+    except Exception as e:
+        log_message(f"[Llama-Server] Failed to spawn server: {e}")
+        llama_server_process = None
+        active_llama_server_model_name = None
+
+
+def get_ggml_type(cache_type_str: str) -> Optional[int]:
+    import llama_cpp
+    mapping = {
+        "f16": llama_cpp.GGML_TYPE_F16,
+        "fp16": llama_cpp.GGML_TYPE_F16,
+        "q8_0": llama_cpp.GGML_TYPE_Q8_0,
+        "q5_1": llama_cpp.GGML_TYPE_Q5_1,
+        "q5_0": llama_cpp.GGML_TYPE_Q5_0,
+        "q4_0": llama_cpp.GGML_TYPE_Q4_0,
+        "turbo4_tcq": 44,
+        "turbo3_tcq": 45,
+        "turbo2_tcq": 46,
+    }
+    cleaned = cache_type_str.lower().strip()
+    if "q4_k" in cleaned:
+        return getattr(llama_cpp, "GGML_TYPE_Q4_K", None)
+    if "q8_k" in cleaned:
+        return getattr(llama_cpp, "GGML_TYPE_Q8_K", None)
+    return mapping.get(cleaned)
+
 def get_llama_model(model_name: str, n_ctx: int):
     global active_llama_model, active_llama_model_name
     if active_llama_model is not None:
         if active_llama_model_name != model_name or active_llama_model.n_ctx() < n_ctx:
             unload_llama_model()
     
-    unload_ollama_models()
+    unload_llama_server()
     
     if active_llama_model is None:
         gguf_path = resolve_gguf_path(model_name)
@@ -142,30 +255,32 @@ def get_llama_model(model_name: str, n_ctx: int):
             raise ValueError(f"Could not resolve GGUF path for model: {model_name}")
             
         try:
-            gpu_layers = calculate_dynamic_gpu_layers(model_name, n_ctx)
+            gpu_layers, offload_kqv = calculate_dynamic_gpu_layers(model_name, n_ctx)
             if gpu_layers <= 0:
-                gpu_layers = 4
+                gpu_layers = 1
         except Exception as e:
-            log_message(f"[Llama-CPP] Error calculating GPU layers: {e}. Falling back to 4 layers.")
-            gpu_layers = 4
+            log_message(f"[Llama-CPP] Error calculating GPU layers: {e}. Falling back to 1 layer.")
+            gpu_layers = 1
+            offload_kqv = False
             
-        log_message(f"[Llama-CPP] Loading {model_name} from {gguf_path} (n_ctx={n_ctx}, gpu_layers={gpu_layers}) with turbo2 cache compression...")
+        log_message(f"[Llama-CPP] Loading {model_name} from {gguf_path} (n_ctx={n_ctx}, gpu_layers={gpu_layers}) with KV cache compression K={cache_type_k}, V={cache_type_v}...")
         from llama_cpp import Llama
         active_llama_model = Llama(
             model_path=gguf_path,
             n_ctx=n_ctx,
             n_gpu_layers=gpu_layers,
             flash_attn=True,
-            type_k=42, # GGML_TYPE_TURBO2_0
-            type_v=42, # GGML_TYPE_TURBO2_0
-            offload_kqv=True,
+            offload_kqv=offload_kqv,
             n_threads=8,
-            verbose=True
+            verbose=False,
+            type_k=get_ggml_type(cache_type_k),
+            type_v=get_ggml_type(cache_type_v)
         )
+
         active_llama_model_name = model_name
     return active_llama_model
 
-async def generate_completion_stream(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None):
+async def generate_completion_stream(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None, min_p: float = 0.05, repeat_penalty: float = 1.05):
     if stop is None:
         stop = ["<turn|>", "<|turn|>", "<bos>", "<eos>"]
     if llama_cpp_available:
@@ -177,17 +292,41 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                 def producer():
                     try:
                         llm = get_llama_model(model_name, num_ctx)
+                        # Dynamically check if prompt length exceeds current context window
+                        try:
+                            prompt_tokens = llm.tokenize(prompt.encode('utf-8'))
+                            token_count = len(prompt_tokens)
+                            # Give a safety buffer (default to 2048 if max_tokens is -1 or None)
+                            headroom = max_tokens if max_tokens > 0 else 2048
+                            required_ctx = token_count + headroom
+                            if required_ctx > llm.n_ctx():
+                                log_message(f"[Llama-CPP] Prompt tokens ({token_count}) + headroom ({headroom}) exceeds loaded context limit ({llm.n_ctx()}). Dynamic reloading to n_ctx={required_ctx}...")
+                                llm = get_llama_model(model_name, required_ctx)
+                        except Exception as token_ex:
+                            log_message(f"[Llama-CPP] Error during token count pre-check: {token_ex}")
+
                         limit_tokens = max_tokens if max_tokens > 0 else None
                         chunks = llm(
                             prompt=prompt,
                             max_tokens=limit_tokens,
                             temperature=temperature,
                             stop=stop,
-                            stream=True
+                            stream=True,
+                            min_p=min_p,
+                            repeat_penalty=repeat_penalty
                         )
                         for chunk in chunks:
-                            text = chunk["choices"][0]["text"]
-                            loop.call_soon_threadsafe(queue.put_nowait, text)
+                            if not isinstance(chunk, dict):
+                                continue
+                            choices = chunk.get("choices")
+                            if not isinstance(choices, list) or len(choices) == 0:
+                                continue
+                            first_choice = choices[0]
+                            if not isinstance(first_choice, dict):
+                                continue
+                            text = first_choice.get("text", "")
+                            if text:
+                                loop.call_soon_threadsafe(queue.put_nowait, text)
                     except Exception as ex:
                         loop.call_soon_threadsafe(queue.put_nowait, ex)
                     finally:
@@ -202,73 +341,46 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                     yield val
                 return
         except Exception as e:
-            log_message(f"[Llama-CPP Stream Error] Direct streaming failed, falling back to Ollama API: {e}")
+            log_message(f"[Llama-CPP Stream Error] Direct streaming failed, falling back to Llama-Server API: {e}")
+
+    # Start or ensure llama-server is running for this model
+    if llama_server_process is None or active_llama_server_model_name != model_name:
+        await start_llama_server(model_name, num_ctx)
+
+
 
     payload = {
         "model": model_name,
         "prompt": prompt,
         "stream": True,
-        "raw": True,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-            "num_ctx": num_ctx,
-            "num_gpu": calculate_dynamic_gpu_layers(model_name, num_ctx),
-            "stop": stop
-        }
+        "temperature": temperature,
+        "max_tokens": max_tokens if max_tokens > 0 else 2048,
+        "stop": stop,
+        "min_p": min_p,
+        "repeat_penalty": repeat_penalty
     }
     async with httpx.AsyncClient(timeout=60) as client:
-        async with client.stream("POST", OLLAMA_URL, json=payload) as response:
-            if response.status_code != 200:
-                raise Exception(f"Ollama API error: {response.status_code}")
-            async for chunk in response.aiter_lines():
-                if chunk:
+        async with client.stream("POST", LLAMA_SERVER_URL, json=payload) as res:
+            async for line in res.aiter_lines():
+                line = line.strip()
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
                     try:
-                        data = json.loads(chunk)
-                        yield data.get("response", "")
+                        data = json.loads(data_str)
+                        if "choices" in data and len(data["choices"]) > 0:
+                            chunk = data["choices"][0].get("text", "")
+                            if chunk:
+                                yield chunk
                     except Exception:
                         pass
 
-async def generate_completion(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None):
-    if stop is None:
-        stop = ["<turn|>", "<|turn|>", "<bos>", "<eos>"]
-    if llama_cpp_available:
-        try:
-            gguf_path = resolve_gguf_path(model_name)
-            if gguf_path:
-                loop = asyncio.get_event_loop()
-                def run_inference():
-                    llm = get_llama_model(model_name, num_ctx)
-                    limit_tokens = max_tokens if max_tokens > 0 else None
-                    res = llm(
-                        prompt=prompt,
-                        max_tokens=limit_tokens,
-                        temperature=temperature,
-                        stop=stop
-                    )
-                    return res
-                response_json = await loop.run_in_executor(None, run_inference)
-                text = response_json["choices"][0]["text"]
-                return {"response": text}
-        except Exception as e:
-            log_message(f"[Llama-CPP Error] Direct inference failed, falling back to Ollama API: {e}")
-
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "stream": False,
-        "raw": True,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_tokens,
-            "num_ctx": num_ctx,
-            "num_gpu": calculate_dynamic_gpu_layers(model_name, num_ctx),
-            "stop": stop
-        }
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        res = await client.post(OLLAMA_URL, json=payload)
-        return res.json()
+async def generate_completion(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None, min_p: float = 0.05, repeat_penalty: float = 1.05) -> Dict[str, Any]:
+    result = []
+    async for chunk in generate_completion_stream(model_name, prompt, temperature, num_ctx, max_tokens, stop, min_p, repeat_penalty):
+        result.append(chunk)
+    return {"response": "".join(result)}
 
 SUPERVISOR_PROMPT = """
 You are the Orchestrator of a multi-agent system. Your goal is to manage tasks by delegating to specialized workers or using available tools.
@@ -346,104 +458,100 @@ def log_message(msg: str):
 # --- Startup Check & Auto-Registration ---
 
 def get_installed_models() -> List[str]:
-    """Fetch the list of registered models in Ollama."""
+    """Scan local models directory recursively for .gguf files, register them, and maintain models.json."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    models = []
+    
+    json_path = os.path.join(base_dir, "models.json")
+    model_map = {}
+    map_updated = False
+    
+    # 1. Load existing models.json map
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                model_map = json.load(f)
+                for model_name, path in list(model_map.items()):
+                    model_name_lower = model_name.lower()
+                    # Filter out MTP, assistant, and mmproj files
+                    if any(tag in model_name_lower for tag in ['mmproj', 'assistant', 'mtp']):
+                        del model_map[model_name]
+                        map_updated = True
+                        continue
+                    if os.path.exists(path):
+                        models.append(model_name)
+        except Exception as e:
+            log_message(f"[Models] Error reading models.json: {e}")
+
+    # 2. Scan local models directory and update map
+    models_dir = os.path.join(base_dir, "models")
     try:
-        with httpx.Client(timeout=3.0) as client:
-            response = client.get(OLLAMA_TAGS_URL)
-            if response.status_code == 200:
-                data = response.json()
-                return [m['name'] for m in data.get('models', [])]
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir, exist_ok=True)
+            
+        for root, _, files in os.walk(models_dir):
+            for f in files:
+                if f.endswith('.gguf'):
+                    name = f[:-5]
+                    name_lower = name.lower()
+                    # Filter out MTP, assistant, and mmproj files
+                    if any(tag in name_lower for tag in ['mmproj', 'assistant', 'mtp']):
+                        continue
+                    if name not in models:
+                        models.append(name) # remove .gguf extension
+                    
+                    # Ensure absolute path is in the map
+                    abs_path = os.path.abspath(os.path.join(root, f))
+                    if name not in model_map or model_map[name] != abs_path:
+                        model_map[name] = abs_path
+                        map_updated = True
     except Exception as e:
-        log_message(f"[Ollama Check] Warning: Unable to reach Ollama: {e}")
-    return []
+        log_message(f"[Startup Error] Failed to list models: {e}")
+        
+    # 3. Save updated map back to models.json if changes occurred
+    if map_updated or not os.path.exists(json_path):
+        try:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(model_map, f, indent=4)
+        except Exception as e:
+            log_message(f"[Models] Error saving models.json: {e}")
+
+    return models
 
 def check_and_register_models():
-    """Auto-registers local GGUF models and Safetensors directories in Ollama."""
-    global active_models_list
-    log_message("[Startup] Scanning Ollama library...")
+    """Initializes active model targets by auto-discovering GGUFs."""
+    global active_models_list, SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
+    log_message("[Startup] Scanning for local model files...")
     active_models_list = get_installed_models()
-    log_message(f"[Startup] Currently installed models: {active_models_list}")
-
-    registration_targets = [
-        {
-            "name": SUPERVISOR_MODEL,
-            "gguf": "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
-            "dir": None
-        },
-        {
-            "name": W3_MODEL,
-            "gguf": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
-            "dir": None
-        },
-        {
-            "name": W4_MODEL,
-            "gguf": "Qwen3.6-27B-UD-Q4_K_XL.gguf",
-            "dir": None
-        },
-        {
-            "name": W2_MODEL,
-            "gguf": "codegemma-7b-it-f16.gguf",
-            "dir": None
-        },
-        {
-            "name": FIM_MODEL,
-            "gguf": "codegemma-2b-f16.gguf",
-            "dir": None
-        }
-    ]
-
-    for target in registration_targets:
-        model_name = target["name"]
+    log_message(f"[Startup] Found models: {active_models_list}")
+    
+    if active_models_list:
+        models = sorted(active_models_list, reverse=True)
         
-        # Check if already installed
-        if any(m.startswith(model_name) or model_name.startswith(m) for m in active_models_list):
-            log_message(f"[Startup] Model '{model_name}' is already registered in Ollama.")
-            continue
-
-        gguf_file = target["gguf"]
-        source_dir = target["dir"]
+        main_models = [m for m in models if not any(tag in m.lower() for tag in ['mmproj', 'assistant', 'mtp'])]
+        if not main_models:
+            main_models = models
+            
+        fim_candidates = [m for m in main_models if '2b' in m.lower() or 'code' in m.lower()]
+        FIM_MODEL = fim_candidates[-1] if fim_candidates else main_models[-1]
         
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        modelfile_path = os.path.join(base_dir, f"Modelfile_{model_name.replace(':', '_').replace('.', '_')}")
+        w2_candidates = [m for m in main_models if ('7b' in m.lower() or 'code' in m.lower()) and m != FIM_MODEL]
+        W2_MODEL = w2_candidates[0] if w2_candidates else main_models[0]
         
-        gguf_path = os.path.join(base_dir, gguf_file) if gguf_file else None
-        source_path = os.path.join(base_dir, source_dir) if source_dir else None
-
-        try:
-            if gguf_path and os.path.exists(gguf_path):
-                log_message(f"[Startup] Found '{gguf_file}' in workspace. Registering as '{model_name}'...")
-                with open(modelfile_path, "w", encoding="utf-8") as f:
-                    f.write(f"FROM \"{gguf_path}\"\n")
-            elif source_path and os.path.exists(source_path):
-                log_message(f"[Startup] Found Safetensors directory '{source_dir}' in workspace. Registering as '{model_name}'...")
-                with open(modelfile_path, "w", encoding="utf-8") as f:
-                    f.write(f"FROM \"{source_path}\"\n")
-            else:
-                log_message(f"[Startup] Source for '{model_name}' not found. Skipping auto-registration.")
-                continue
-
-            # Create model using Ollama CLI
-            log_message(f"[Startup] Creating Ollama model '{model_name}' from modelfile...")
-            process = subprocess.run(
-                ["ollama", "create", model_name, "-f", modelfile_path],
-                capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=300
-            )
-            if process.returncode == 0:
-                log_message(f"[Startup] Successfully registered model '{model_name}' in Ollama.")
-                active_models_list = get_installed_models()
-            else:
-                log_message(f"[Startup] Error creating model '{model_name}': {process.stderr}")
-        except Exception as e:
-            log_message(f"[Startup] Failed to auto-register model '{model_name}': {e}")
-        finally:
-            if os.path.exists(modelfile_path):
-                os.remove(modelfile_path)
+        super_candidates = [m for m in main_models if 'a4b' in m.lower() or '35b' in m.lower() or '26b' in m.lower()]
+        SUPERVISOR_MODEL = super_candidates[0] if super_candidates else main_models[0]
+        W1_MODEL = SUPERVISOR_MODEL
+        W3_MODEL = super_candidates[1] if len(super_candidates) > 1 else SUPERVISOR_MODEL
+        W4_MODEL = super_candidates[2] if len(super_candidates) > 2 else SUPERVISOR_MODEL
+        
+        log_message(f"[Startup] Auto-Assigned Supervisor: {SUPERVISOR_MODEL}")
+        log_message(f"[Startup] Auto-Assigned W2 (Code): {W2_MODEL}")
+        log_message(f"[Startup] Auto-Assigned FIM: {FIM_MODEL}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Run CPU/Disk-bound check in run_in_executor as a background task
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, check_and_register_models)
+    # Run model check synchronously to avoid race conditions with early requests
+    check_and_register_models()
     yield
 
 app = FastAPI(
@@ -457,81 +565,49 @@ app = FastAPI(
 def get_target_vram_mb() -> float:
     try:
         res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,nounits,noheader"],
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,nounits,noheader"],
             capture_output=True, text=True, check=True
         )
         lines = res.stdout.strip().split("\n")
         if lines:
-            total = float(lines[0])
-            if total <= 6500:
-                return total - 800.0
-            elif total <= 8500:
-                return total - 1000.0
-            else:
-                return total - 1500.0
+            free = float(lines[0])
+            # Leave 600MB safety headroom to prevent Shared VRAM paging
+            return max(500.0, free - 600.0)
     except Exception:
         pass
-    return 5400.0  # Fallback: assume ~5.4GB available on a 6GB VRAM card
+    return 4000.0  # Fallback: assume 4.0GB available
+
 
 def get_model_info(model_name: str):
-    try:
-        full_name = model_name if ":" in model_name else f"{model_name}:latest"
-        with httpx.Client(timeout=5.0) as client:
-            res = client.post(f"{OLLAMA_BASE}/api/show", json={"name": full_name})
-            if res.status_code == 200:
-                data = res.json()
-                block_count = 0
-                info = data.get("model_info", {})
-                for k, v in info.items():
-                    if k.endswith(".block_count"):
-                        block_count = int(v)
-                        break
-                
-                details = data.get("details", {})
-                parent_model = details.get("parent_model", "")
-                file_size_bytes = 0
-                if parent_model and os.path.exists(parent_model):
-                    file_size_bytes = os.path.getsize(parent_model)
-                else:
-                    modelfile = data.get("modelfile", "")
-                    match = re.search(r'(?i)FROM\s+["\']?([^\n"\']+)["\']?', modelfile)
-                    if match:
-                        path = match.group(1).strip()
-                        if os.path.exists(path):
-                            file_size_bytes = os.path.getsize(path)
-                        else:
-                            blob_name = os.path.basename(path)
-                            possible_paths = [
-                                os.path.join(os.path.expanduser("~"), ".ollama", "models", "blobs", blob_name),
-                                os.path.join("C:\\Users\\ccrg6\\.ollama\\models\\blobs", blob_name),
-                                os.path.join("C:\\Users\\ccrg6\\.ollama\\models\\blobs", blob_name.replace(":", "-"))
-                            ]
-                            for p in possible_paths:
-                                if os.path.exists(p):
-                                    file_size_bytes = os.path.getsize(p)
-                                    break
-                
-                if file_size_bytes == 0:
-                    param_size = details.get("parameter_size", "7B")
-                    val = 7.0
-                    match_val = re.search(r'([0-9.]+)', param_size)
-                    if match_val:
-                        val = float(match_val.group(1))
-                    quant = details.get("quantization_level", "Q4_0")
-                    if "F16" in quant:
-                        bytes_per_param = 2.0
-                    elif "Q8" in quant:
-                        bytes_per_param = 1.0
-                    else:
-                        bytes_per_param = 0.55
-                    file_size_bytes = int(val * 1e9 * bytes_per_param)
-                
-                return block_count, file_size_bytes
-    except Exception as e:
-        log_message(f"[Offload Check] Error querying model show API: {e}")
+    """Estimate model info from local GGUF or fallback to defaults."""
+    gguf_path = resolve_gguf_path(model_name)
+    if gguf_path and os.path.exists(gguf_path):
+        size = os.path.getsize(gguf_path)
+        # Parse block count from GGUF metadata
+        try:
+            import struct
+            with open(gguf_path, "rb") as f:
+                header = f.read(64 * 1024)
+                if header[:4] == b'GGUF':
+                    idx = header.find(b"block_count")
+                    if idx != -1:
+                        type_offset = idx + len("block_count")
+                        val_type = struct.unpack("<I", header[type_offset:type_offset+4])[0]
+                        if val_type in (4, 5):  # UINT32 or INT32
+                            layers = struct.unpack("<I" if val_type == 4 else "<i", header[type_offset+4:type_offset+8])[0]
+                            if 0 < layers < 150:
+                                return layers, size
+        except Exception:
+            pass
+        # Fallbacks based on size
+        if size > 20 * 1024 * 1024 * 1024:
+            return 60, size
+        elif size > 10 * 1024 * 1024 * 1024:
+            return 40, size
+        return 32, size
     return 32, int(7e9 * 0.55)
 
-def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> int:
+def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, bool]:
     targeted_reserve_vram_mb = get_target_vram_mb()
     total_layers, model_base_vram_bytes = get_model_info(model_name)
     if total_layers == 0:
@@ -546,22 +622,25 @@ def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> int:
         kv_cache_vram_mb = (ctx_size / 49152) * 3150.0
         
     available_weight_vram = targeted_reserve_vram_mb - kv_cache_vram_mb
+    offload_kqv = True
+    
     if available_weight_vram <= 0:
-        log_message(f"[DYNAMIC AUTO-OFFLOAD] Cache footprint ({kv_cache_vram_mb:.1f}MB) saturates VRAM. Offloading 0 layers.")
-        return 0
+        log_message(f"[DYNAMIC AUTO-OFFLOAD] Cache footprint ({kv_cache_vram_mb:.1f}MB) saturates VRAM. Moving KV Cache to RAM to preserve GPU layers.")
+        available_weight_vram = targeted_reserve_vram_mb
+        offload_kqv = False
         
     safe_layers = int(available_weight_vram // vram_per_layer)
-    final_layers = max(0, min(total_layers, safe_layers))
+    final_layers = max(1, min(total_layers, safe_layers))
     
     log_message("--- DYNAMIC VRAM REPORT ---")
     log_message(f"Model:            {model_name}")
     log_message(f"Total Layers:     {total_layers}")
     log_message(f"File Size:        {model_base_vram_mb:.1f} MiB (~{vram_per_layer:.1f} MiB/layer)")
-    log_message(f"Est. KV Cache:    {kv_cache_vram_mb:.1f} MiB")
+    log_message(f"Est. KV Cache:    {kv_cache_vram_mb:.1f} MiB (Offloaded: {offload_kqv})")
     log_message(f"Target VRAM:      {targeted_reserve_vram_mb:.1f} MiB")
     log_message(f"Action:           Offloading {final_layers}/{total_layers} layers to GPU")
     log_message("----------------------------")
-    return final_layers
+    return final_layers, offload_kqv
 
 # --- Graceful Fallbacks ---
 
@@ -572,9 +651,20 @@ async def resolve_model(target: str) -> str:
         loop = asyncio.get_event_loop()
         active_models_list = await loop.run_in_executor(None, get_installed_models)
     
+    # Prioritize main models over mmproj/assistant/mtp when doing prefix matching
+    main_candidates = []
+    other_candidates = []
     for model_name in active_models_list:
         if model_name.startswith(target) or target.startswith(model_name):
-            return model_name
+            if any(tag in model_name.lower() for tag in ['mmproj', 'assistant', 'mtp']):
+                other_candidates.append(model_name)
+            else:
+                main_candidates.append(model_name)
+                
+    if main_candidates:
+        return main_candidates[0]
+    if other_candidates:
+        return other_candidates[0]
             
     log_message(f"[Fallback] Model '{target}' not found. Falling back to '{SUPERVISOR_MODEL}'.")
     return SUPERVISOR_MODEL
@@ -585,38 +675,90 @@ def clean_thought_and_whitespace(text: str) -> str:
         return ""
     orig_text = text
     text = re.sub(r'ễ.*?ễ', '', text, flags=re.DOTALL)
-    text = re.sub(r'<thought>.*?(?:</thought>|$)', '', text, flags=re.DOTALL)
-    text = re.sub(r'<think>.*?(?:</think>|$)', '', text, flags=re.DOTALL)
-    text = re.sub(r'<\|channel\>thought.*?(?:<channel\|\>|$)', '', text, flags=re.DOTALL)
+    text = re.sub(r'<thought>.*?(?:</thought>)', '', text, flags=re.DOTALL)
+    text = re.sub(r'<think>.*?(?:</think>)', '', text, flags=re.DOTALL)
+    text = re.sub(r'<\|channel\>thought.*?(?:<channel\|\>)', '', text, flags=re.DOTALL)
     
     cleaned = text.strip()
-    if not cleaned and orig_text.strip():
-        # Fallback: if all text was stripped as thinking but the model actually produced output,
-        # return the raw output so the loop doesn't fail with an empty draft.
+    if not cleaned:
+        # Fallback: if all text was stripped, try removing unclosed tags from the end
+        unclosed_stripped = orig_text
+        unclosed_stripped = re.sub(r'<thought>.*$', '', unclosed_stripped, flags=re.DOTALL)
+        unclosed_stripped = re.sub(r'<think>.*$', '', unclosed_stripped, flags=re.DOTALL)
+        unclosed_stripped = re.sub(r'<\|channel\>thought.*$', '', unclosed_stripped, flags=re.DOTALL)
+        cleaned_unclosed = unclosed_stripped.strip()
+        if cleaned_unclosed:
+            return cleaned_unclosed
         return orig_text.strip()
     return cleaned
 
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
     """Defensively extracts and parses JSON from raw LLM output."""
-    cleaned = clean_thought_and_whitespace(text)
-    
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
+    cleaned = clean_thought_and_whitespace(text).strip()
+    if not cleaned or ('{' not in cleaned and '<|tool_call' not in cleaned):
+        return None
 
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned, re.DOTALL)
-    if match:
+    # 0. Intercept native <|tool_call> syntax
+    if "<|tool_call" in cleaned:
+        match = re.search(r'<\|tool_call\|>\s*call:\s*([^\s{]+)\s*(\{.*?\})\s*<tool_call\|>', cleaned, re.DOTALL)
+        if match:
+            func_name = match.group(1).strip()
+            args_str = match.group(2).strip()
+            try:
+                args = json.loads(args_str)
+            except Exception:
+                args = args_str
+            return {
+                "action": "call_tool",
+                "target": func_name,
+                "arguments_or_instructions": args,
+                "step_summary": f"Native tool call: {func_name}",
+                "reason": "Parsed from <|tool_call>"
+            }
+        
+        # Fallback for weird syntaxes like <|tool_call>call:run_task(task_id="npm: 3")<tool_call|>
+        alt_match = re.search(r'<\|tool_call\|>\s*call:\s*([^\(]+)\((.*?)\)\s*<tool_call\|>', cleaned, re.DOTALL)
+        if alt_match:
+            func_name = alt_match.group(1).strip()
+            args = alt_match.group(2).strip()
+            return {
+                "action": "call_tool",
+                "target": func_name,
+                "arguments_or_instructions": args,
+                "step_summary": f"Native tool call: {func_name}",
+                "reason": "Parsed from <|tool_call>"
+            }
+
+    # 1. Try to extract from markdown code blocks first
+    if "```" in cleaned:
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+    # 2. If it starts/ends with braces, try to parse it directly
+    if cleaned.startswith('{') and cleaned.endswith('}'):
         try:
-            return json.loads(match.group(1).strip())
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
 
+    # 3. Try to locate the first '{' and last '}' and parse the substring
     start = cleaned.find('{')
     end = cleaned.rfind('}')
     if start != -1 and end != -1 and end > start:
+        if not (start == 0 and end == len(cleaned) - 1):
+            try:
+                return json.loads(cleaned[start:end+1].strip())
+            except json.JSONDecodeError:
+                pass
+
+    # 4. As a last resort, try parsing the whole cleaned string
+    if not (cleaned.startswith('{') and cleaned.endswith('}')):
         try:
-            return json.loads(cleaned[start:end+1].strip())
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
 
@@ -649,13 +791,15 @@ async def preload_supervisor():
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, get_llama_model, resolved_model_name, CONTEXT_WINDOW)
             else:
+                if llama_server_process is None or active_llama_server_model_name != resolved_model_name:
+                    await start_llama_server(resolved_model_name, CONTEXT_WINDOW)
                 payload = {
                     "model": resolved_model_name,
                     "prompt": "",
                     "stream": False,
                     "keep_alive": -1
                 }
-                async with httpx.AsyncClient(timeout=20) as client: await client.post(OLLAMA_URL, json=payload)
+                async with httpx.AsyncClient(timeout=20) as client: await client.post(LLAMA_SERVER_URL, json=payload)
             log_message(f"[Autoswap] Successfully warm-loaded '{resolved_model_name}'.")
         except Exception as e:
             log_message(f"[Autoswap] Warm-load failed: {e}")
@@ -689,28 +833,291 @@ def safe_parse_tool_args(payload_data: Any, expected_key: str) -> dict:
         return {expected_key: payload_data}
     return {}
 
+def extract_instructions(payload: Any) -> str:
+    if not payload:
+        return ""
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, dict):
+        for key in ["instructions", "instruction", "task", "prompt", "command", "text", "query"]:
+            if key in payload and isinstance(payload[key], str):
+                return payload[key].strip()
+        if len(payload) == 1:
+            val = list(payload.values())[0]
+            if isinstance(val, str):
+                return val.strip()
+        return json.dumps(payload)
+    if isinstance(payload, list):
+        return "\n".join(str(item) for item in payload)
+    return str(payload)
+
 # --- API Endpoints ---
+
+@app.get("/api/models")
+async def get_active_models():
+    """Returns the dynamically discovered local models in the format expected by the VS Code extension."""
+    global active_models_list
+    if not active_models_list:
+        active_models_list = get_installed_models()
+
+    models_to_report = [
+        {
+            "id": "serenity-supervisor-high",
+            "name": f"Serenity: Supervisor - High Mode ({SUPERVISOR_MODEL})",
+            "family": "serenity-supervisor",
+            "version": "1.0.0",
+            "maxInputTokens": 120000,
+            "maxOutputTokens": 16384,
+            "capabilities": {"toolCalling": True, "imageInput": False}
+        },
+        {
+            "id": "serenity-supervisor-low",
+            "name": f"Serenity: Supervisor - Low Mode ({SUPERVISOR_MODEL})",
+            "family": "serenity-supervisor",
+            "version": "1.0.0",
+            "maxInputTokens": 120000,
+            "maxOutputTokens": 16384,
+            "capabilities": {"toolCalling": True, "imageInput": False}
+        },
+        {
+            "id": "serenity-supervisor",
+            "name": f"Serenity: Orchestrator ({SUPERVISOR_MODEL}) [Default/High]",
+            "family": "serenity-supervisor",
+            "version": "1.0.0",
+            "maxInputTokens": 120000,
+            "maxOutputTokens": 16384,
+            "capabilities": {"toolCalling": True, "imageInput": False}
+        }
+    ]
+
+    for model_name in active_models_list:
+        gguf_path = resolve_gguf_path(model_name)
+        if gguf_path and os.path.exists(gguf_path):
+            models_to_report.append({
+                "id": model_name,
+                "name": f"Serenity: {model_name} (Worker)",
+                "family": model_name,
+                "version": "1.0.0",
+                "maxInputTokens": 120000,
+                "maxOutputTokens": 16384,
+                "capabilities": {"toolCalling": True, "imageInput": False}
+            })
+
+    return {"models": models_to_report}
 
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str):
     if session_id in sessions_history:
         del sessions_history[session_id]
         return {"status": "success", "message": f"Session {session_id} deleted."}
-    return {"status": "error", "message": "Session not found."}# --- Custom Model Mapping Helpers ---
+    return {"status": "error", "message": "Session not found."}
+
+COMMAND_RULES = [
+    # Blacklisted rules first (if any match, block it!)
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+log\b.*\s--output(=|\s|$)", False),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+branch\b.*\s-(d|D|m|M|-delete|-force)\b", False),
+    (r"^column\b.*\s-c\s+[0-9]{4,}", False),
+    (r"^date\b.*\s(-s|--set)\b", False),
+    (r"^find\b.*\s-(delete|exec|execdir|fprint|fprintf|fls|ok|okdir)\b", False),
+    (r"^rg\b.*\s(--pre|--hostname-bin)\b", False),
+    (r"^sed\b.*\s(-[a-zA-Z]*(e|f)[a-zA-Z]*|--expression|--file)\b", False),
+    (r"^sed\b.*s\/.*\/.*\/[ew]", False),
+    (r"^sed\b.*;W", False),
+    (r"^sort\b.*\s-(o|S)\b", False),
+    (r"^tree\b.*\s-o\b", False),
+    (r"^rm\b", False),
+    (r"^rmdir\b", False),
+    (r"^del\b", False),
+    (r"^Remove-Item\b", False),
+    (r"^ri\b", False),
+    (r"^rd\b", False),
+    (r"^erase\b", False),
+    (r"^dd\b", False),
+    (r"^ps\b", False),
+    (r"^top\b", False),
+    (r"^Stop-Process\b", False),
+    (r"^spps\b", False),
+    (r"^curl\b", False),
+    (r"^wget\b", False),
+
+    # Whitelisted rules
+    (r"^cd(\s+|$)", True),
+    (r"^echo(\s+|$)", True),
+    (r"^ls(\s+|$)", True),
+    (r"^dir(\s+|$)", True),
+    (r"^pwd(\s+|$)", True),
+    (r"^cat(\s+|$)", True),
+    (r"^head(\s+|$)", True),
+    (r"^tail(\s+|$)", True),
+    (r"^findstr(\s+|$)", True),
+    (r"^wc(\s+|$)", True),
+    (r"^tr(\s+|$)", True),
+    (r"^cut(\s+|$)", True),
+    (r"^cmp(\s+|$)", True),
+    (r"^which(\s+|$)", True),
+    (r"^basename(\s+|$)", True),
+    (r"^dirname(\s+|$)", True),
+    (r"^realpath(\s+|$)", True),
+    (r"^readlink(\s+|$)", True),
+    (r"^stat(\s+|$)", True),
+    (r"^file(\s+|$)", True),
+    (r"^od(\s+|$)", True),
+    (r"^du(\s+|$)", True),
+    (r"^df(\s+|$)", True),
+    (r"^sleep(\s+|$)", True),
+    (r"^nl(\s+|$)", True),
+    (r"^grep(\s+|$)", True),
+    (r"^column(\s+|$)", True),
+    (r"^date(\s+|$)", True),
+    (r"^find(\s+|$)", True),
+    (r"^rg(\s+|$)", True),
+    (r"^sed(\s+|$)", True),
+    (r"^sort(\s+|$)", True),
+    (r"^tree(\s+|$)", True),
+    (r"^xxd(\s+|$)", True),
+    (r"^xxd\b(\s+-\S+)*\s+[^-\s]\\S*$", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+status\b", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+log\b", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+show\b", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+diff\b", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+ls-files\b", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+grep\b", True),
+    (r"^git(\s+(-C\s+\S+|--no-pager))*\s+branch\b", True),
+    (r"^docker\s+(ps|images|info|version|inspect|logs|top|stats|port|diff|search|events)\b", True),
+    (r"^docker\s+(container|image|network|volume|context|system)\s+(ls|ps|inspect|history|show|df|info)\b", True),
+    (r"^docker\s+compose\s+(ps|ls|top|logs|images|config|version|port|events)\b", True),
+    (r"^Get-ChildItem(\s+|$)", True),
+    (r"^Get-Content(\s+|$)", True),
+    (r"^Get-Date(\s+|$)", True),
+    (r"^Get-Random(\s+|$)", True),
+    (r"^Get-Location(\s+|$)", True),
+    (r"^Set-Location(\s+|$)", True),
+    (r"^Write-Host(\s+|$)", True),
+    (r"^Write-Output(\s+|$)", True),
+    (r"^Out-String(\s+|$)", True),
+    (r"^Split-Path(\s+|$)", True),
+    (r"^Join-Path(\s+|$)", True),
+    (r"^Start-Sleep(\s+|$)", True),
+    (r"^Where-Object(\s+|$)", True),
+    (r"^Select-(Object|String|Xml)\b", True),
+    (r"^Measure-(Object|Command)\b", True),
+    (r"^Compare-Object\b", True),
+    (r"^Format-(Table|List|Wide|Custom|String)\b", True),
+    (r"^Sort-Object\b", True),
+    (r"^npm\s+(ls|list|outdated|view|info|show|explain|why|root|prefix|bin|search|doctor|fund|repo|bugs|docs|home|help(-search)?)\b", True),
+    (r"^npm\s+config\s+(list|get)\b", True),
+    (r"^npm\s+pkg\s+get\b", True),
+    (r"^npm\s+audit$", True),
+    (r"^npm\s+cache\s+verify\b", True),
+    (r"^yarn\s+(list|outdated|info|why|bin|help|versions)\b", True),
+    (r"^yarn\s+licenses\b", True),
+    (r"^yarn\s+audit\b(?!.*\bfix\b)", True),
+    (r"^yarn\s+config\s+(list|get)\b", True),
+    (r"^yarn\s+cache\s+dir\b", True),
+    (r"^pnpm\s+(ls|list|outdated|why|root|bin|doctor)\b", True),
+    (r"^pnpm\s+licenses\b", True),
+    (r"^pnpm\s+audit\b(?!.*\bfix\b)", True),
+    (r"^pnpm\s+config\s+(list|get)\b", True),
+    (r"^npm\s+ci\b", True),
+    (r"^yarn\s+install\s+--frozen-lockfile\b", True),
+    (r"^pnpm\s+install\s+--frozen-lockfile\b", True)
+]
+
+def split_command_statements(command_line: str) -> List[str]:
+    try:
+        pattern = r'(".*?"|\'.*?\'|&&|\|\||;|\|)'
+        parts = re.split(pattern, command_line)
+        statements = []
+        current = []
+        for part in parts:
+            if part in ["&&", "||", ";", "|"]:
+                stmt = "".join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+            else:
+                current.append(part)
+        stmt = "".join(current).strip()
+        if stmt:
+            statements.append(stmt)
+        return statements
+    except Exception:
+        return [command_line.strip()]
+
+def is_command_allowed(command_line: str) -> bool:
+    statements = split_command_statements(command_line)
+    if not statements:
+        return False
+    for stmt in statements:
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        for pattern, allowed in COMMAND_RULES:
+            if not allowed:
+                if re.search(pattern, stmt, re.I):
+                    log_message(f"[Command Filter] Blocked command statement '{stmt}' by blacklist pattern '{pattern}'")
+                    return False
+        matched_whitelist = False
+        for pattern, allowed in COMMAND_RULES:
+            if allowed:
+                if re.search(pattern, stmt, re.I):
+                    matched_whitelist = True
+                    break
+        if not matched_whitelist:
+            log_message(f"[Command Filter] Blocked command statement '{stmt}' (no matching whitelist pattern)")
+            return False
+    return True
+
+class StreamingThoughtFilter:
+    def __init__(self):
+        self.buffer = ""
+        self.in_thought = False
+        self.thought_started = False
+        
+    def feed(self, chunk: str) -> str:
+        self.buffer += chunk
+        
+        if not self.thought_started:
+            for tag in ["<|channel>thought", "<think>", "<thought>"]:
+                if tag in self.buffer:
+                    self.in_thought = True
+                    self.thought_started = True
+                    break
+            if not self.thought_started and len(self.buffer) > 50:
+                flushed = self.buffer
+                self.buffer = ""
+                return flushed
+                
+        if self.in_thought:
+            for end_tag in ["<channel|>", "</think>", "</thought>"]:
+                idx = self.buffer.find(end_tag)
+                if idx != -1:
+                    self.in_thought = False
+                    self.buffer = self.buffer[idx + len(end_tag):]
+                    flushed = self.buffer
+                    self.buffer = ""
+                    return flushed
+            return ""
+        else:
+            flushed = self.buffer
+            self.buffer = ""
+            return flushed
+
+    def flush_remaining(self) -> str:
+        if self.in_thought:
+            return ""
+        return self.buffer
+
+# --- Custom Model Mapping Helpers ---
 MAX_HISTORY_TURNS = 10
 
 def is_standalone_model(model_id: str) -> bool:
-    return model_id in ["serenity-w1", "serenity-w2", "serenity-w3", "serenity-w4"]
+    return model_id not in ["serenity-supervisor", "serenity-supervisor-high", "serenity-supervisor-low"]
 
 def map_custom_model_id(model_id: str) -> str:
-    mapping = {
-        "serenity-supervisor": SUPERVISOR_MODEL,
-        "serenity-w1": W1_MODEL,
-        "serenity-w2": W2_MODEL,
-        "serenity-w3": W3_MODEL,
-        "serenity-w4": W4_MODEL
-    }
-    return mapping.get(model_id, model_id)
+    if model_id in ["serenity-supervisor", "serenity-supervisor-high", "serenity-supervisor-low"]:
+        return SUPERVISOR_MODEL
+    return model_id
 
 async def run_orchestration(request: QueryRequest, http_request: Request):
     """
@@ -766,6 +1173,17 @@ async def run_orchestration(request: QueryRequest, http_request: Request):
 <|think|>
 You are SerenityDev running in standalone mode for model {request.model}.
 Provide a clean, direct, production-ready response in Markdown format. Avoid system markers.
+
+PONYTAIL LAZINESS LADDER:
+Before writing code, stop at the first rung that holds:
+1. Does this need to exist? (YAGNI) -> skip it.
+2. Already in codebase? -> reuse it, don't rewrite.
+3. Stdlib does it? -> use it.
+4. Native platform feature? -> use it.
+5. Installed dependency? -> use it.
+6. One line? -> one line.
+7. Only then: minimum that works (without compromising safety or validation).
+Never compromise on security, input validation, or error handling.
 <turn|>
 <|turn>user
 <context>
@@ -815,6 +1233,57 @@ Provide a clean, direct, production-ready response in Markdown format. Avoid sys
             return
 
         # --- Path B: Multi-Agent Supervisor Routing Pipeline ---
+        # Parse slash commands if present
+        mode = "agent"
+        raw_prompt = request.prompt.strip()
+        matched_cmd = None
+        if raw_prompt.startswith(("/explore", "/exolore")):
+            mode = "explore"
+            matched_cmd = "/explore" if raw_prompt.startswith("/explore") else "/exolore"
+        elif raw_prompt.startswith("/plan"):
+            mode = "plan"
+            matched_cmd = "/plan"
+        elif raw_prompt.startswith("/execute"):
+            mode = "execute"
+            matched_cmd = "/execute"
+        elif raw_prompt.startswith("/agent"):
+            mode = "agent"
+            matched_cmd = "/agent"
+
+        if matched_cmd:
+            cleaned_prompt = raw_prompt[len(matched_cmd):].strip()
+            request.prompt = cleaned_prompt if cleaned_prompt else "List or summarize the codebase structures"
+            log_message(f"[Orchestrator] Slash Command Detected: {matched_cmd}. Mode: {mode}. Cleaned Prompt: {request.prompt}")
+
+        mode_instructions = ""
+        if mode == "explore":
+            mode_instructions = (
+                "\nCRITICAL EXPLORE MODE CONSTRAINT:\n"
+                "- You are running in read-only EXPLORE mode. You are restricted to read-only tools: "
+                "mcp:filesystem:list_directory, mcp:filesystem:read_file, and mcp:filesystem:grep_search.\n"
+                "- Do NOT modify any files. Do NOT use write_file, insert_edit_into_file, replace_string_in_file, multi_replace_string_in_file.\n"
+                "- You must NOT make any changes. Explore the codebase to understand the query, then delegate to W1 to summarize the findings.\n"
+            )
+        elif mode == "plan":
+            mode_instructions = (
+                "\nCRITICAL PLAN MODE CONSTRAINT:\n"
+                "- You are running in PLAN mode. Your sole objective is to formulate a plan to address the prompt.\n"
+                "- You may read files to understand context, but you must NOT write, edit, or modify any files.\n"
+                "- Once the plan is ready, delegate to W1 to present the details of the plan to the user.\n"
+            )
+        elif mode == "execute":
+            mode_instructions = (
+                "\nCRITICAL EXECUTE MODE:\n"
+                "- You are running in EXECUTE mode. Your objective is to implement changes to the codebase.\n"
+                "- You have full, direct access to compile/test via 'mcp:terminal:run_command', modify files using edit/write tools directly, or delegate code generation tasks to specialist workers as needed.\n"
+            )
+        elif mode == "agent":
+            mode_instructions = (
+                "\nCRITICAL AGENT MODE:\n"
+                "- You are running in AGENT mode. Act as an autonomous coordinator.\n"
+                "- You can execute any tools directly (compiling, file edits, etc.) or delegate tasks to specialized worker agents on an as-needed basis.\n"
+            )
+
         if not is_programmatic:
             yield {"type": "progress", "text": "Resolving active model weights..."}
             await asyncio.sleep(0.01)
@@ -848,9 +1317,18 @@ Provide a clean, direct, production-ready response in Markdown format. Avoid sys
             w4_res = await resolve_model(W4_MODEL)
             log_message(f"[Orchestrator] Resolved Models -> Supervisor/W1: {supervisor_res}, W2: {w2_res}, W3: {w3_res}, W4: {w4_res}")
 
+        # Determine High / Low Mode
+        is_low_mode = (request.model == "serenity-supervisor-low")
+        max_tool_loops = 3 if is_low_mode else 6
+        supervisor_temp = 0.1 if is_low_mode else 0.5
+        mode_explanation_prompt = (
+            "- You are running in Low-Resource Efficiency Mode. Output minimal explanations. Keep 'reason' and 'step_summary' fields short, concise, and direct. Focus on token savings and speed.\n"
+            if is_low_mode else
+            "- You are running in High-Capacity Reasoning Mode. Explain your thoughts fully. Detail your plan, rationale, and validation checks in 'reason' and 'step_summary' to ensure maximum accuracy.\n"
+        )
+
         # Phase 1: Autonomous Multi-Turn Tool Loop
         tool_loop_count = 0
-        max_tool_loops = 4
         agent_steps = []
         worker_id = "W1"
         instructions = ""
@@ -858,6 +1336,7 @@ Provide a clean, direct, production-ready response in Markdown format. Avoid sys
         
         supervisor_context = request.context
         worker_context = ""
+        worker_tool_responses = []
 
         while tool_loop_count < max_tool_loops:
             routing_prompt = f"""<bos><|turn>system
@@ -866,8 +1345,12 @@ You are the SerenityDev Hierarchical Supervisor (Gemma-4 Core). You run a multi-
 Your immediate objective is to analyze the user's request, establish a multi-step plan, and pull the exact content of files required.
 
 CRITICAL CONTEXT RULES:
+- If the task requires changing or understanding code in existing files, you MUST first search for or read those files using 'read_file', 'grep_search', or 'list_directory' to enrich your context. Do NOT delegate to workers or execute code writes without first reading the target files.
 - Minimize context bloat. Only read files directly related to the user request.
 - Always create or update your plan before executing code writes.
+- Enforce the Ponytail Laziness Ladder on all Worker agents (YAGNI, reuse codebase, stdlib, native platform, installed dependency, one line, minimum works) to keep code minimal.
+{mode_instructions}
+{mode_explanation_prompt}
 
 AVAILABLE TOOLS:
 - mcp:filesystem:create_or_update_plan
@@ -877,8 +1360,8 @@ AVAILABLE TOOLS:
   Args: {{}}
   Description: Lists all files in the current workspace root.
 - mcp:filesystem:read_file
-  Args: {{"path": "relative_path"}}
-  Description: Reads code from a file.
+  Args: {{"path": "relative_path", "start_line": int, "end_line": int}}
+  Description: Reads code from a file. If the file is large, start_line and end_line (1-indexed, inclusive) must be specified to read target regions and prevent context bloat.
 - mcp:filesystem:write_file
   Args: {{"path": "relative_path", "content": "full_file_content"}}
   Description: Writes or overwrites code.
@@ -894,11 +1377,19 @@ AVAILABLE TOOLS:
 - mcp:filesystem:grep_search
   Args: {{"query": "search_term"}}
   Description: Searches for text patterns across project files.
+- mcp:terminal:run_command
+  Args: {{"command": "string"}}
+  Description: Runs a shell command in the workspace and returns stdout/stderr. Use this to run tests, linters, or build scripts.
 
 DECISION RULE:
 1. If you haven't formulated a plan or need to look up file locations, call 'create_or_update_plan' or 'list_directory'.
-2. If you need to evaluate file structures, call 'read_file' or 'grep_search'.
-3. Once context is fully populated and plans are set, delegate code generation to your specialist workers.
+2. If the request involves modifying or checking files, you MUST call 'read_file' or 'grep_search' to read the files first.
+3. Only delegate to workers or execute writes after you have gathered and inspected the required file contents.
+4. You have full direct access to all execution tools. You can choose to:
+   - Edit, write, or modify code directly using file editing tools (write_file, insert_edit_into_file, replace_string_in_file, multi_replace_string_in_file).
+   - Compile, build, lint, or run tests directly using 'mcp:terminal:run_command'.
+   - Delegate any part of the task to a specialist worker agent (W1, W2, W3, W4) with clear instructions.
+5. Choose the path (direct tool usage vs worker delegation) that is most accurate, safe, and efficient for the current task.
 
 Workers:
 - W1 (Gemma 26B MOE): Complex architecture, multi-step debugging.
@@ -909,12 +1400,12 @@ Workers:
 You must respond with a JSON object matching this schema exactly:
 {{
   "action": "call_tool" | "delegate_worker",
-  "target": "mcp:filesystem:create_or_update_plan" | "mcp:filesystem:list_directory" | "mcp:filesystem:read_file" | "mcp:filesystem:write_file" | "mcp:filesystem:insert_edit_into_file" | "mcp:filesystem:replace_string_in_file" | "mcp:filesystem:multi_replace_string_in_file" | "mcp:filesystem:grep_search" | "W1" | "W2" | "W3" | "W4",
-  "arguments_or_instructions": "Provide the argument dictionary/JSON for a tool call, OR instructions for a worker.",
+  "target": "mcp:filesystem:create_or_update_plan" | "mcp:filesystem:list_directory" | "mcp:filesystem:read_file" | "mcp:filesystem:write_file" | "mcp:filesystem:insert_edit_into_file" | "mcp:filesystem:replace_string_in_file" | "mcp:filesystem:multi_replace_string_in_file" | "mcp:filesystem:grep_search" | "mcp:terminal:run_command" | "W1" | "W2" | "W3" | "W4",
+  "arguments_or_instructions": {{"key": "value"}} or "string_instructions",
   "step_summary": "A short summary of what was learned or done in this step, to be added to the timeline.",
   "reason": "Explain your tactical thinking."
 }}
-Respond ONLY with raw JSON. No markdown wrappers.
+CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|tool_call> tags. No markdown wrappers.
 <turn|>
 <|turn>user
 <context>
@@ -932,20 +1423,35 @@ Respond ONLY with raw JSON. No markdown wrappers.
                 yield {"type": "progress", "text": f"Supervisor routing phase (turn {tool_loop_count + 1})..."}
                 await asyncio.sleep(0.01)
 
-            try:
-                res = await generate_completion(supervisor_res, routing_prompt, 0.1, CONTEXT_WINDOW)
-                routing_raw = res.get('response', '')
-                decision = extract_json(routing_raw)
-            except Exception as e:
-                decision = None
-                log_message(f"[Supervisor Error] Routing phase failed: {e}")
+            decision = None
+            retry_count = 0
+            max_retries = 2
+            current_routing_prompt = routing_prompt
+            routing_raw = ""
+
+            while retry_count <= max_retries:
+                try:
+                    res = await generate_completion(supervisor_res, current_routing_prompt, supervisor_temp + (0.05 * retry_count), CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05)
+                    routing_raw = res.get('response', '')
+                    decision = extract_json(routing_raw)
+                    if decision and "action" in decision and "target" in decision:
+                        break
+                    else:
+                        raise ValueError("Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.")
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        log_message(f"[Supervisor Self-Healing] Failed after {max_retries} retries. Falling back to W1. Error: {e}")
+                        break
+                    log_message(f"[Supervisor Self-Healing] Attempt {retry_count} failed: {e}. Retrying with error details...")
+                    current_routing_prompt = routing_prompt + f"\n\n[SYSTEM ERROR: Your previous response was invalid and could not be parsed. Error: {str(e)}.\nYour previous raw response was:\n{routing_raw}\n\nPlease correct this and output ONLY a valid JSON object matching the schema exactly. Do not wrap in markdown or add text before/after.]\n"
 
             if not decision or "action" not in decision:
                 decision = {
                     "action": "delegate_worker",
                     "target": "W1",
                     "arguments_or_instructions": "Provide direct code solutions.",
-                    "reason": "Default fallback triggered due to parsing failure."
+                    "reason": "Default fallback triggered due to routing or parsing failure after retries."
                 }
 
             action = decision.get("action", "delegate_worker")
@@ -954,9 +1460,14 @@ Respond ONLY with raw JSON. No markdown wrappers.
             reason = decision.get("reason", "Standard execution flow")
             step_summary = decision.get("step_summary", reason)
 
+
             if action == "delegate_worker":
                 worker_id = target if target in ["W1", "W2", "W3", "W4"] else "W1"
-                instructions = payload_data
+                instructions = extract_instructions(payload_data)
+                if mode == "explore":
+                    instructions = f"[EXPLORE MODE - READ ONLY] {instructions}"
+                elif mode == "plan":
+                    instructions = f"[PLAN MODE - DO NOT MODIFY FILES] {instructions}"
                 break
 
             if not is_programmatic:
@@ -967,7 +1478,58 @@ Respond ONLY with raw JSON. No markdown wrappers.
             tool_context = ""
             full_tool_context = None
 
-            if target == "mcp:filesystem:create_or_update_plan":
+            # Hardened constraint check for read-only modes
+            if mode in ["explore", "plan"] and target in [
+                "mcp:filesystem:write_file",
+                "mcp:filesystem:insert_edit_into_file",
+                "mcp:filesystem:replace_string_in_file",
+                "mcp:filesystem:multi_replace_string_in_file"
+            ]:
+                tool_context = f"\n\n[System Tool Error: Action blocked. You are in {mode.upper()} mode, which is read-only. Modifying files is forbidden.]\n"
+                log_message(f"[Constraint Blocked] Blocked write tool {target} in {mode} mode.")
+                agent_steps.append({
+                    "step": tool_loop_count + 1,
+                    "tool": target,
+                    "status": "error",
+                    "details": "Blocked by read-only mode"
+                })
+
+            if target == "mcp:terminal:run_command":
+                try:
+                    args = safe_parse_tool_args(payload_data, "command")
+                    command = args.get("command")
+                    if command:
+                        if not is_command_allowed(command):
+                            tool_context = f"\n\n[System Tool Error: Command execution blocked by security policy: '{command}']\n"
+                            log_message(f"[Constraint Blocked] Blocked command execution: {command}")
+                            agent_steps.append({
+                                "step": tool_loop_count + 1,
+                                "tool": f"run_command: {command}",
+                                "status": "error",
+                                "details": "Blocked by security policy"
+                            })
+                        else:
+                            # Wrap command in PowerShell to support standard aliases like 'ls'
+                            full_cmd = f"powershell -NoProfile -Command \"{command}\""
+                            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30)
+                        stdout = result.stdout[:2000]
+                        stderr = result.stderr[:2000]
+                        tool_context = f"\n\n[System Tool Response: Command Exited with {result.returncode}]\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}\n"
+                        log_message(f"[Tool Success] Executed command: {command}")
+                        agent_steps.append({
+                            "step": tool_loop_count + 1,
+                            "tool": f"run_command: {command}",
+                            "status": "success" if result.returncode == 0 else "error",
+                            "details": f"Exit {result.returncode}"
+                        })
+                    else:
+                        tool_context = f"\n\n[System Tool Error: No command provided]\n"
+                except subprocess.TimeoutExpired:
+                    tool_context = f"\n\n[System Tool Error: Command timed out after 30 seconds]\n"
+                except Exception as e:
+                    tool_context = f"\n\n[System Tool Error: Command failed: {e}]\n"
+
+            elif target == "mcp:filesystem:create_or_update_plan":
                 try:
                     args = safe_parse_tool_args(payload_data, "steps")
                     steps = args.get("steps", [])
@@ -1016,17 +1578,37 @@ Respond ONLY with raw JSON. No markdown wrappers.
                 try:
                     args = safe_parse_tool_args(payload_data, "path")
                     file_path = args.get("path") if isinstance(args, dict) else None
+                    start_line = args.get("start_line") if isinstance(args, dict) else None
+                    end_line = args.get("end_line") if isinstance(args, dict) else None
                     if file_path and os.path.exists(file_path):
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                              file_contents = f.read()
                         
-                        full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}']\n{file_contents}\n"
-                        if len(file_contents) > 8000:
-                            trunc_contents = file_contents[:4000] + f"\n...[{len(file_contents)-8000} chars truncated for supervisor]...\n" + file_contents[-4000:]
+                        file_lines = file_contents.splitlines()
+                        total_lines = len(file_lines)
+                        
+                        if start_line is not None and end_line is not None:
+                            try:
+                                s = max(1, int(start_line))
+                                e = min(total_lines, int(end_line))
+                                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[s-1:e], start=s)]
+                                response_content = "\n".join(sliced_lines)
+                                full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}' (Lines {s}-{e} of {total_lines})]\n{response_content}\n"
+                            except Exception as ex:
+                                raise ValueError(f"Invalid line range parameters: {ex}")
                         else:
-                            trunc_contents = file_contents
-                            
-                        tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}']\n{trunc_contents}\n"
+                            # Auto-truncation threshold for files without explicit ranges
+                            if len(file_lines) > 150:
+                                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[:100], start=1)]
+                                response_content = "\n".join(sliced_lines)
+                                warn_msg = f"\n... [File too large ({len(file_lines)} lines). Auto-truncated to first 100 lines to prevent bloat. Use 'read_file' with 'start_line' and 'end_line' or use 'grep_search' to locate target code.] ...\n"
+                                full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}' (First 100 lines of {total_lines})]\n{response_content}{warn_msg}"
+                            else:
+                                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines, start=1)]
+                                response_content = "\n".join(sliced_lines)
+                                full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}']\n{response_content}\n"
+                        
+                        tool_context = full_tool_context
                         log_message(f"[Tool Success] Read {len(file_contents)} characters from: {file_path}")
                         agent_steps.append({
                             "step": tool_loop_count + 1,
@@ -1311,7 +1893,20 @@ Respond ONLY with raw JSON. No markdown wrappers.
             if len(supervisor_context) > 50000:
                 supervisor_context = "...\n[Earlier tool responses truncated for context window limits]\n..." + supervisor_context[-20000:]
             
-            worker_context = f"{worker_context}{full_tool_context}"
+            worker_tool_responses.append(full_tool_context)
+            total_worker_len = sum(len(r) for r in worker_tool_responses)
+            if total_worker_len > 30000:
+                rebuilt_responses = []
+                for idx, r in enumerate(worker_tool_responses):
+                    # Keep the last 2 tool responses in full, truncate older ones to just headers/first line
+                    if idx >= len(worker_tool_responses) - 2:
+                        rebuilt_responses.append(r)
+                    else:
+                        first_line = r.splitlines()[0] if r.strip() else "[Empty Tool Response]"
+                        rebuilt_responses.append(f"\n\n{first_line}\n... [Early tool response contents truncated to preserve worker context window] ...\n")
+                worker_context = "".join(rebuilt_responses)
+            else:
+                worker_context = "".join(worker_tool_responses)
             tool_loop_count += 1
 
         if tool_loop_count >= max_tool_loops:
@@ -1326,18 +1921,36 @@ Respond ONLY with raw JSON. No markdown wrappers.
 
         worker_model = w1_res if worker_id == "W1" else (w2_res if worker_id == "W2" else (w3_res if worker_id == "W3" else w4_res))
         
-        if worker_model != supervisor_res and not (llama_cpp_available and resolve_gguf_path(worker_model)):
+        if (llama_server_process is not None and llama_server_process.poll() is None) and worker_model != supervisor_res and not (llama_cpp_available and resolve_gguf_path(worker_model)):
             log_message(f"[Orchestrator] VRAM Swap: Unloading Supervisor '{supervisor_res}' to free VRAM for '{worker_model}'...")
             try:
                 async with httpx.AsyncClient(timeout=5) as client:
-                    await client.post(OLLAMA_URL, json={"model": supervisor_res, "keep_alive": 0})
+                    await client.post(LLAMA_SERVER_URL, json={"model": supervisor_res, "keep_alive": 0})
             except Exception:
                 pass
+
+        worker_mode_constraint = ""
+        if mode == "explore":
+            worker_mode_constraint = "\nCRITICAL: You are running in read-only EXPLORE mode. Do NOT generate file edits, writes, or modifications. Only analyze and explain structures."
+        elif mode == "plan":
+            worker_mode_constraint = "\nCRITICAL: You are running in PLAN mode. Do NOT generate file edits or modifications. Only output a structured, complete plan."
+
         worker_prompt = f"""<bos><|turn>system
 <|think|>
-You are SerenityDev {worker_id}, a specialized software engineering agent.
+You are SerenityDev {worker_id}, a specialized software engineering agent.{worker_mode_constraint}
 Instructions: {instructions}
 Provide a clean, direct, production-ready response in Markdown format. Avoid system markers.
+
+PONYTAIL LAZINESS LADDER:
+Before writing code, stop at the first rung that holds:
+1. Does this need to exist? (YAGNI) -> skip it.
+2. Already in codebase? -> reuse it, don't rewrite.
+3. Stdlib does it? -> use it.
+4. Native platform feature? -> use it.
+5. Installed dependency? -> use it.
+6. One line? -> one line.
+7. Only then: minimum that works (without compromising safety or validation).
+Never compromise on security, input validation, or error handling.
 <turn|>
 <|turn>user
 <context>
@@ -1354,9 +1967,33 @@ Provide a clean, direct, production-ready response in Markdown format. Avoid sys
 """
 
         log_message(f"[Orchestrator] Running Worker {worker_id} ({worker_model.split(':')[0]})...")
+        if not is_programmatic:
+            timeline_md = ""
+            if agent_steps:
+                timeline_md = "> 🛠️ **Agentic Tools Executed:**\n"
+                for step in agent_steps:
+                    icon = "🟢" if step["status"] == "success" else "🟡"
+                    timeline_md += f"> {step['step']}. {icon} `{step['tool']}` ➡️ *{step['details']}*\n"
+                timeline_md += ">\n"
+
+            prelim_header = f"""> ### 🤖 SERENITY DEV ORCHESTRATION REPORT\n> 🗺️ **Routing:** `Supervisor ({supervisor_res.split(':')[0]})` ➡️ `Worker: {worker_id} ({worker_model.split(':')[0]})`\n> ⚙️ **Mode:** `{mode.upper()}`\n> 🎯 **Reason:** *"{reason}"*\n{timeline_md}> 🔍 **Review:** `⏳ In Progress (Awaiting Worker Draft & Supervisor Review)`\n\n---\n\n"""
+            yield {"type": "content", "content": prelim_header}
+            await asyncio.sleep(0.01)
+
         try:
-            res = await generate_completion(worker_model, worker_prompt, 0.2, CONTEXT_WINDOW)
-            worker_draft_raw = res.get('response', '')
+            worker_draft_parts = []
+            thought_filter = StreamingThoughtFilter()
+            async for chunk in generate_completion_stream(worker_model, worker_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
+                worker_draft_parts.append(chunk)
+                filtered = thought_filter.feed(chunk)
+                if filtered:
+                    yield {"type": "content", "content": filtered}
+            
+            remaining = thought_filter.flush_remaining()
+            if remaining:
+                yield {"type": "content", "content": remaining}
+                
+            worker_draft_raw = "".join(worker_draft_parts)
             final_answer = clean_thought_and_whitespace(worker_draft_raw)
         except Exception as e:
             yield {"type": "error", "detail": f"Worker failure during synthesis: {str(e)}"}
@@ -1367,11 +2004,11 @@ Provide a clean, direct, production-ready response in Markdown format. Avoid sys
             yield {"type": "progress", "text": "Supervisor is reviewing draft quality..."}
             await asyncio.sleep(0.01)
 
-        if worker_model != supervisor_res and not (llama_cpp_available and resolve_gguf_path(worker_model)):
+        if (llama_server_process is not None and llama_server_process.poll() is None) and worker_model != supervisor_res and not (llama_cpp_available and resolve_gguf_path(worker_model)):
             log_message(f"[Orchestrator] VRAM Swap: Unloading Worker '{worker_model}' to free VRAM for Supervisor Review...")
             try:
                 async with httpx.AsyncClient(timeout=5) as client:
-                    await client.post(OLLAMA_URL, json={"model": worker_model, "keep_alive": 0})
+                    await client.post(LLAMA_SERVER_URL, json={"model": worker_model, "keep_alive": 0})
             except Exception:
                 pass
 
@@ -1403,7 +2040,7 @@ Respond ONLY with the raw JSON object. Do not wrap it in markdown code blocks or
         approved = True
         feedback = ""
         try:
-            res = await generate_completion(supervisor_res, review_prompt, 0.1, CONTEXT_WINDOW)
+            res = await generate_completion(supervisor_res, review_prompt, 0.2, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05)
             review_raw = res.get('response', '')
             review_decision = extract_json(review_raw)
             if review_decision:
@@ -1418,22 +2055,43 @@ Respond ONLY with the raw JSON object. Do not wrap it in markdown code blocks or
                 w1_name = w1_res.split(':')[0]
                 yield {"type": "progress", "text": f"Supervisor rejected draft. Refinement model rewriting ({w1_name})..."}
                 await asyncio.sleep(0.01)
+                
+                rejection_msg = f"\n\n---\n> 🔍 **Review:** `❌ Rejected -> Re-routed (Reason: {feedback[:100]}...)`\n> 🔄 **Refinement Model Rewriting ({w1_name})...**\n\n"
+                yield {"type": "content", "content": rejection_msg}
+                await asyncio.sleep(0.01)
 
-            if w1_res != supervisor_res and not (llama_cpp_available and resolve_gguf_path(w1_res)):
+            if (llama_server_process is not None and llama_server_process.poll() is None) and w1_res != supervisor_res and not (llama_cpp_available and resolve_gguf_path(w1_res)):
                 log_message(f"[Orchestrator] VRAM Swap: Unloading Supervisor '{supervisor_res}' for W1 Refinement...")
                 try:
                     async with httpx.AsyncClient(timeout=5) as client:
-                        await client.post(OLLAMA_URL, json={"model": supervisor_res, "keep_alive": 0})
+                        await client.post(LLAMA_SERVER_URL, json={"model": supervisor_res, "keep_alive": 0})
                 except Exception:
                     pass
 
             log_message(f"[Supervisor Rejection] Draft failed quality check. Feedback: {feedback}")
             log_message(f"[Orchestrator] Re-routing task to high-capacity reasoning model {w1_res}...")
             
+            refine_mode_constraint = ""
+            if mode == "explore":
+                refine_mode_constraint = "\nCRITICAL: You are running in read-only EXPLORE mode. Do NOT generate file edits, writes, or modifications. Only analyze and explain."
+            elif mode == "plan":
+                refine_mode_constraint = "\nCRITICAL: You are running in PLAN mode. Do NOT generate file edits or modifications. Only output a structured, complete plan."
+
             refine_prompt = f"""<bos><|turn>system
 <|think|>
-You are the SerenityDev W1 worker. You have been assigned to revise and correct a draft answer based on feedback from the Hierarchical Supervisor.
+You are a SerenityDev Worker. You have been assigned to revise and correct a draft answer based on feedback from the Hierarchical Supervisor.{refine_mode_constraint}
 Please rewrite the answer, ensuring all feedback is fully addressed, code is perfectly correct, and formatting is clean. Provide a direct, professional markdown solution.
+
+PONYTAIL LAZINESS LADDER:
+Before writing code, stop at the first rung that holds:
+1. Does this need to exist? (YAGNI) -> skip it.
+2. Already in codebase? -> reuse it, don't rewrite.
+3. Stdlib does it? -> use it.
+4. Native platform feature? -> use it.
+5. Installed dependency? -> use it.
+6. One line? -> one line.
+7. Only then: minimum that works (without compromising safety or validation).
+Never compromise on security, input validation, or error handling.
 <turn|>
 <|turn>user
 User Request: {request.prompt}
@@ -1445,27 +2103,28 @@ Previous Draft:
 <|turn>model
 <|channel>thought
 """
-            refine_payload = {
-                "model": w1_res,
-                "prompt": refine_prompt,
-                "stream": False,
-                "raw": True,
-                "options": {
-                    "temperature": 0.1,
-                    "num_predict": -1,
-                    "num_ctx": CONTEXT_WINDOW,
-                    "num_gpu": calculate_dynamic_gpu_layers(w1_res, CONTEXT_WINDOW)
-                }
-            }
 
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    res = await client.post(OLLAMA_URL, json=refine_payload)
-                    refined_raw = res.json().get('response', '')
-                    final_answer = clean_thought_and_whitespace(refined_raw)
-                    log_message(f"[Orchestrator] Refined solution successfully synthesized.")
+                refined_parts = []
+                thought_filter = StreamingThoughtFilter()
+                async for chunk in generate_completion_stream(w1_res, refine_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
+                    refined_parts.append(chunk)
+                    filtered = thought_filter.feed(chunk)
+                    if filtered:
+                        yield {"type": "content", "content": filtered}
+                
+                remaining = thought_filter.flush_remaining()
+                if remaining:
+                    yield {"type": "content", "content": remaining}
+                    
+                refined_raw = "".join(refined_parts)
+                final_answer = clean_thought_and_whitespace(refined_raw)
+                log_message(f"[Orchestrator] Refined solution successfully synthesized.")
             except Exception as e:
                 log_message(f"[Orchestrator Error] Refinement loop failed, falling back to worker draft: {e}")
+        else:
+            if not is_programmatic:
+                yield {"type": "content", "content": "\n\n---\n> 🔍 **Review:** `✅ Approved by Supervisor`"}
 
         # Assemble the report
         clean_answer = clean_thought_and_whitespace(final_answer)
@@ -1477,26 +2136,13 @@ Previous Draft:
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, get_llama_model, supervisor_res, CONTEXT_WINDOW)
                 else:
+                    if llama_server_process is None or active_llama_server_model_name != supervisor_res:
+                        await start_llama_server(supervisor_res, CONTEXT_WINDOW)
                     async with httpx.AsyncClient(timeout=20) as client:
-                        await client.post(OLLAMA_URL, json={"model": supervisor_res, "prompt": "", "stream": False, "keep_alive": -1})
+                        await client.post(LLAMA_SERVER_URL, json={"model": supervisor_res, "prompt": "", "stream": False, "keep_alive": -1})
             except Exception:
                 pass
         BackgroundTasks().add_task(run_preload)
-
-        if is_programmatic:
-            full_response_answer = clean_answer
-        else:
-            review_badge = "✅ Approved by Supervisor" if approved else f"❌ Rejected -> Re-routed (Reason: {feedback[:60]}...)"
-            timeline_md = ""
-            if agent_steps:
-                timeline_md = "> 🛠️ **Agentic Tools Executed:**\n"
-                for step in agent_steps:
-                    icon = "🟢" if step["status"] == "success" else "🟡"
-                    timeline_md += f"> {step['step']}. {icon} `{step['tool']}` ➡️ *{step['details']}*\n"
-                timeline_md += ">\n"
-
-            premium_header = f"""> ### 🤖 SERENITY DEV ORCHESTRATION REPORT\n> 🗺️ **Routing:** `Supervisor ({supervisor_res.split(':')[0]})` ➡️ `Worker: {worker_id} ({worker_model.split(':')[0]})`\n> 🎯 **Reason:** *"{reason}"*\n{timeline_md}> 🔍 **Review:** `{review_badge}`\n\n---\n\n"""
-            full_response_answer = f"{premium_header}{clean_answer}"
 
         if session_id:
             sessions_history[session_id].append({
@@ -1506,12 +2152,7 @@ Previous Draft:
             if len(sessions_history[session_id]) > MAX_HISTORY_TURNS:
                 sessions_history[session_id].pop(0)
 
-        # Stream chunks back to client
-        chunk_size = 64
-        for idx in range(0, len(full_response_answer), chunk_size):
-            chunk = full_response_answer[idx : idx + chunk_size]
-            yield {"type": "content", "content": chunk}
-            await asyncio.sleep(0.005)
+        review_badge = "✅ Approved by Supervisor" if approved else f"❌ Rejected -> Re-routed (Reason: {feedback[:60]}...)"
 
         yield {
             "type": "done",
@@ -1659,6 +2300,8 @@ async def resume_server():
 class ConfigUpdate(BaseModel):
     model_consolidation: Optional[bool] = None
     current_model: Optional[str] = None
+    cache_type_k: Optional[str] = None
+    cache_type_v: Optional[str] = None
 
 @app.get("/api/config")
 async def get_config():
@@ -1669,38 +2312,56 @@ async def get_config():
         "w1_model": W1_MODEL,
         "w2_model": W2_MODEL,
         "w3_model": W3_MODEL,
-        "fim_model": FIM_MODEL
+        "fim_model": FIM_MODEL,
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v
     }
 
 @app.post("/api/config")
 async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks):
-    global model_consolidation, CURRENT_MODEL
+    global model_consolidation, CURRENT_MODEL, cache_type_k, cache_type_v
     if config.model_consolidation is not None:
         model_consolidation = config.model_consolidation
         log_message(f"[Config] Model consolidation set to: {model_consolidation}")
-    if config.current_model is not None:
-        resolved = await resolve_model(config.current_model)
-        CURRENT_MODEL = resolved
-        log_message(f"[Config] Current consolidated model set to: {CURRENT_MODEL}")
+    if config.cache_type_k is not None:
+        cache_type_k = config.cache_type_k
+        log_message(f"[Config] Key cache type (K) set to: {cache_type_k}")
+    if config.cache_type_v is not None:
+        cache_type_v = config.cache_type_v
+        log_message(f"[Config] Value cache type (V) set to: {cache_type_v}")
         
-        # Warm-load/preload the consolidated model in background
+    if config.current_model is not None or config.cache_type_k is not None or config.cache_type_v is not None:
+        resolved = await resolve_model(config.current_model if config.current_model is not None else CURRENT_MODEL)
+        if config.current_model is not None:
+            CURRENT_MODEL = resolved
+            log_message(f"[Config] Current consolidated model set to: {CURRENT_MODEL}")
+        
+        # Warm-load/preload the consolidated model in background to apply cache settings
         async def run_preload():
             async with inference_lock:
-                log_message(f"[Config] Warm-loading selected consolidated model '{resolved}'...")
+                log_message(f"[Config] Warm-loading selected consolidated model '{resolved}' with cache K={cache_type_k}, V={cache_type_v}...")
                 try:
                     if llama_cpp_available and resolve_gguf_path(resolved):
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW)
                     else:
+                        if llama_server_process is None or active_llama_server_model_name != resolved:
+                            await start_llama_server(resolved, CONTEXT_WINDOW)
                         payload = {"model": resolved, "prompt": "", "stream": False, "keep_alive": -1}
                         async with httpx.AsyncClient(timeout=25) as client:
-                            await client.post(OLLAMA_URL, json=payload)
+                            await client.post(LLAMA_SERVER_URL, json=payload)
                     log_message(f"[Config] Successfully warm-loaded '{resolved}'.")
                 except Exception as e:
                     log_message(f"[Config] Dynamic preload failed for '{resolved}': {e}")
         background_tasks.add_task(run_preload)
         
-    return {"status": "success", "model_consolidation": model_consolidation, "current_model": CURRENT_MODEL}
+    return {
+        "status": "success",
+        "model_consolidation": model_consolidation,
+        "current_model": CURRENT_MODEL,
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v
+    }
 
 # --- Web UI & Dashboard Endpoints ---
 
@@ -1709,19 +2370,22 @@ async def get_status():
     """Returns real-time status of the orchestrator, installed models, and GPU memory metrics."""
     installed = get_installed_models()
     loaded_vram = []
-    try:
-        res = httpx.get(OLLAMA_PS_URL, timeout=1.5)
-        if res.status_code == 200:
-            loaded_vram = res.json().get("models", [])
-    except Exception:
-        pass
+    if llama_server_process is not None and llama_server_process.poll() is None:
+        try:
+            # Assuming llama-server provides /v1/models
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                res = await client.get(f"{LLAMA_SERVER_BASE}/v1/models")
+                if res.status_code == 200:
+                    loaded_vram = [{"name": m["id"]} for m in res.json().get("data", [])]
+        except Exception:
+            pass
 
     # Windows GPU memory parser
     gpu_memory = None
     try:
         res = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
-            capture_output=True, text=True, timeout=1
+            capture_output=True, text=True, timeout=5
         )
         if res.returncode == 0 and res.stdout:
             parts = res.stdout.strip().split(",")
@@ -1771,7 +2435,9 @@ async def get_status():
         "logs": orchestrator_logs[-50:],
         "gpu_memory": gpu_memory,
         "model_consolidation": model_consolidation,
-        "current_model": CURRENT_MODEL
+        "current_model": CURRENT_MODEL,
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v
     }
 
 @app.post("/api/register")
@@ -1793,9 +2459,11 @@ async def trigger_preload(model_name: str, background_tasks: BackgroundTasks):
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW)
                 else:
+                    if llama_server_process is None or active_llama_server_model_name != resolved:
+                        await start_llama_server(resolved, CONTEXT_WINDOW)
                     payload = {"model": resolved, "prompt": "", "stream": False, "keep_alive": -1}
                     async with httpx.AsyncClient(timeout=25) as client:
-                        await client.post(OLLAMA_URL, json=payload)
+                        await client.post(LLAMA_SERVER_URL, json=payload)
                 log_message(f"[UI Control] Loaded '{resolved}' successfully.")
             except Exception as e:
                 log_message(f"[UI Control] Preload failed for '{resolved}': {e}")
@@ -1961,6 +2629,35 @@ async def serve_dashboard():
                         </div>
                     </div>
                 </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 mt-3 border-t border-white/5">
+                    <div>
+                        <label class="block text-xs font-mono text-slate-400 mb-1.5">KV Cache Key (K)</label>
+                        <select id="cacheTypeKSelect" onchange="updateCacheCompression()" class="w-full bg-slate-950/80 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-purple-500">
+                            <option value="f16">fp16 (Default)</option>
+                            <option value="q8_0">q8_0 (8-bit quantization)</option>
+                            <option value="q5_1">q5_1 (5-bit quantization)</option>
+                            <option value="q5_0">q5_0 (5-bit quantization)</option>
+                            <option value="q4_0">q4_0 (4-bit quantization)</option>
+                            <option value="turbo4_tcq">turbo4_tcq</option>
+                            <option value="turbo3_tcq">turbo3_tcq</option>
+                            <option value="turbo2_tcq">turbo2_tcq</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-mono text-slate-400 mb-1.5">KV Cache Value (V)</label>
+                        <select id="cacheTypeVSelect" onchange="updateCacheCompression()" class="w-full bg-slate-950/80 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-purple-500">
+                            <option value="f16">fp16 (Default)</option>
+                            <option value="q8_0">q8_0 (8-bit quantization)</option>
+                            <option value="q5_1">q5_1 (5-bit quantization)</option>
+                            <option value="q5_0">q5_0 (5-bit quantization)</option>
+                            <option value="q4_0">q4_0 (4-bit quantization)</option>
+                            <option value="turbo4_tcq">turbo4_tcq</option>
+                            <option value="turbo3_tcq">turbo3_tcq</option>
+                            <option value="turbo2_tcq">turbo2_tcq</option>
+                        </select>
+                    </div>
+                </div>
             </div>
 
             <!-- Interactive Live Playground (Chat Panel) -->
@@ -2054,9 +2751,9 @@ async def serve_dashboard():
                     </div>
                 </div>
 
-                <!-- Ollama Active VRAM Loader -->
+                <!-- Llama-Server Active VRAM Loader -->
                 <div class="pt-3 border-t border-white/5">
-                    <span class="text-[10px] font-mono text-slate-400 block mb-2 uppercase">VRAM Resident Models (Ollama API)</span>
+                    <span class="text-[10px] font-mono text-slate-400 block mb-2 uppercase">VRAM Resident Models (Llama-Server API)</span>
                     <div id="vramContainer" class="space-y-2">
                         <div class="py-4 flex flex-col items-center justify-center border border-dashed border-white/10 rounded-xl bg-black/25">
                             <span class="text-xl mb-1">💤</span>
@@ -2170,6 +2867,13 @@ async def serve_dashboard():
                     document.getElementById("consolidationToggle").checked = data.model_consolidation;
                     document.getElementById("consolidatedModelSelect").value = data.current_model;
                     document.getElementById("consolidatedModelSelect").disabled = !data.model_consolidation;
+                    
+                    if (data.cache_type_k) {
+                        document.getElementById("cacheTypeKSelect").value = data.cache_type_k;
+                    }
+                    if (data.cache_type_v) {
+                        document.getElementById("cacheTypeVSelect").value = data.cache_type_v;
+                    }
                 }
 
                 // 4. Update VRAM resident models
@@ -2430,7 +3134,22 @@ async def serve_dashboard():
             isConsolidationUpdating = false;
         }
 
-        // Quick action command handler
+        // Update KV cache compression API
+        async function updateCacheCompression() {
+            isConsolidationUpdating = true;
+            const kVal = document.getElementById("cacheTypeKSelect").value;
+            const vVal = document.getElementById("cacheTypeVSelect").value;
+            try {
+                await fetch("/api/config", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ cache_type_k: kVal, cache_type_v: vVal })
+                });
+            } catch (err) {}
+            isConsolidationUpdating = false;
+        }
+ 
+         // Quick action command handler
         async function sendControlCommand(command) {
             if (command === 'shutdown') {
                 const confirmed = confirm("⚠️ Shutdown SerenityDev Orchestrator process?\nThis releases port 8002 completely.");
@@ -2522,14 +3241,16 @@ async def restart_server(background_tasks: BackgroundTasks, request: Optional[Re
     
     loop = asyncio.get_event_loop()
     def unload_all_models():
-        log_message("[Server] Unloading active models from Ollama VRAM...")
+        if llama_server_process is None or llama_server_process.poll() is not None:
+            return
+        log_message("[Server] Unloading active models from Llama-Server VRAM...")
         try:
             installed = get_installed_models()
             for m in installed:
-                httpx.post(OLLAMA_URL, json={"model": m, "keep_alive": 0}, timeout=5)
-            log_message("[Server] Successfully unloaded Ollama models.")
+                httpx.post(LLAMA_SERVER_URL, json={"model": m, "keep_alive": 0}, timeout=5)
+            log_message("[Server] Successfully unloaded Llama-Server models.")
         except Exception as e:
-            log_message(f"[Server] Error unloading Ollama models: {e}")
+            log_message(f"[Server] Error unloading Llama-Server models: {e}")
             
     await loop.run_in_executor(None, unload_all_models)
     unload_llama_model()
@@ -2548,8 +3269,10 @@ async def restart_server(background_tasks: BackgroundTasks, request: Optional[Re
                                 loop = asyncio.get_event_loop()
                                 await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW)
                             else:
+                                if llama_server_process is None or active_llama_server_model_name != resolved:
+                                    await start_llama_server(resolved, CONTEXT_WINDOW)
                                 payload = {"model": resolved, "prompt": "", "stream": False, "keep_alive": -1}
-                                async with httpx.AsyncClient(timeout=25) as client: await client.post(OLLAMA_URL, json=payload)
+                                async with httpx.AsyncClient(timeout=25) as client: await client.post(LLAMA_SERVER_URL, json=payload)
                             log_message(f"[Server Preload] Successfully loaded '{resolved}' into memory.")
                         except Exception as e:
                             log_message(f"[Server Preload] Preload failed for '{resolved}': {e}")
@@ -2585,7 +3308,13 @@ async def shutdown():
     asyncio.create_task(kill_process())
     return {"message": "Shutdown command received. The server is shutting down..."}
 
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage().find("GET /api/status") == -1
+
 if __name__ == "__main__":
+    import logging
+    logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
     free_port(8002)
     print("[Server] Starting SerenityDev Orchestrator...")
     uvicorn.run("serenitydevserver:app", host="0.0.0.0", port=8002, reload=False)

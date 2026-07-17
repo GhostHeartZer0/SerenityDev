@@ -1,11 +1,42 @@
 import * as vscode from 'vscode';
 import axios from 'axios';
 import * as http from 'http';
+import * as cp from 'child_process';
+import * as path from 'path';
+
+let serverProcess: cp.ChildProcess | undefined;
+let serverOutputChannel: vscode.OutputChannel;
 
 const API_BASE = 'http://localhost:8002/api';
 const ASK_URL = 'http://localhost:8002/ask';
 
 export function activate(context: vscode.ExtensionContext) {
+    serverOutputChannel = vscode.window.createOutputChannel("Serenity Server");
+    context.subscriptions.push(serverOutputChannel);
+
+    const config = vscode.workspace.getConfiguration('serenitydev');
+    const pythonPath = config.get<string>('pythonPath') || 'python';
+    const serverScriptPath = path.join(context.extensionPath, 'serenitydevserver.py');
+
+    serverOutputChannel.appendLine(`Starting Serenity server using ${pythonPath} at ${serverScriptPath}...`);
+    serverProcess = cp.spawn(pythonPath, [serverScriptPath], { cwd: context.extensionPath });
+
+    if (serverProcess.stdout) {
+        serverProcess.stdout.on('data', (data) => {
+            serverOutputChannel.append(data.toString());
+        });
+    }
+
+    if (serverProcess.stderr) {
+        serverProcess.stderr.on('data', (data) => {
+            serverOutputChannel.append(data.toString());
+        });
+    }
+
+    serverProcess.on('close', (code) => {
+        serverOutputChannel.appendLine(`Server process exited with code ${code}`);
+    });
+
     let statusBarItem: vscode.StatusBarItem;
 
     // Initialize Status Bar
@@ -18,8 +49,13 @@ export function activate(context: vscode.ExtensionContext) {
         response.progress('Initializing SerenityDev routing pipeline...');
 
         return new Promise<void>((resolve, reject) => {
+            let fullPrompt = request.prompt;
+            if (request.command) {
+                fullPrompt = `/${request.command} ${fullPrompt}`;
+            }
+
             const postData = JSON.stringify({
-                prompt: request.prompt,
+                prompt: fullPrompt,
                 session_id: 'native_chat',
                 workspace_dir: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || ''
             });
@@ -122,54 +158,15 @@ export function activate(context: vscode.ExtensionContext) {
     // Register Native VS Code Language Model Provider (so models show up in picker)
     const lmProvider: vscode.LanguageModelChatProvider = {
         async provideLanguageModelChatInformation(options: any, token: vscode.CancellationToken): Promise<vscode.LanguageModelChatInformation[]> {
-            const models: vscode.LanguageModelChatInformation[] = [
-                {
-                    id: 'serenity-supervisor',
-                    name: 'Serenity: gemma-4-26B-A4B (Supervisor)',
-                    family: 'serenity-supervisor',
-                    version: '1.0.0',
-                    maxInputTokens: 120000,
-                    maxOutputTokens: 16384,
-                    capabilities: { toolCalling: true, imageInput: false }
-                },
-                {
-                    id: 'serenity-w1',
-                    name: 'Serenity: gemma-4-26B-A4B (Worker 1)',
-                    family: 'serenity-w1',
-                    version: '1.0.0',
-                    maxInputTokens: 120000,
-                    maxOutputTokens: 16384,
-                    capabilities: { toolCalling: true, imageInput: false }
-                },
-                {
-                    id: 'serenity-w2',
-                    name: 'Serenity: codegemma-7b-it (Worker 2)',
-                    family: 'serenity-w2',
-                    version: '1.0.0',
-                    maxInputTokens: 120000,
-                    maxOutputTokens: 16384,
-                    capabilities: { toolCalling: true, imageInput: false }
-                },
-                {
-                    id: 'serenity-w3',
-                    name: 'Serenity: Qwen3.6 35B-A3B (Worker 3)',
-                    family: 'serenity-w3',
-                    version: '1.0.0',
-                    maxInputTokens: 120000,
-                    maxOutputTokens: 16384,
-                    capabilities: { toolCalling: true, imageInput: false }
-                },
-                {
-                    id: 'serenity-w4',
-                    name: 'Serenity: Qwen3.6 27B (Worker 4)',
-                    family: 'serenity-w4',
-                    version: '1.0.0',
-                    maxInputTokens: 120000,
-                    maxOutputTokens: 16384,
-                    capabilities: { toolCalling: true, imageInput: false }
+            try {
+                const response = await axios.get(`${API_BASE}/models`);
+                if (response.data && response.data.models) {
+                    return response.data.models as vscode.LanguageModelChatInformation[];
                 }
-            ];
-            return models;
+            } catch (err) {
+                console.error("Failed to fetch models from devserver:", err);
+            }
+            return [];
         },
 
         async provideLanguageModelChatResponse(
@@ -512,4 +509,9 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
     }
 }
 
-export function deactivate() { }
+export function deactivate() {
+    if (serverProcess) {
+        serverProcess.kill();
+        serverProcess = undefined;
+    }
+}

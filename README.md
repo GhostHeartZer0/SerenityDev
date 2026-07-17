@@ -1,14 +1,14 @@
-# SerenityDev README
+# SerenityDev Local Agent Interface
 
-This is the README for my extension "SerenityDev".
+This is my extension "SerenityDev".
 This is a vibe-coded extension/server made for VS Code and Android Studio (TBD), so I can run llm agents locally. 
 the folder "serenitydev-0.0.1" is the original folder. models would go here for registration.
 for model details, see serenitydevserver.py and ctrl-f "gguf"
 
 ## Features
 
-Ollama model registry
-llama.cpp inference with Ollama fallback
+llama-server model registry
+llama.cpp inference with llama-server fallback
 hyper-specific model routing (registration of alternate models to be added)
 
 ### Supervisor vs Workers
@@ -20,6 +20,7 @@ the supervisor routes to a system pictured below. To skip all this, select a wor
 
 This is simply an extension for Local Agentic purposes, because I'm picky and don't like any available options.
 its not meant to work for many purposes, yet.
+this isn't a professional app, I'm still improving and finding out what works and how to do all this, so consider this a learning experiment project.
 
 > Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
 
@@ -32,20 +33,29 @@ see imports.
 This extension contributes the following settings:
 
 * `Serenity:extension status control panel`: Resume, Pause, Stop this extension.
+* @Serenity prompt routing in a new extension box (Icon missing, I know)
 
 ## Known Issues
 
 Probably a lot.
-Models reason in chat, not seperated.
-I'm still not sure if it all works correctly.
+Blank icon
+further response testing is needed, I just got it responsing again.
+Models reason directly in chat, not seperated properly.
+Additional testing and tweaking overall is still needed 
+
 
 ## Release Notes
 
 migrated standalone server folder into VS extension.
+Various tweaks and fixes, feature and stability upgrades.
 
 ### 1.0.0
 
 Initial release
+
+### 1.0.1
+
+- Details TBA -
 
 ## Feedback and Improvements
 
