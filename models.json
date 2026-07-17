@@ -1,0 +1,7 @@
+{
+    "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL": "C:\\Users\\ccrg6\\SerenityDev\\models\\26B-A4B\\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+    "codegemma-2b-f16": "C:\\Users\\ccrg6\\SerenityDev\\models\\codegemma\\codegemma-2b-f16.gguf",
+    "codegemma-7b-it-f16": "C:\\Users\\ccrg6\\SerenityDev\\models\\codegemma\\codegemma-7b-it-f16.gguf",
+    "Qwen3.6-35B-A3B-UD-Q4_K_XL": "C:\\Users\\ccrg6\\SerenityDev\\models\\Qwen3.6-35B-A3B\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+    "gemma4-v2-Q4_K_M": "C:\\Users\\ccrg6\\SerenityDev\\models\\yuxinlu1 fable5\\gemma4-v2-Q4_K_M.gguf"
+}
