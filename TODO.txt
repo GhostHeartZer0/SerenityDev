@@ -6,141 +6,34 @@ File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
-[Done] 1. resolve llm output is massdumping instead of streaming response.
-   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.]
+1. resolve llm output is massdumping instead of streaming response.
+   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Done] 
 
-[Done] 2. kv cache compression settings (add to UI and verify it works / changes)
+2. kv cache compression settings (add to UI and verify it works / changes) [Done] 
 
-[Done] 3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq
+3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq [Done] 
 
-[Done] 4. implement terminal command whitelist / blacklist filtering in devserver for run_command:
-   Allowed commands (true):
-     - "cd": true
-     - "echo": true
-     - "ls": true
-     - "dir": true
-     - "pwd": true
-     - "cat": true
-     - "head": true
-     - "tail": true
-     - "findstr": true
-     - "wc": true
-     - "tr": true
-     - "cut": true
-     - "cmp": true
-     - "which": true
-     - "basename": true
-     - "dirname": true
-     - "realpath": true
-     - "readlink": true
-     - "stat": true
-     - "file": true
-     - "od": true
-     - "du": true
-     - "df": true
-     - "sleep": true
-     - "nl": true
-     - "grep": true
-     - "column": true
-     - "date": true
-     - "find": true
-     - "rg": true
-     - "sed": true
-     - "sort": true
-     - "tree": true
-     - "xxd": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+status\\b/": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+log\\b/": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+show\\b/": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+diff\\b/": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+ls-files\\b/": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+grep\\b/": true
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+branch\\b/": true
-     - "/^docker\\s+(ps|images|info|version|inspect|logs|top|stats|port|diff|search|events)\\b/": true
-     - "/^docker\\s+(container|image|network|volume|context|system)\\s+(ls|ps|inspect|history|show|df|info)\\b/": true
-     - "/^docker\\s+compose\\s+(ps|ls|top|logs|images|config|version|port|events)\\b/": true
-     - "Get-ChildItem": true
-     - "Get-Content": true
-     - "Get-Date": true
-     - "Get-Random": true
-     - "Get-Location": true
-     - "Set-Location": true
-     - "Write-Host": true
-     - "Write-Output": true
-     - "Out-String": true
-     - "Split-Path": true
-     - "Join-Path": true
-     - "Start-Sleep": true
-     - "Where-Object": true
-     - "/^Select-[a-z0-9]/i": true
-     - "/^Measure-[a-z0-9]/i": true
-     - "/^Compare-[a-z0-9]/i": true
-     - "/^Format-[a-z0-9]/i": true
-     - "/^Sort-[a-z0-9]/i": true
-     - "/^npm\\s+(ls|list|outdated|view|info|show|explain|why|root|prefix|bin|search|doctor|fund|repo|bugs|docs|home|help(-search)?)\\b/": true
-     - "/^npm\\s+config\\s+(list|get)\\b/": true
-     - "/^npm\\s+pkg\\s+get\\b/": true
-     - "/^npm\\s+audit$/": true
-     - "/^npm\\s+cache\\s+verify\\b/": true
-     - "/^yarn\\s+(list|outdated|info|why|bin|help|versions)\\b/": true
-     - "/^yarn\\s+licenses\\b/": true
-     - "/^yarn\\s+audit\\b(?!.*\\bfix\\b)/": true
-     - "/^yarn\\s+config\\s+(list|get)\\b/": true
-     - "/^yarn\\s+cache\\s+dir\\b/": true
-     - "/^pnpm\\s+(ls|list|outdated|why|root|bin|doctor)\\b/": true
-     - "/^pnpm\\s+licenses\\b/": true
-     - "/^pnpm\\s+audit\\b(?!.*\\bfix\\b)/": true
-     - "/^pnpm\\s+config\\s+(list|get)\\b/": true
-     - "npm ci": true
-     - "/^yarn\\s+install\\s+--frozen-lockfile\\b/": true
-     - "/^pnpm\\s+install\\s+--frozen-lockfile\\b/": true
-     - "column": true
-     - "date": true
-     - "find": true
-     - "rg": true
-     - "sed": true
-     - "sort": true
-     - "tree": true
-     - "/^xxd$/": true
-     - "/^xxd\\b(\\s+-\\S+)*\\s+[^-\\s]\\S*$/": true
-   Blocked commands (false):
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+log\\b.*\\s--output(=|\\s|$)/": false
-     - "/^git(\\s+(-C\\s+\\S+|--no-pager))*\\s+branch\\b.*\\s-(d|D|m|M|-delete|-force)\\b/": false
-     - "/^column\\b.*\\s-c\\s+[0-9]{4,}/": false
-     - "/^date\\b.*\\s(-s|--set)\\b/": false
-     - "/^find\\b.*\\s-(delete|exec|execdir|fprint|fprintf|fls|ok|okdir)\\b/": false
-     - "/^rg\\b.*\\s(--pre|--hostname-bin)\\b/": false
-     - "/^sed\\b.*\\s(-[a-zA-Z]*(e|f)[a-zA-Z]*|--expression|--file)\\b/": false
-     - "/^sed\\b.*s\\/.*\\/.*\\/[ew]/": false
-     - "/^sed\\b.*;W/": false
-     - "/^sort\\b.*\\s-(o|S)\\b/": false
-     - "/^tree\\b.*\\s-o\\b/": false
-     - "rm": false
-     - "rmdir": false
-     - "del": false
-     - "Remove-Item": false
-     - "ri": false
-     - "rd": false
-     - "erase": false
-     - "dd": false
-     - "ps": false
-     - "top": false
-     - "Stop-Process": false
-     - "spps": false
-     - "curl": false
-     - "wget": false
+4. implement terminal command whitelist / blacklist filtering in devserver for run_command. [Done]
 
-[Done] 5. High and Low modes, split logic in two:
+5. High and Low modes, split logic in two:
    - gemma-4-26B-A4B (High) explains everything it does, uses thinking to the max, as many tokens and tool uses as needed to solve the issue with utmost accuracy. Prioritizes self-optimizable pipeline: research - plan - worker selections - permission (if necessary) - execution - test.
-   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test.
+   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test. [Done] 
 
-[Done] 6. ensure for each task and worker the temp and such is set properly thruout.
+6. ensure for each task and worker the temp and such is set properly thruout. [Done] 
 
-7. https://github.com/thedavidweng/gork-build clone repo for insights and merging. use it to improve this codebase.
+7. Adapted gork-build Rust architecture to improve this codebase. Added: 1) Tool-Pair-Safe context trimming, 2) Workspace/Session prompt queue manager & decongestion, 3) Sliding-window CircuitBreaker for API/tool resilience. Annotated Rust-exclusive features (Alacritty PTY handles, Ratatui TUI rendering, D-Bus sleep listeners). [Done]
 
 8. fix the extension icon not showing up in VSCode.
 
-[Done] "when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints."
+9. map MOE router sizes
+test and learn gemma-4 params. figure out: what works best for coding? what has the lowest probability of skipping the response/ what parameters provide the most complete and accurate response?
+add git commands to harness
+
+10. review FIM handling and VRAM usage; let it be on unless VRAM is to be saturated especially by a large LLM being loaded. load FIM if there is space, auto-offload for Orchestrator / Supervisor and secondary routing phases.
+11.  Smart App Control & Cache Localization:
+   - Localize TEMP/TMP and CUDA compiler cache paths to the workspace to bypass Windows security policy blocks.
+   - Ensure all subprocess backends (MSVC, CMake, Pip, PyTorch, Triton) respect the localized variables. [Done] 
+"when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints." [Done] 
 
 [TBD] make auto-pushing verified updates a thing. 
 
