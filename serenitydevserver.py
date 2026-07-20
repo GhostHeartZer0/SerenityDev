@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import logging
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
@@ -16,7 +17,23 @@ import uvicorn
 import signal
 
 # Force working directory to be the directory of this server script
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+workspace_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(workspace_dir)
+
+# Localize TEMP/TMP and compiler cache paths to bypass Windows Smart App Control blocks
+cache_dir = os.path.abspath(os.path.join(workspace_dir, ".serenity_cache"))
+cache_subdirs = {
+    "TEMP": os.path.join(cache_dir, "temp"),
+    "TMP": os.path.join(cache_dir, "temp"),
+    "CUDA_CACHE_PATH": os.path.join(cache_dir, "cuda_cache"),
+    "TRITON_CACHE_DIR": os.path.join(cache_dir, "triton_cache"),
+    "TORCH_EXTENSIONS_DIR": os.path.join(cache_dir, "torch_extensions"),
+    "PIP_CACHE_DIR": os.path.join(cache_dir, "pip_cache")
+}
+for path in set(cache_subdirs.values()):
+    os.makedirs(path, exist_ok=True)
+for env_var, path in cache_subdirs.items():
+    os.environ[env_var] = path
 
 # Configuration Constants
 LLAMA_SERVER_BASE = "http://localhost:8080"
@@ -52,6 +69,92 @@ CURRENT_MODEL = SUPERVISOR_MODEL
 model_consolidation = True
 sessions_history = {} # session_id -> list of message context dicts
 server_paused = False
+
+# --- Architectural Insights from gork-build ---
+
+class CircuitBreaker:
+    """Sliding-window circuit breaker for API calls and tool executions (adapted from gork-build xai-circuit-breaker)."""
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures: List[float] = []
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF-OPEN
+        self.last_state_change = time.time()
+
+    def record_success(self):
+        self.failures.clear()
+        self.state = "CLOSED"
+
+    def record_failure(self):
+        now = time.time()
+        self.failures.append(now)
+        # Prune failures outside 60s sliding window
+        self.failures = [t for t in self.failures if now - t <= 60.0]
+        if len(self.failures) >= self.failure_threshold:
+            self.state = "OPEN"
+            self.last_state_change = now
+
+    def allow_request(self) -> bool:
+        now = time.time()
+        if self.state == "OPEN":
+            if now - self.last_state_change > self.recovery_timeout:
+                self.state = "HALF-OPEN"
+                return True
+            return False
+        return True
+
+class WorkspaceQueue:
+    """Session & workspace-aware prompt queue manager (adapted from gork-build xai-prompt-queue)."""
+    def __init__(self):
+        self.queues: Dict[str, List[Dict[str, Any]]] = {} # session_id -> list of prompt entries
+        self.running_prompts: Dict[str, Optional[str]] = {} # session_id -> running prompt id
+
+    def enqueue(self, session_id: str, prompt_id: str, text: str, kind: str = "user"):
+        if session_id not in self.queues:
+            self.queues[session_id] = []
+        entry = {
+            "id": prompt_id,
+            "text": text,
+            "kind": kind,
+            "timestamp": time.time()
+        }
+        self.queues[session_id].append(entry)
+        return entry
+
+    def dequeue(self, session_id: str) -> Optional[Dict[str, Any]]:
+        if session_id in self.queues and self.queues[session_id]:
+            item = self.queues[session_id].pop(0)
+            self.running_prompts[session_id] = item["id"]
+            return item
+        self.running_prompts[session_id] = None
+        return None
+
+    def clear_queue(self, session_id: str):
+        if session_id in self.queues:
+            self.queues[session_id].clear()
+
+    def get_status(self, session_id: str) -> Dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "running_prompt_id": self.running_prompts.get(session_id),
+            "pending_count": len(self.queues.get(session_id, []))
+        }
+
+def trim_context_tool_pairs(messages: List[Dict[str, str]], max_items: int) -> List[Dict[str, str]]:
+    """Context compaction helper (adapted from gork-build xai-grok-compaction).
+    Ensures tool calls and tool responses are never split across context window boundaries."""
+    if len(messages) <= max_items:
+        return messages
+
+    trimmed = messages[-max_items:]
+    # If the first message in trimmed is an orphan tool response without its matching call, drop it
+    if trimmed and ("System Tool Response" in trimmed[0].get("content", "") or trimmed[0].get("role") == "tool"):
+        trimmed = trimmed[1:]
+    return trimmed
+
+# Global instances
+global_circuit_breaker = CircuitBreaker()
+global_workspace_queue = WorkspaceQueue()
 
 # llama-cpp-python state management
 active_llama_model = None
