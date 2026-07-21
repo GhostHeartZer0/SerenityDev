@@ -3,6 +3,7 @@ import axios from 'axios';
 import * as http from 'http';
 import * as cp from 'child_process';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 
 let serverProcess: cp.ChildProcess | undefined;
 let serverOutputChannel: vscode.OutputChannel;
@@ -350,8 +351,12 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
     private _sessionId: string;
 
+    private _generateSessionId(): string {
+        return `session_${randomBytes(16).toString('hex')}`;
+    }
+
     constructor(private readonly _extensionUri: vscode.Uri) {
-        this._sessionId = 'session_' + Math.random().toString(36).substr(2, 9);
+        this._sessionId = this._generateSessionId();
     }
 
     public resolveWebviewView(
@@ -411,7 +416,7 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
                 try {
                     await axios.delete(`${API_BASE}/session/${this._sessionId}`);
                 } catch (e) { }
-                this._sessionId = 'session_' + Math.random().toString(36).substr(2, 9);
+                this._sessionId = this._generateSessionId();
             }
         });
     }
