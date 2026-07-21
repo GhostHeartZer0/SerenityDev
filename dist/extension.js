@@ -17066,7 +17066,7 @@ var SerenityChatProvider = class {
           await axios_default.delete(`${API_BASE}/session/${this._sessionId}`);
         } catch (e) {
         }
-        this._sessionId = "session_" + Math.random().toString(36).substr(2, 9);
+        this._sessionId = "session_" + crypto_default.randomBytes(16).toString("hex");
       }
     });
   }
