@@ -1244,10 +1244,22 @@ async def run_orchestration(request: QueryRequest, http_request: Request):
         await asyncio.sleep(0.01)
 
     async with inference_lock:
-        if request.workspace_dir and os.path.exists(request.workspace_dir):
+        if request.workspace_dir:
             try:
-                os.chdir(request.workspace_dir)
-                log_message(f"[Orchestrator] Changed working directory to: {request.workspace_dir}")
+                safe_root = os.path.realpath(workspace_dir)
+                requested_path = request.workspace_dir
+                if not os.path.isabs(requested_path):
+                    requested_path = os.path.join(safe_root, requested_path)
+                resolved_workspace = os.path.realpath(requested_path)
+
+                if os.path.commonpath([safe_root, resolved_workspace]) != safe_root:
+                    raise ValueError("Workspace path escapes allowed root")
+
+                if os.path.isdir(resolved_workspace):
+                    os.chdir(resolved_workspace)
+                    log_message(f"[Orchestrator] Changed working directory to: {resolved_workspace}")
+                else:
+                    log_message(f"[Orchestrator Error] Workspace directory does not exist or is not a directory: {resolved_workspace}")
             except Exception as e:
                 log_message(f"[Orchestrator Error] Failed to change directory: {e}")
 
