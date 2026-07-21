@@ -1228,17 +1228,22 @@ def validate_workspace_path(path_value: str) -> str:
     if "\x00" in path_value:
         raise ValueError("Workspace path contains invalid characters")
 
-    normalized = os.path.normpath(path_value.strip())
+    raw = path_value.strip().replace("\\", "/")
+    normalized = os.path.normpath(raw)
     if normalized in ("", "."):
         raise ValueError("Workspace path is empty")
-    if os.path.isabs(normalized):
+    if os.path.isabs(normalized) or normalized.startswith(("/", "\\")):
         raise ValueError("Absolute workspace paths are not allowed")
+    if re.match(r"^[A-Za-z]:", normalized):
+        raise ValueError("Drive-qualified workspace paths are not allowed")
 
-    parts = [p for p in normalized.split(os.sep) if p not in ("", ".")]
-    if any(p == ".." for p in parts):
+    parts = [p for p in normalized.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
         raise ValueError("Workspace path traversal is not allowed")
+    if any(not re.fullmatch(r"[A-Za-z0-9._-]+", p) for p in parts):
+        raise ValueError("Workspace path contains unsupported characters")
 
-    return os.path.join(*parts) if parts else normalized
+    return os.path.join(*parts)
 
 async def run_orchestration(request: QueryRequest, http_request: Request):
     """
