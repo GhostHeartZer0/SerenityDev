@@ -1343,8 +1343,9 @@ Never compromise on security, input validation, or error handling.
                         "steps": []
                     }
                 }
-            except Exception as e:
-                yield {"type": "error", "detail": f"Standalone execution failed: {str(e)}"}
+            except Exception:
+                logging.exception("Standalone execution failed")
+                yield {"type": "error", "detail": "Standalone execution failed due to an internal error."}
             return
 
         # --- Path B: Multi-Agent Supervisor Routing Pipeline ---
@@ -1679,14 +1680,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                         "status": "success",
                         "details": step_summary
                     })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to list directory: {str(e)}]\n"
-                    log_message(f"[Tool Error] List directory failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] List directory failed")
+                    tool_context = "\n\n[System Tool Error: Failed to list directory]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "list_directory",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to list directory due to an internal error."
                     })
 
             elif target == "mcp:filesystem:read_file":
@@ -1740,14 +1741,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             "status": "error",
                             "details": "File not found"
                         })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to read file: {str(e)}]\n"
-                    log_message(f"[Tool Error] Read file failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] Read file failed")
+                    tool_context = "\n\n[System Tool Error: Failed to read file]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "read_file",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to read file due to an internal error."
                     })
 
             elif target == "mcp:filesystem:insert_edit_into_file":
@@ -1788,14 +1789,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             "status": "error",
                             "details": "File not found"
                         })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to insert content: {str(e)}]\n"
-                    log_message(f"[Tool Error] Insert content failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] Insert content failed")
+                    tool_context = "\n\n[System Tool Error: Failed to insert content]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "insert_edit_into_file",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to insert content due to an internal error."
                     })
 
             elif target == "mcp:filesystem:replace_string_in_file":
@@ -1836,14 +1837,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             "status": "error",
                             "details": "File not found"
                         })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to replace content: {str(e)}]\n"
-                    log_message(f"[Tool Error] Replace content failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] Replace content failed")
+                    tool_context = "\n\n[System Tool Error: Failed to replace content]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "replace_string_in_file",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to replace content due to an internal error."
                     })
 
             elif target == "mcp:filesystem:write_file":
@@ -1873,14 +1874,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             "status": "error",
                             "details": "No path provided"
                         })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to write file: {str(e)}]\n"
-                    log_message(f"[Tool Error] Write file failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] Write file failed")
+                    tool_context = "\n\n[System Tool Error: Failed to write file]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "write_file",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to write file due to an internal error."
                     })
 
             elif target == "mcp:filesystem:multi_replace_string_in_file":
@@ -1943,14 +1944,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                                 "status": "success",
                                 "details": step_summary
                             })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to perform multi-replace: {str(e)}]\n"
-                    log_message(f"[Tool Error] Multi-replace failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] Multi-replace failed")
+                    tool_context = "\n\n[System Tool Error: Failed to perform multi-replace]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "multi_replace_string_in_file",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to perform multi-replace due to an internal error."
                     })
 
             elif target == "mcp:filesystem:grep_search":
@@ -1991,14 +1992,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             "status": "warning",
                             "details": step_summary
                         })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to perform grep search: {str(e)}]\n"
-                    log_message(f"[Tool Error] Grep search failed: {e}")
+                except Exception:
+                    logging.exception("[Tool Error] Grep search failed")
+                    tool_context = "\n\n[System Tool Error: Failed to perform grep search]\n"
                     agent_steps.append({
                         "step": tool_loop_count + 1,
                         "tool": "grep_search",
                         "status": "error",
-                        "details": str(e)
+                        "details": "Failed to perform grep search due to an internal error."
                     })
 
             if full_tool_context is None:
@@ -2110,8 +2111,9 @@ Never compromise on security, input validation, or error handling.
                 
             worker_draft_raw = "".join(worker_draft_parts)
             final_answer = clean_thought_and_whitespace(worker_draft_raw)
-        except Exception as e:
-            yield {"type": "error", "detail": f"Worker failure during synthesis: {str(e)}"}
+        except Exception:
+            logging.exception("Worker failure during synthesis")
+            yield {"type": "error", "detail": "Worker failure during synthesis due to an internal error."}
             return
 
         # --- Phase 3: Supervisor Review ---
