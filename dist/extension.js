@@ -17013,7 +17013,7 @@ function activate(context) {
 var SerenityChatProvider = class {
   constructor(_extensionUri) {
     this._extensionUri = _extensionUri;
-    this._sessionId = "session_" + Math.random().toString(36).substr(2, 9);
+    this._sessionId = "session_" + crypto_default.randomBytes(16).toString("hex");
   }
   _extensionUri;
   static viewType = "serenity.chatView";
