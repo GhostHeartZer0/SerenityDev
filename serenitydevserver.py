@@ -1222,6 +1222,24 @@ def map_custom_model_id(model_id: str) -> str:
         return SUPERVISOR_MODEL
     return model_id
 
+def validate_workspace_path(path_value: str) -> str:
+    if not isinstance(path_value, str):
+        raise ValueError("Workspace path must be a string")
+    if "\x00" in path_value:
+        raise ValueError("Workspace path contains invalid characters")
+
+    normalized = os.path.normpath(path_value.strip())
+    if normalized in ("", "."):
+        raise ValueError("Workspace path is empty")
+    if os.path.isabs(normalized):
+        raise ValueError("Absolute workspace paths are not allowed")
+
+    parts = [p for p in normalized.split(os.sep) if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        raise ValueError("Workspace path traversal is not allowed")
+
+    return os.path.join(*parts) if parts else normalized
+
 async def run_orchestration(request: QueryRequest, http_request: Request):
     """
     Unified Orchestrator pipeline generator.
@@ -1247,9 +1265,8 @@ async def run_orchestration(request: QueryRequest, http_request: Request):
         if request.workspace_dir:
             try:
                 safe_root = os.path.realpath(workspace_dir)
-                requested_path = request.workspace_dir
-                if not os.path.isabs(requested_path):
-                    requested_path = os.path.join(safe_root, requested_path)
+                validated_relative = validate_workspace_path(request.workspace_dir)
+                requested_path = os.path.join(safe_root, validated_relative)
                 resolved_workspace = os.path.realpath(requested_path)
 
                 if os.path.commonpath([safe_root, resolved_workspace]) != safe_root:
