@@ -2281,9 +2281,15 @@ async def ask_serenity_stream(request: QueryRequest, http_request: Request):
     async def event_generator():
         try:
             async for event in run_orchestration(request, http_request):
-                yield f"data: {json.dumps(event)}\n\n"
+                if isinstance(event, dict) and event.get("type") == "error":
+                    safe_event = dict(event)
+                    safe_event["detail"] = "An internal error occurred."
+                    yield f"data: {json.dumps(safe_event)}\n\n"
+                else:
+                    yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"
+            log_message(f"[Stream Error] ask_serenity_stream failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'detail': 'An internal error occurred.'})}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
