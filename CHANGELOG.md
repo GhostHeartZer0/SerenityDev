@@ -1,15 +1,22 @@
 # Change Log
-
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
-## [Unreleased]
-
-- Initial commit
+## Version 1.5.0
+- Limited server process permissions & .env rogue agent isolation. Added is_path_allowed checks to read/write/edit/grep tools, blacklisted .env in command execution rules, filtered list_directory, and sanitized subprocess environment. [Done]
+- Fixed LOCAL_API_KEY structure in dotenv loading & fallback to prevent ValueError startup crash and handle local key configuration. [Done]
+- Implemented SerenityKeyVault with SHA3-512 & SHAKE-256 (Keccak XOF) hardware MAC entropy binding for pqc_v1: key blobs. [Done]
+- Added PQCEnforcementMiddleware for request signature and 30s sliding window replay protection. [Done]
+- Created startup.py & config_guard.py for strict environment validation; enforced zero fallback key policy in serenitydevserver.py (fails fast if LOCALAPIKEY is missing or unencrypted). [Done]
+- Cleaned up and updated .gitignore rules (added build/test/venv/cache patterns, unignored .env.example template). [Done]
+- Created seal_secrets.py CLI tool to generate hardware-bound PQC key blobs (`pqc_v1:...`) with MAC + SHA3-512 + SHAKE-256 entropy. [Done]
 
 ## Version 1.4.20 2026-07-20 
 - Gemma-4 Chat templates updated to the july release, boasting improved benchmark scores, tool call handling, and thought handling.
 - added compatibility with Windows Smart App Control and localized cache
 - cleared up workflow and added TODO to CHANGELOG.
+
+## [Version 1.0.2]
+- Initial commit
 
 ### To-Do List: (Items marked [Done] must be tested and verified, then they will be crossed out and added above)
 
