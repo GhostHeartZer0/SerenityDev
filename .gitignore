@@ -1,5 +1,26 @@
+# Dependencies
 node_modules/
-models/
-scratch/
+
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# Build & Test output
+out/
+.vscode-test/
+.serenity_cache/
+
+# Data & Models
+models/
+scratch/
+
+# Environment & Logs
+*.env
+!.env.example
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

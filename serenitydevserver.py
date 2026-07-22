@@ -1,21 +1,105 @@
 # serenitydevserver.py
+from startup import initialize_environment
+
+try:
+    print("[...] Initiating SerenityDev Secure Boot...")
+    initialize_environment()
+except RuntimeError as e:
+    import sys
+    print(f"\n{e}")
+    sys.exit(1)
+
 import asyncio
 import json
 import os
 import re
 import subprocess
-import sys
 import time
 import logging
+import hmac
+import uuid
+import hashlib
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import httpx
 import uvicorn
 import signal
+import cryptography
 
+class SerenityKeyVault:
+    """Hardware-bound Key Vault using SHA3-512 & SHAKE-256 (Keccak XOF) entropy binding."""
+
+    @staticmethod
+    def get_machine_entropy() -> bytes:
+        mac = str(uuid.getnode()).encode("utf-8")
+        return hashlib.sha3_512(mac).digest()
+
+    @classmethod
+    def unlock(cls, key_blob: str) -> str:
+        if not key_blob:
+            return ""
+        if not key_blob.startswith("pqc_v1:"):
+            raise ValueError("[PQC Error] Key blob is not encrypted with PQC format (pqc_v1:).")
+
+        raw_payload = bytes.fromhex(key_blob[7:])
+        if len(raw_payload) < 13:
+            raise ValueError("[PQC Error] Key payload too short.")
+
+        nonce = raw_payload[:12]
+        ciphertext = raw_payload[12:]
+        entropy = cls.get_machine_entropy()
+
+        # Attempt AESGCM decryption if cryptography library is installed
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            derived_key = hashlib.shake_256(entropy).digest(32)
+            aesgcm = AESGCM(derived_key)
+            decrypted_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+            return decrypted_bytes.decode("utf-8")
+        except Exception:
+            pass
+
+        # Fallback to SHAKE-256 keystream XOR decryption
+        try:
+            keystream = hashlib.shake_256(entropy + nonce).digest(len(ciphertext))
+            plain_bytes = bytes(b ^ k for b, k in zip(ciphertext, keystream))
+            return plain_bytes.decode("utf-8")
+        except Exception:
+            raise PermissionError("[Security Breach] Hardware mismatch or corrupted PQC key blob.")
+
+    @classmethod
+    def encrypt(cls, plaintext: str) -> str:
+        nonce = os.urandom(12)
+        entropy = cls.get_machine_entropy()
+        plain_bytes = plaintext.encode("utf-8")
+
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            derived_key = hashlib.shake_256(entropy).digest(32)
+            aesgcm = AESGCM(derived_key)
+            ciphertext = aesgcm.encrypt(nonce, plain_bytes, None)
+        except ImportError:
+            keystream = hashlib.shake_256(entropy + nonce).digest(len(plain_bytes))
+            ciphertext = bytes(b ^ k for b, k in zip(plain_bytes, keystream))
+
+        payload = nonce + ciphertext
+        return f"pqc_v1:{payload.hex()}"
+
+raw_env_key = os.getenv("LOCAL_API_KEY") or os.getenv("LOCALAPI_KEY") or os.getenv("LOCALAPIKEY") or ""
+try:
+    LOCAL_API_KEY = SerenityKeyVault.unlock(raw_env_key)
+except Exception as e:
+    logging.error(f"[Auth Error] Failed to unlock key: {e}")
+    raise RuntimeError(f"CRITICAL ERROR: [Auth] Hardware-bound key unlock failed: {e}\nShutting down to prevent insecure operation.")
+
+if not LOCAL_API_KEY:
+    raise RuntimeError("CRITICAL ERROR: [Auth] Unlocked key is empty. Shutting down to prevent insecure operation.")
+
+  
 # Force working directory to be the directory of this server script
 workspace_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(workspace_dir)
@@ -663,6 +747,31 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+class PQCEnforcementMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, secret_key: str):
+        super().__init__(app)
+        self.secret_key = secret_key
+
+    async def dispatch(self, request: Request, call_next):
+        pqc_signature = request.headers.get("X-PQC-Signature")
+        timestamp_str = request.headers.get("X-PQC-Timestamp")
+
+        if pqc_signature or timestamp_str:
+            try:
+                ts = float(timestamp_str or "0")
+                if abs(time.time() - ts) > 30:
+                    return JSONResponse(status_code=401, content={"detail": "Request expired / Replay detected."})
+                mac_bytes = uuid.getnode().to_bytes(8, byteorder="big")
+                expected_sig = hashlib.sha3_512(mac_bytes + str(int(ts)).encode("utf-8") + self.secret_key.encode("utf-8")).hexdigest()
+                if not hmac.compare_digest(pqc_signature or "", expected_sig):
+                    return JSONResponse(status_code=401, content={"detail": "Cryptographic Identity Mismatch."})
+            except Exception as e:
+                return JSONResponse(status_code=401, content={"detail": f"PQC Signature Verification Failed: {str(e)}"})
+
+        return await call_next(request)
+
+app.add_middleware(PQCEnforcementMiddleware, secret_key=LOCAL_API_KEY)
+
 # --- GPU Layer Offloading Helpers ---
 
 def get_target_vram_mb() -> float:
@@ -1042,6 +1151,8 @@ COMMAND_RULES = [
     (r"^spps\b", False),
     (r"^curl\b", False),
     (r"^wget\b", False),
+    (r"\.env\b", False),
+    (r"\b\.env", False),
 
     # Whitelisted rules
     (r"^cd(\s+|$)", True),
@@ -1170,6 +1281,19 @@ def is_command_allowed(command_line: str) -> bool:
             log_message(f"[Command Filter] Blocked command statement '{stmt}' (no matching whitelist pattern)")
             return False
     return True
+
+def is_path_allowed(file_path: Optional[str]) -> bool:
+    """Restricts server process and agent tools from accessing sensitive .env files."""
+    if not file_path or not isinstance(file_path, str):
+        return False
+    try:
+        abs_path = os.path.abspath(file_path)
+        base_name = os.path.basename(abs_path).lower()
+        if base_name == ".env" or base_name.startswith(".env.") or ".env" in base_name:
+            return False
+        return True
+    except Exception:
+        return False
 
 class StreamingThoughtFilter:
     def __init__(self):
@@ -1649,7 +1773,8 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                         else:
                             # Wrap command in PowerShell to support standard aliases like 'ls'
                             full_cmd = f"powershell -NoProfile -Command \"{command}\""
-                            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30)
+                            sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
+                            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
                         stdout = result.stdout[:2000]
                         stderr = result.stderr[:2000]
                         tool_context = f"\n\n[System Tool Response: Command Exited with {result.returncode}]\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}\n"
@@ -1718,7 +1843,16 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     file_path = args.get("path") if isinstance(args, dict) else None
                     start_line = args.get("start_line") if isinstance(args, dict) else None
                     end_line = args.get("end_line") if isinstance(args, dict) else None
-                    if file_path and os.path.exists(file_path):
+                    if file_path and not is_path_allowed(file_path):
+                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
+                        log_message(f"[Tool Error] Access restricted: {file_path}")
+                        agent_steps.append({
+                            "step": tool_loop_count + 1,
+                            "tool": f"read_file: {file_path}",
+                            "status": "error",
+                            "details": "Access restricted"
+                        })
+                    elif file_path and os.path.exists(file_path):
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                              file_contents = f.read()
                         
@@ -1779,7 +1913,16 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     file_path = args.get("path") if isinstance(args, dict) else None
                     target_content = args.get("target_content") if isinstance(args, dict) else ""
                     new_content = args.get("new_content") if isinstance(args, dict) else ""
-                    if file_path and os.path.exists(file_path):
+                    if file_path and not is_path_allowed(file_path):
+                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
+                        log_message(f"[Tool Error] Access restricted: {file_path}")
+                        agent_steps.append({
+                            "step": tool_loop_count + 1,
+                            "tool": f"insert_edit_into_file: {file_path}",
+                            "status": "error",
+                            "details": "Access restricted"
+                        })
+                    elif file_path and os.path.exists(file_path):
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                             content = f.read()
                         if target_content in content:
@@ -1827,7 +1970,16 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     file_path = args.get("path") if isinstance(args, dict) else None
                     target_content = args.get("target_content") if isinstance(args, dict) else ""
                     new_content = args.get("new_content") if isinstance(args, dict) else ""
-                    if file_path and os.path.exists(file_path):
+                    if file_path and not is_path_allowed(file_path):
+                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
+                        log_message(f"[Tool Error] Access restricted: {file_path}")
+                        agent_steps.append({
+                            "step": tool_loop_count + 1,
+                            "tool": f"replace_string_in_file: {file_path}",
+                            "status": "error",
+                            "details": "Access restricted"
+                        })
+                    elif file_path and os.path.exists(file_path):
                         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                             content = f.read()
                         if target_content in content:
@@ -1876,7 +2028,16 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     content = args.get("content") if isinstance(args, dict) else ""
                     if not isinstance(content, str):
                         content = ""
-                    if file_path:
+                    if file_path and not is_path_allowed(file_path):
+                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
+                        log_message(f"[Tool Error] Access restricted: {file_path}")
+                        agent_steps.append({
+                            "step": tool_loop_count + 1,
+                            "tool": f"write_file: {file_path}",
+                            "status": "error",
+                            "details": "Access restricted"
+                        })
+                    elif file_path:
                         with open(file_path, "w", encoding="utf-8") as f:
                             f.write(content)
                         tool_context = f"\n\n[System Tool Response: Successfully wrote {len(content)} characters to '{file_path}']\n"
@@ -1914,6 +2075,8 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     
                     if not file_path:
                         tool_context = f"\n\n[System Tool Error: File path was not provided for replacement.]\n"
+                    elif not is_path_allowed(file_path):
+                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
                     elif not os.path.exists(file_path):
                         tool_context = f"\n\n[System Tool Error: File '{file_path}' was not found in the workspace.]\n"
                     elif not replacements or not isinstance(replacements, list):
@@ -1987,6 +2150,8 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             # Filter dirs in-place to optimize traversal speed and prevent descending into big folders
                             dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
                             for file in files:
+                                if file.startswith(".env") or not is_path_allowed(file):
+                                    continue
                                 if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md", ".java", ".cpp", ".h")):
                                     path = os.path.join(root, file)
                                     try:
@@ -3462,4 +3627,4 @@ if __name__ == "__main__":
     logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
     free_port(8002)
     print("[Server] Starting SerenityDev Orchestrator...")
-    uvicorn.run("serenitydevserver:app", host="0.0.0.0", port=8002, reload=False)
+    uvicorn.run("serenitydevserver:app", host="127.0.0.1", port=8002, reload=False)
