@@ -6,6 +6,8 @@ File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
+New models and ones displayed should be given Agent role, reserving the Worker role purely for delegation by a Supervisor or Orchestrator.
+
 1. resolve llm output is massdumping instead of streaming response.
    [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Done] 
 
@@ -34,6 +36,10 @@ add git commands to harness
    - Localize TEMP/TMP and CUDA compiler cache paths to the workspace to bypass Windows security policy blocks.
    - Ensure all subprocess backends (MSVC, CMake, Pip, PyTorch, Triton) respect the localized variables. [Done] 
 "when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints." [Done] 
+
+12. Implement HTTPS-enforced StreamableHTTP MCP server endpoint (`/mcp`) in `serenitydevserver.py` for Google AI Edge Gallery integration. [Done]
+
+13. Hardened SerenityKeyVault multi-factor hardware entropy (OS MAC + Windows MachineGuid + BIOS UUID), SHAKE-256 GCM nonces (zero collision across 10k squeezes), constant-time comparisons, SessionRotationManager with encrypted store-and-resume, and autonomous downtime rotation loop (default 10-minute idle threshold). [Done]
 
 [TBD] make auto-pushing verified updates a thing. 
 
