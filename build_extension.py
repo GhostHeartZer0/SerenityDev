@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import os
+import json
 
 def main():
     print("Starting build process for SerenityDev extension...")
@@ -23,7 +24,17 @@ def main():
             text=True
         )
         
+        vsix_path = None
+        pkg_path = os.path.join(workspace_dir, "package.json")
+        if os.path.exists(pkg_path):
+            with open(pkg_path, "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            vsix_name = f"{pkg.get('name')}-{pkg.get('version')}.vsix"
+            vsix_path = os.path.abspath(os.path.join(workspace_dir, vsix_name))
+
         print("\nSuccess! The .vsix file has been updated/created.")
+        if vsix_path:
+            print(f"VSIX Path: {vsix_path}")
         print("You can now install it in VS Code by right-clicking the .vsix file and selecting 'Install Extension VSIX'.")
         
     except subprocess.CalledProcessError as e:
@@ -36,3 +47,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

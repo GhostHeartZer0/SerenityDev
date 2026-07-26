@@ -2,6 +2,7 @@
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
 ## Version 1.5.0
+- Hardened `SerenityKeyVault` with composite multi-factor hardware entropy (OS MAC, Windows `MachineGuid`, BIOS UUID) to prevent user-space MAC address spoofing attacks, squeezed 96-bit nonces directly from SHAKE-256 to prevent GCM nonce reuse catastrophes, enforced constant-time digest comparisons (`hmac.compare_digest`), implemented `SessionRotationManager` with encrypted state preservation/resumption, added `/api/session/rotate` and `/api/session/status` endpoints, and launched an autonomous downtime session rotation loop (default 10-minute idle threshold). [Done]
 - Limited server process permissions & .env rogue agent isolation. Added is_path_allowed checks to read/write/edit/grep tools, blacklisted .env in command execution rules, filtered list_directory, and sanitized subprocess environment. [Done]
 - Fixed LOCAL_API_KEY structure in dotenv loading & fallback to prevent ValueError startup crash and handle local key configuration. [Done]
 - Implemented SerenityKeyVault with SHA3-512 & SHAKE-256 (Keccak XOF) hardware MAC entropy binding for pqc_v1: key blobs. [Done]
@@ -9,6 +10,66 @@ All notable changes to the "SerenityDev" extension will be documented in this fi
 - Created startup.py & config_guard.py for strict environment validation; enforced zero fallback key policy in serenitydevserver.py (fails fast if LOCALAPIKEY is missing or unencrypted). [Done]
 - Cleaned up and updated .gitignore rules (added build/test/venv/cache patterns, unignored .env.example template). [Done]
 - Created seal_secrets.py CLI tool to generate hardware-bound PQC key blobs (`pqc_v1:...`) with MAC + SHA3-512 + SHAKE-256 entropy. [Done]
+- Updated .vscodeignore to exclude .env, .venv, scratch, and cache files from VSIX packaging. [Done]
+- Updated build_extension.py to calculate and output the absolute VSIX file path on successful build. [Done]
+- Added Ollama & OpenAI API compatibility routes (`/api/tags`, `/api/version`, `/v1/models`, `/v1/models/{model_id}`, `/v1/chat/completions`, `/health`) and `CORSMiddleware` in `serenitydevserver.py` to prevent 404 errors and resolve client HTTP upgrade/preflight edge cases. [Done]
+- Re-encrypted LOCAL_API_KEY in .env using encrypt_key.py bound to current machine hardware MAC entropy to resolve cryptography.exceptions.InvalidTag error. [Done]
+- Added graceful `asyncio.CancelledError` handling across completion streaming, OpenAI compatibility routes, and supervisor loops in `serenitydevserver.py` to prevent task group tracebacks on client disconnections. [Done]
+- Allowed absolute and drive-qualified workspace directory paths from Android Studio and VS Code plugins in `validate_workspace_path` and `run_orchestration` in `serenitydevserver.py`. [Done]
+- Expanded native tool call parsing in `extract_json` in `serenitydevserver.py` to match tag variants like `<channel|><|tool_call>call:read_file{...}` and prevent orchestrator stalling. [Done]
+- Implemented `get_vram_info()` in `serenitydevserver.py` using `pynvml` & `nvidia-smi` to track Total VRAM, Free VRAM, and Self Process VRAM (`free + self_used`) for accurate dynamic GPU offloading. [Done]
+- Added `parse_read_file_args()` in `serenitydevserver.py` supporting all line range parameters (`start_line`, `startLine`, `start`, `line`, `range`, `path:1520`, `path around line 1520`). [Done]
+- Added tool target normalization routing in `serenitydevserver.py` to map model tool aliases (`search_files` -> `grep_search`, `list_files` -> `list_directory`, etc.). [Done]
+- Implemented tool target namespace prefix stripping in `serenitydevserver.py` (e.g. `google:mcp:code_interpreter:read_file` -> `read_file`) to ensure tool call execution across custom client schemas. [Done]
+- Created and refactored `SERENITY.md` specification document with Caveman Principle, Ponytail Laziness Ladder, tool target schemas, and execution pipeline rules. [Done]
+- Merged `src/Serenity.md` manifest into root `SERENITY.md` (adding Offload-then-Load OTL protocol, memory workaround specs, sub-agent logic flows, and tool optimization matrix). [Done]
+- Updated `clean_thought_and_whitespace()` in `serenitydevserver.py` with robust regexes to strip pipe-wrapped think/thought tags (`<|think|>`, `<|thought|>`, `<|channel|>thought`) and prevent thought-trace JSON leakage from breaking tool calls. [Done]
+- Removed duplicate leading `<bos>` tags from all prompt templates in `serenitydevserver.py` to eliminate `llama.py` duplicate BOS runtime warnings and preserve chat template token alignment. [Done]
+- Updated `StreamingThoughtFilter` to initialize with `start_in_thought=True` by default and clean out unneeded native tool call tags during worker Markdown output streaming. [Done]
+- Fixed f-string literal brace escaping in `review_prompt` in `serenitydevserver.py` (`{{` and `}}`) to resolve `ValueError: Invalid format specifier` runtime stream crash. [Done]
+- Added parameter key fallbacks (`search_string`, `replace_string`, `old_content`, `new_content`, `target`, `replacement`) to `replace_string_in_file` handler in `serenitydevserver.py`. [Done]
+- Reset `max_tool_loops` default to 10 (Low mode) / 30 (High mode) in `serenitydevserver.py`, and added optional `max_steps` parameter support in `QueryRequest` so clients can customize execution depth. [Done]
+- Implemented `executed_tool_calls` signature tracking and duplicate tool call interception in `serenitydevserver.py` to block models from repeatedly re-reading identical files. [Done]
+- Updated `list_directory` handler in `serenitydevserver.py` to parse and list subdirectories (`path`, `directory`, `folder`) instead of hardcoding `.`, allowing models to inspect subfolders like `gradle` or `app`. [Done]
+- Hardened all MCP tool handlers in `serenitydevserver.py`: added auto-creation of parent directories (`os.makedirs`) in `write_file`, parameter key fallbacks across `insert_edit_into_file` and `multi_replace_string_in_file`, and directory scoping (`path`/`dir`) for `grep_search`. [Done]
+- Added OpenAI `/v1/responses`, `/responses`, `/v1/completions`, `/completions`, and `/chat/completions` API compatibility endpoints to `serenitydevserver.py` to fix Android Studio, JetBrains, and VS Code IDE 404 connection errors. [Done]
+- Updated tool matrix in `src/SERENITY.md` to document optional subdirectory `path` parameter support for `list_directory`. [Done]
+- Implemented HTTPS-enforced StreamableHTTP Model Context Protocol (MCP) endpoint (`@app.api_route("/mcp")`) in `serenitydevserver.py` supporting `initialize`, `tools/list`, `tools/call`, `ping`, and `notifications/initialized` for Google AI Edge Gallery and external MCP clients. [Done]
+- Created `start_native_mcp.py` to run custom native HTTPS MCP server directly on LAN IP (`0.0.0.0:8443`) with PQC hardware-seeded Local Root CA (`rootCA.pem`) and SHA-384 signed TLS certificates for Android trust without third-party tunnel services. [Done]
+- Updated `.gitignore` to exclude TLS certificates, keys (`*.pem`, `*.key`, `rootCA.*`, `cert.*`), and credential files from git version control. [Done]
+- Cleaned up rule redundancy between `.agents/AGENTS.md` and `src/SERENITY.md`: established `.agents/AGENTS.md` as the auto-injected systemic rulebook, and updated `src/SERENITY.md` to reference `.agents/AGENTS.md` while maintaining technical architecture specifications. [Done]
+- Added `cap_n_ctx_for_model()` in `serenitydevserver.py` to auto-cap context allocations (`n_ctx`) to model-specific training limits (e.g. 8192 max for CodeGemma models), eliminating `n_ctx_seq > n_ctx_train` context overflow warnings. [Done]
+- Added `/mcp` GET/POST Streamable HTTP JSON-RPC 2.0 endpoints with PQC Bearer token auth in `serenitydevserver.py`. Refactored `start_native_mcp.py` for HTTPS-only security with auto-serve `rootCA.pem` HTTP downloader on port 8080. Hardened `verify_mcp_auth` for flexible token headers (`Authorization: Bearer <token>`, `Authorization: <token>`, `Bearer: <token>`, `?token=`) and allowed optional GET discovery probes for Edge Gallery initialization. [Done]
+- Enforced strict role separation in `serenitydevserver.py` and `src/SERENITY.md`: Supervisor functions as Planner & Architect (`create_or_update_plan`, task decomposition, review), while Workers function as pure Executors (tool operations, direct code synthesis, ultra-terse summary for Supervisor without chatter). [Done]
+- Updated model registry (`/api/models`) and startup logs in `serenitydevserver.py` to assign the `Agent` role to registered/discovered models (e.g. `Serenity: <model> (Agent)`), reserving the `Worker` title strictly for explicit delegation phases by the Supervisor. [Done]
+- Added `unload_direct_llama_model = unload_llama_model` function alias in `serenitydevserver.py` to resolve `NameError: name 'unload_direct_llama_model' is not defined` runtime stream failure during model reloading. [Done]
+- Updated `/api/status` endpoint in `serenitydevserver.py` with non-blocking `query_nvidia_smi_sync()` executed in `asyncio.to_thread` with tight timeout (1.5s) and `cached_gpu_memory` fallback, resolving `subprocess.TimeoutExpired` crashes when `nvidia-smi` blocks on CUDA context locks. [Done]
+- Updated optional `llama_cpp` import in `serenitydevserver.py` to check `importlib.util.find_spec("llama_cpp")` before loading, preventing IDE debuggers from breaking on unhandled `ModuleNotFoundError` exceptions. [Done]
+- Fixed model unloading hangs in `unload_llama_model()` and `unload_llama_server()` by invoking explicit `.close()`, `del`, and 2s timeout fallbacks before garbage collection. [Done]
+- Redesigned Orchestration Report output formatting in `serenitydevserver.py` using native GFM Markdown and `<details open>` collapsible blocks, ensuring clean layout rendering in VS Code and Android Studio IDE clients. [Done]
+- Fixed host string literal in `start_native_mcp.py` (`host="0.0.0.0"`), resolving socket `[Errno 11001] getaddrinfo failed` startup crashes. [Done]
+- Added automatic `free_port()` cleanup in `start_native_mcp.py` to auto-terminate zombie processes occupying ports 8443 or 8080 on Windows (`Errno 10048 WSAEADDRINUSE`) with `subprocess.run` exit code handling. [Done]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## Version 1.4.20 2026-07-20 
 - Gemma-4 Chat templates updated to the july release, boasting improved benchmark scores, tool call handling, and thought handling.
@@ -20,18 +81,11 @@ All notable changes to the "SerenityDev" extension will be documented in this fi
 
 ### To-Do List: (Items marked [Done] must be tested and verified, then they will be crossed out and added above)
 
-1. resolve llm output is massdumping instead of streaming response.
-   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Done] 
-
 2. kv cache compression settings (add to UI and verify it works / changes) [Done] 
 
 3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq [Done] 
 
 4. implement terminal command whitelist / blacklist filtering in devserver for run_command. [Done]
-
-5. High and Low modes, split logic in two:
-   - gemma-4-26B-A4B (High) explains everything it does, uses thinking to the max, as many tokens and tool uses as needed to solve the issue with utmost accuracy. Prioritizes self-optimizable pipeline: research - plan - worker selections - permission (if necessary) - execution - test.
-   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test. [Done] 
 
 6. ensure for each task and worker the temp and such is set properly thruout. [Done] 
 

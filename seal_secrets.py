@@ -9,15 +9,21 @@ import hashlib
 import os
 import sys
 
-def generate_machine_entropy() -> bytes:
-    """Generates hardware-bound seed using MAC address string and SHA3-512."""
-    mac = str(uuid.getnode()).encode('utf-8')
-    return hashlib.sha3_512(mac).digest()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from serenitydevserver import SerenityKeyVault
+except Exception:
+    SerenityKeyVault = None
 
 def seal_secret(raw_text: str) -> str:
-    """Encrypts raw secret into pqc_v1 format with 12-byte random nonce."""
-    entropy = generate_machine_entropy()
-    nonce = os.urandom(12)
+    """Encrypts raw secret into pqc_v1 format with hardened entropy and nonces."""
+    if SerenityKeyVault is not None:
+        return SerenityKeyVault.encrypt(raw_text)
+
+    mac = str(uuid.getnode()).encode('utf-8')
+    entropy = hashlib.sha3_512(mac).digest()
+    seed = os.urandom(16) + entropy
+    nonce = hashlib.shake_256(seed).digest(12)
     plain_bytes = raw_text.encode('utf-8')
 
     try:

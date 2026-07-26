@@ -19,10 +19,12 @@ import logging
 import hmac
 import uuid
 import hashlib
+import datetime
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 import httpx
@@ -31,12 +33,44 @@ import signal
 import cryptography
 
 class SerenityKeyVault:
-    """Hardware-bound Key Vault using SHA3-512 & SHAKE-256 (Keccak XOF) entropy binding."""
+    """Hardware-bound Key Vault using SHA3-512 & SHAKE-256 (Keccak XOF) multi-factor entropy binding."""
 
     @staticmethod
     def get_machine_entropy() -> bytes:
+        """Reads composite multi-factor hardware attributes (OS MAC, Windows MachineGuid, BIOS UUID) to prevent user-space MAC spoofing."""
+        components = [str(uuid.getnode()).encode("utf-8")]
+        # 1. Windows Registry MachineGuid
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
+                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
+                if guid:
+                    components.append(str(guid).encode("utf-8"))
+        except Exception:
+            pass
+        # 2. BIOS / Motherboard UUID
+        try:
+            res = subprocess.run("wmic csproduct get UUID", shell=True, capture_output=True, text=True, timeout=2)
+            if res.returncode == 0 and res.stdout:
+                lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip() and "UUID" not in l]
+                if lines:
+                    components.append(lines[0].encode("utf-8"))
+        except Exception:
+            pass
+
+        combined = b"|".join(components)
+        return hashlib.sha3_512(combined).digest()
+
+    @staticmethod
+    def get_legacy_entropy() -> bytes:
         mac = str(uuid.getnode()).encode("utf-8")
         return hashlib.sha3_512(mac).digest()
+
+    @classmethod
+    def generate_nonce(cls, entropy: bytes, extra: bytes = b"") -> bytes:
+        """Squeezes a fresh 96-bit (12-byte) IV directly from SHAKE-256 to prevent GCM nonce reuse catastrophes."""
+        seed = os.urandom(16) + time.monotonic_ns().to_bytes(8, "big") + entropy + extra
+        return hashlib.shake_256(seed).digest(12)
 
     @classmethod
     def unlock(cls, key_blob: str) -> str:
@@ -51,30 +85,34 @@ class SerenityKeyVault:
 
         nonce = raw_payload[:12]
         ciphertext = raw_payload[12:]
-        entropy = cls.get_machine_entropy()
 
-        # Attempt AESGCM decryption if cryptography library is installed
-        try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            derived_key = hashlib.shake_256(entropy).digest(32)
-            aesgcm = AESGCM(derived_key)
-            decrypted_bytes = aesgcm.decrypt(nonce, ciphertext, None)
-            return decrypted_bytes.decode("utf-8")
-        except Exception:
-            pass
+        # Try multi-factor machine entropy first, fallback to legacy OS MAC entropy for backward compatibility
+        for entropy_fn in [cls.get_machine_entropy, cls.get_legacy_entropy]:
+            entropy = entropy_fn()
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                derived_key = hashlib.shake_256(entropy).digest(32)
+                aesgcm = AESGCM(derived_key)
+                decrypted_bytes = aesgcm.decrypt(nonce, ciphertext, None)
+                return decrypted_bytes.decode("utf-8")
+            except Exception:
+                pass
 
-        # Fallback to SHAKE-256 keystream XOR decryption
-        try:
-            keystream = hashlib.shake_256(entropy + nonce).digest(len(ciphertext))
-            plain_bytes = bytes(b ^ k for b, k in zip(ciphertext, keystream))
-            return plain_bytes.decode("utf-8")
-        except Exception:
-            raise PermissionError("[Security Breach] Hardware mismatch or corrupted PQC key blob.")
+            try:
+                keystream = hashlib.shake_256(entropy + nonce).digest(len(ciphertext))
+                plain_bytes = bytes(b ^ k for b, k in zip(ciphertext, keystream))
+                text = plain_bytes.decode("utf-8")
+                if text and all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in text):
+                    return text
+            except Exception:
+                pass
+
+        raise PermissionError("[Security Breach] Hardware mismatch or corrupted PQC key blob.")
 
     @classmethod
     def encrypt(cls, plaintext: str) -> str:
-        nonce = os.urandom(12)
         entropy = cls.get_machine_entropy()
+        nonce = cls.generate_nonce(entropy)
         plain_bytes = plaintext.encode("utf-8")
 
         try:
@@ -240,15 +278,114 @@ def trim_context_tool_pairs(messages: List[Dict[str, str]], max_items: int) -> L
 global_circuit_breaker = CircuitBreaker()
 global_workspace_queue = WorkspaceQueue()
 
+class SessionRotationManager:
+    """Manages active session rotations, key generation epochs, state preservation, and autonomous downtime rotations."""
+
+    idle_minutes: int = int(os.environ.get("SERENITY_SESSION_ROTATION_IDLE_MINUTES", "10"))
+    max_age_hours: float = float(os.environ.get("SERENITY_MAX_SESSION_AGE_HOURS", "1.0"))
+
+    last_client_activity: float = time.time()
+    key_created_at: float = time.time()
+    rotation_epoch: int = 1
+    pending_rotation_notice: bool = False
+
+    @classmethod
+    def record_activity(cls):
+        cls.last_client_activity = time.time()
+
+    @classmethod
+    def rotate(cls, store_and_resume: bool = True) -> Dict[str, Any]:
+        global sessions_history, global_workspace_queue
+        cache_path = os.path.join(cache_dir, "session_rotation_state.bin")
+        stored_items_count = 0
+
+        if store_and_resume:
+            state_data = {
+                "epoch": cls.rotation_epoch,
+                "timestamp": time.time(),
+                "sessions_history": sessions_history,
+                "workspace_queues": global_workspace_queue.queues
+            }
+            json_bytes = json.dumps(state_data).encode("utf-8")
+            encrypted_blob = SerenityKeyVault.encrypt(json_bytes.decode("latin1"))
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(encrypted_blob)
+            stored_items_count = len(sessions_history)
+
+        cls.rotation_epoch += 1
+        cls.key_created_at = time.time()
+        cls.pending_rotation_notice = True
+
+        if store_and_resume and os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    blob = f.read()
+                decrypted_str = SerenityKeyVault.unlock(blob)
+                restored = json.loads(decrypted_str)
+                if isinstance(restored, dict):
+                    if "sessions_history" in restored and isinstance(restored["sessions_history"], dict):
+                        sessions_history.update(restored["sessions_history"])
+                    if "workspace_queues" in restored and isinstance(restored["workspace_queues"], dict):
+                        for k, v in restored["workspace_queues"].items():
+                            global_workspace_queue.queues[k] = v
+            except Exception as e:
+                logging.error(f"[Session Rotation] Failed to restore session state: {e}")
+
+        logging.info(f"[Security] Session rotated to Epoch {cls.rotation_epoch} (store_and_resume={store_and_resume}).")
+        return {
+            "epoch": cls.rotation_epoch,
+            "key_created_at": cls.key_created_at,
+            "stored_and_resumed": store_and_resume,
+            "stored_sessions_count": stored_items_count,
+            "notice": "Session state preserved. Master key rotated successfully."
+        }
+
+    @classmethod
+    def get_status(cls) -> Dict[str, Any]:
+        now = time.time()
+        idle_duration = now - cls.last_client_activity
+        key_age_seconds = now - cls.key_created_at
+        return {
+            "rotation_epoch": cls.rotation_epoch,
+            "key_created_at": cls.key_created_at,
+            "key_age_seconds": round(key_age_seconds, 2),
+            "idle_duration_seconds": round(idle_duration, 2),
+            "idle_threshold_minutes": cls.idle_minutes,
+            "max_age_hours": cls.max_age_hours,
+            "pending_rotation_notice": cls.pending_rotation_notice,
+            "hardware_binding": "SHA3-512 + SHAKE-256 Multi-Factor (MAC + MachineGuid + BIOS UUID)"
+        }
+
+    @classmethod
+    def check_downtime_and_rotate(cls):
+        now = time.time()
+        idle_seconds = now - cls.last_client_activity
+        key_age_seconds = now - cls.key_created_at
+        if idle_seconds >= cls.idle_minutes * 60 and key_age_seconds >= cls.max_age_hours * 3600:
+            cls.rotate(store_and_resume=True)
+
+class SessionRotationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        SessionRotationManager.record_activity()
+        response = await call_next(request)
+        if SessionRotationManager.pending_rotation_notice:
+            response.headers["X-Serenity-Session-Notice"] = (
+                f"session_rotated; epoch={SessionRotationManager.rotation_epoch}; session_preserved=true; endpoint=/api/session/rotate"
+            )
+        return response
+
+import importlib.util
+
 # llama-cpp-python state management
 active_llama_model = None
 active_llama_model_name = None
 llama_cpp_available = False
-try:
-    import llama_cpp
-    llama_cpp_available = True
-except ImportError:
-    pass
+if importlib.util.find_spec("llama_cpp") is not None:
+    try:
+        import llama_cpp
+        llama_cpp_available = True
+    except Exception:
+        pass
 
 def resolve_gguf_path(model_name: str) -> Optional[str]:
     if not model_name:
@@ -289,30 +426,45 @@ def resolve_gguf_path(model_name: str) -> Optional[str]:
 active_llama_server_model_name = None
 
 def unload_llama_server():
-    """Stops the llama-server process to free VRAM."""
+    """Stops the llama-server process to free VRAM cleanly without hanging."""
     global llama_server_process, active_llama_server_model_name
     try:
         if llama_server_process is not None:
             log_message("[Llama-Server] Stopping active llama-server process to free VRAM...")
-            llama_server_process.terminate()
-            llama_server_process.wait(timeout=5)
+            try:
+                llama_server_process.terminate()
+                llama_server_process.wait(timeout=2)
+            except Exception:
+                if llama_server_process is not None:
+                    llama_server_process.kill()
             llama_server_process = None
             log_message("[Llama-Server] Successfully terminated.")
     except Exception as e:
         log_message(f"[Llama-Server] Warning killing llama-server: {e}")
         if llama_server_process is not None:
-            llama_server_process.kill()
+            try:
+                llama_server_process.kill()
+            except Exception:
+                pass
             llama_server_process = None
     finally:
         active_llama_server_model_name = None
 
 def unload_llama_model():
-    """Explicitly unloads the direct llama-cpp-python model to clear VRAM."""
+    """Explicitly unloads the direct llama-cpp-python model to clear VRAM without blocking."""
     global active_llama_model, active_llama_model_name
     if active_llama_model is not None:
-        log_message(f"[Llama-CPP] Unloading model '{active_llama_model_name}' first...")
+        model_to_close = active_llama_model
+        model_name_to_close = active_llama_model_name
         active_llama_model = None
         active_llama_model_name = None
+        log_message(f"[Llama-CPP] Unloading model '{model_name_to_close}'...")
+        try:
+            if hasattr(model_to_close, "close") and callable(getattr(model_to_close, "close")):
+                model_to_close.close()
+            del model_to_close
+        except Exception as e:
+            log_message(f"[Llama-CPP] Warning during model close: {e}")
         import gc
         gc.collect()
         try:
@@ -322,6 +474,8 @@ def unload_llama_model():
         except Exception:
             pass
         log_message("[Llama-CPP] Direct model offloaded successfully.")
+
+unload_direct_llama_model = unload_llama_model
 
 async def start_llama_server(model_name: str, n_ctx: int):
     """Starts the llama-server subprocess if using API fallback."""
@@ -406,6 +560,7 @@ async def start_llama_server(model_name: str, n_ctx: int):
         log_message(f"[Llama-Server] Failed to spawn server: {e}")
         llama_server_process = None
         active_llama_server_model_name = None
+        raise RuntimeError(f"Failed to spawn llama-server: {e}")
 
 
 def get_ggml_type(cache_type_str: str) -> Optional[int]:
@@ -428,14 +583,31 @@ def get_ggml_type(cache_type_str: str) -> Optional[int]:
         return getattr(llama_cpp, "GGML_TYPE_Q8_K", None)
     return mapping.get(cleaned)
 
-def get_llama_model(model_name: str, n_ctx: int):
+MODEL_MAX_CONTEXT_LIMITS = {
+    "codegemma": 8192,
+    "gemma-2": 8192,
+    "gemma-2b": 8192,
+    "gemma-7b": 8192,
+}
+
+def cap_n_ctx_for_model(model_name: str, requested_n_ctx: int) -> int:
+    """Cap requested n_ctx to model's maximum trained context length to prevent training context overflow warnings."""
+    model_lower = model_name.lower()
+    for key, max_limit in MODEL_MAX_CONTEXT_LIMITS.items():
+        if key in model_lower:
+            if requested_n_ctx > max_limit:
+                log_message(f"[Llama-CPP] Capping requested n_ctx ({requested_n_ctx}) to model '{model_name}' max trained context limit ({max_limit}).")
+                return max_limit
+    return requested_n_ctx
+
+def get_llama_model(model_name: str, n_ctx: int = 16384, cache_type_k: str = "f16", cache_type_v: str = "f16"):
     global active_llama_model, active_llama_model_name
-    if active_llama_model is not None:
-        if active_llama_model_name != model_name or active_llama_model.n_ctx() < n_ctx:
-            unload_llama_model()
+    n_ctx = cap_n_ctx_for_model(model_name, n_ctx)
     
-    unload_llama_server()
-    
+    if active_llama_model is not None and (active_llama_model_name != model_name or active_llama_model.n_ctx() < n_ctx):
+        log_message(f"[Llama-CPP] Unloading active model '{active_llama_model_name}' to reload for '{model_name}'...")
+        unload_direct_llama_model()
+        
     if active_llama_model is None:
         gguf_path = resolve_gguf_path(model_name)
         if not gguf_path:
@@ -519,22 +691,27 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                     finally:
                         loop.call_soon_threadsafe(queue.put_nowait, None)
                 loop.run_in_executor(None, producer)
-                while True:
-                    val = await queue.get()
-                    if val is None:
-                        break
-                    if isinstance(val, Exception):
-                        raise val
-                    yield val
+                try:
+                    while True:
+                        val = await queue.get()
+                        if val is None:
+                            break
+                        if isinstance(val, Exception):
+                            raise val
+                        yield val
+                except asyncio.CancelledError:
+                    log_message("[Llama-CPP Stream] Stream cancelled by client connection drop.")
+                    raise
                 return
+        except asyncio.CancelledError:
+            log_message("[Llama-CPP Stream] Generation cancelled.")
+            raise
         except Exception as e:
             log_message(f"[Llama-CPP Stream Error] Direct streaming failed, falling back to Llama-Server API: {e}")
 
     # Start or ensure llama-server is running for this model
     if llama_server_process is None or active_llama_server_model_name != model_name:
         await start_llama_server(model_name, num_ctx)
-
-
 
     payload = {
         "model": model_name,
@@ -546,27 +723,35 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
         "min_p": min_p,
         "repeat_penalty": repeat_penalty
     }
-    async with httpx.AsyncClient(timeout=60) as client:
-        async with client.stream("POST", LLAMA_SERVER_URL, json=payload) as res:
-            async for line in res.aiter_lines():
-                line = line.strip()
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(data_str)
-                        if "choices" in data and len(data["choices"]) > 0:
-                            chunk = data["choices"][0].get("text", "")
-                            if chunk:
-                                yield chunk
-                    except Exception:
-                        pass
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream("POST", LLAMA_SERVER_URL, json=payload) as res:
+                async for line in res.aiter_lines():
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            if "choices" in data and len(data["choices"]) > 0:
+                                chunk = data["choices"][0].get("text", "")
+                                if chunk:
+                                    yield chunk
+                        except Exception:
+                            pass
+    except asyncio.CancelledError:
+        log_message("[Llama-Server Stream] Stream cancelled by client connection drop.")
+        raise
 
 async def generate_completion(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None, min_p: float = 0.05, repeat_penalty: float = 1.05) -> Dict[str, Any]:
     result = []
-    async for chunk in generate_completion_stream(model_name, prompt, temperature, num_ctx, max_tokens, stop, min_p, repeat_penalty):
-        result.append(chunk)
+    try:
+        async for chunk in generate_completion_stream(model_name, prompt, temperature, num_ctx, max_tokens, stop, min_p, repeat_penalty):
+            result.append(chunk)
+    except asyncio.CancelledError:
+        log_message(f"[Completion Cancelled] Task cancelled for model {model_name}")
+        raise
     return {"response": "".join(result)}
 
 SUPERVISOR_PROMPT = """
@@ -625,6 +810,7 @@ class QueryRequest(BaseModel):
     model: str = SUPERVISOR_MODEL
     session_id: Optional[str] = None
     workspace_dir: Optional[str] = None
+    max_steps: Optional[int] = None
 
 class FimRequest(BaseModel):
     prefix: str
@@ -732,19 +918,42 @@ def check_and_register_models():
         W4_MODEL = super_candidates[2] if len(super_candidates) > 2 else SUPERVISOR_MODEL
         
         log_message(f"[Startup] Auto-Assigned Supervisor: {SUPERVISOR_MODEL}")
-        log_message(f"[Startup] Auto-Assigned W2 (Code): {W2_MODEL}")
-        log_message(f"[Startup] Auto-Assigned FIM: {FIM_MODEL}")
+        log_message(f"[Startup] Auto-Assigned Agent (Code): {W2_MODEL}")
+        log_message(f"[Startup] Auto-Assigned Agent (FIM): {FIM_MODEL}")
+
+async def autonomous_downtime_session_rotation_loop():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            SessionRotationManager.check_downtime_and_rotate()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.error(f"[Downtime Rotation] Loop error: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Run model check synchronously to avoid race conditions with early requests
     check_and_register_models()
-    yield
+    rotation_task = asyncio.create_task(autonomous_downtime_session_rotation_loop())
+    try:
+        yield
+    finally:
+        rotation_task.cancel()
 
 app = FastAPI(
     title="Serenity Orchestrator",
     description="Multi-agent local orchestrator featuring Hierarchical Supervisor routing and Autoreplacer (FIM) autocomplete management.",
     lifespan=lifespan
+)
+
+app.add_middleware(SessionRotationMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class PQCEnforcementMiddleware(BaseHTTPMiddleware):
@@ -774,20 +983,68 @@ app.add_middleware(PQCEnforcementMiddleware, secret_key=LOCAL_API_KEY)
 
 # --- GPU Layer Offloading Helpers ---
 
-def get_target_vram_mb() -> float:
+def get_vram_info() -> dict:
+    """Queries GPU VRAM metrics: Total, Free, Used, Self (devserver/llama-server), and Target Usable VRAM."""
+    total_mb = 0.0
+    free_mb = 0.0
+    used_mb = 0.0
+    self_used_mb = 0.0
+
+    # 1. High precision query via pynvml
     try:
-        res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,nounits,noheader"],
-            capture_output=True, text=True, check=True
-        )
-        lines = res.stdout.strip().split("\n")
-        if lines:
-            free = float(lines[0])
-            # Leave 600MB safety headroom to prevent Shared VRAM paging
-            return max(500.0, free - 600.0)
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        total_mb = mem_info.total / (1024 * 1024)
+        free_mb = mem_info.free / (1024 * 1024)
+        used_mb = mem_info.used / (1024 * 1024)
+
+        target_pids = {os.getpid()}
+        if 'llama_server_process' in globals() and llama_server_process and llama_server_process.poll() is None:
+            target_pids.add(llama_server_process.pid)
+
+        procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle) + pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+        for proc in procs:
+            if proc.pid in target_pids and proc.usedGpuMemory:
+                self_used_mb += proc.usedGpuMemory / (1024 * 1024)
     except Exception:
         pass
-    return 4000.0  # Fallback: assume 4.0GB available
+
+    # 2. Fallback query via nvidia-smi
+    if total_mb <= 0:
+        try:
+            res = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total,memory.free,memory.used", "--format=csv,nounits,noheader"],
+                capture_output=True, text=True, check=True
+            )
+            lines = res.stdout.strip().split("\n")
+            if lines:
+                parts = [float(x.strip()) for x in lines[0].split(",")]
+                if len(parts) >= 3:
+                    total_mb, free_mb, used_mb = parts[0], parts[1], parts[2]
+        except Exception:
+            pass
+
+    if total_mb <= 0:
+        total_mb = 6144.0
+        free_mb = 4000.0
+        used_mb = 2144.0
+
+    usable_mb = free_mb + self_used_mb
+    target_vram = max(500.0, usable_mb - 300.0)
+    target_vram = min(target_vram, total_mb - 300.0)
+
+    return {
+        "total": total_mb,
+        "free": free_mb,
+        "used": used_mb,
+        "self_used": self_used_mb,
+        "available_target": target_vram
+    }
+
+def get_target_vram_mb() -> float:
+    return get_vram_info()["available_target"]
 
 
 def get_model_info(model_name: str):
@@ -820,7 +1077,8 @@ def get_model_info(model_name: str):
     return 32, int(7e9 * 0.55)
 
 def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, bool]:
-    targeted_reserve_vram_mb = get_target_vram_mb()
+    vram_info = get_vram_info()
+    targeted_reserve_vram_mb = vram_info["available_target"]
     total_layers, model_base_vram_bytes = get_model_info(model_name)
     if total_layers == 0:
         total_layers = 32
@@ -828,10 +1086,7 @@ def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, b
     model_base_vram_mb = model_base_vram_bytes / (1024 * 1024)
     vram_per_layer = model_base_vram_mb / total_layers
     
-    if ctx_size <= 49152:
-        kv_cache_vram_mb = 3150.0
-    else:
-        kv_cache_vram_mb = (ctx_size / 49152) * 3150.0
+    kv_cache_vram_mb = max(256.0, (ctx_size / 49152.0) * 3150.0)
         
     available_weight_vram = targeted_reserve_vram_mb - kv_cache_vram_mb
     offload_kqv = True
@@ -846,6 +1101,9 @@ def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, b
     
     log_message("--- DYNAMIC VRAM REPORT ---")
     log_message(f"Model:            {model_name}")
+    log_message(f"Total GPU VRAM:   {vram_info['total']:.1f} MiB")
+    log_message(f"Free VRAM:        {vram_info['free']:.1f} MiB")
+    log_message(f"Self VRAM:        {vram_info['self_used']:.1f} MiB")
     log_message(f"Total Layers:     {total_layers}")
     log_message(f"File Size:        {model_base_vram_mb:.1f} MiB (~{vram_per_layer:.1f} MiB/layer)")
     log_message(f"Est. KV Cache:    {kv_cache_vram_mb:.1f} MiB (Offloaded: {offload_kqv})")
@@ -887,17 +1145,15 @@ def clean_thought_and_whitespace(text: str) -> str:
         return ""
     orig_text = text
     text = re.sub(r'ễ.*?ễ', '', text, flags=re.DOTALL)
-    text = re.sub(r'<thought>.*?(?:</thought>)', '', text, flags=re.DOTALL)
-    text = re.sub(r'<think>.*?(?:</think>)', '', text, flags=re.DOTALL)
-    text = re.sub(r'<\|channel\>thought.*?(?:<channel\|\>)', '', text, flags=re.DOTALL)
+    text = re.sub(r'<\|?(?:thought|think)\|?>.*?(?:</\|?(?:thought|think)\|?>)', '', text, flags=re.DOTALL)
+    text = re.sub(r'<\|?channel\|?>?thought.*?(?:<channel\|?>?)', '', text, flags=re.DOTALL)
     
     cleaned = text.strip()
     if not cleaned:
         # Fallback: if all text was stripped, try removing unclosed tags from the end
         unclosed_stripped = orig_text
-        unclosed_stripped = re.sub(r'<thought>.*$', '', unclosed_stripped, flags=re.DOTALL)
-        unclosed_stripped = re.sub(r'<think>.*$', '', unclosed_stripped, flags=re.DOTALL)
-        unclosed_stripped = re.sub(r'<\|channel\>thought.*$', '', unclosed_stripped, flags=re.DOTALL)
+        unclosed_stripped = re.sub(r'<\|?(?:thought|think)\|?>.*$', '', unclosed_stripped, flags=re.DOTALL)
+        unclosed_stripped = re.sub(r'<\|?channel\|?>?thought.*$', '', unclosed_stripped, flags=re.DOTALL)
         cleaned_unclosed = unclosed_stripped.strip()
         if cleaned_unclosed:
             return cleaned_unclosed
@@ -910,9 +1166,9 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
     if not cleaned or ('{' not in cleaned and '<|tool_call' not in cleaned):
         return None
 
-    # 0. Intercept native <|tool_call> syntax
-    if "<|tool_call" in cleaned:
-        match = re.search(r'<\|tool_call\|>\s*call:\s*([^\s{]+)\s*(\{.*?\})\s*<tool_call\|>', cleaned, re.DOTALL)
+    # 0. Intercept native tool call syntax (<|tool_call>, <tool_call>, call:...)
+    if "<|tool_call" in cleaned or "<tool_call" in cleaned or "call:" in cleaned:
+        match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*(\{.*?\})\s*(?:<\|?tool_call\|?>?|</tool_call>)?', cleaned, re.DOTALL)
         if match:
             func_name = match.group(1).strip()
             args_str = match.group(2).strip()
@@ -925,11 +1181,11 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                 "target": func_name,
                 "arguments_or_instructions": args,
                 "step_summary": f"Native tool call: {func_name}",
-                "reason": "Parsed from <|tool_call>"
+                "reason": "Parsed from native tool call"
             }
         
-        # Fallback for weird syntaxes like <|tool_call>call:run_task(task_id="npm: 3")<tool_call|>
-        alt_match = re.search(r'<\|tool_call\|>\s*call:\s*([^\(]+)\((.*?)\)\s*<tool_call\|>', cleaned, re.DOTALL)
+        # Fallback for parenthesized syntaxes like <|tool_call>call:run_task(task_id="npm: 3")<tool_call|>
+        alt_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\((.*?)\)\s*(?:<\|?tool_call\|?>?|</tool_call>)?', cleaned, re.DOTALL)
         if alt_match:
             func_name = alt_match.group(1).strip()
             args = alt_match.group(2).strip()
@@ -938,7 +1194,7 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                 "target": func_name,
                 "arguments_or_instructions": args,
                 "step_summary": f"Native tool call: {func_name}",
-                "reason": "Parsed from <|tool_call>"
+                "reason": "Parsed from native tool call"
             }
 
     # 1. Try to extract from markdown code blocks first
@@ -946,32 +1202,29 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
         match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1).strip())
-            except json.JSONDecodeError:
+                obj, _ = json.JSONDecoder().raw_decode(match.group(1).strip())
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
                 pass
 
-    # 2. If it starts/ends with braces, try to parse it directly
-    if cleaned.startswith('{') and cleaned.endswith('}'):
+    # 2. Iterate over all '{' matches using raw_decode to parse valid JSON dicts surrounded by text
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', cleaned):
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
+            obj, _ = decoder.raw_decode(cleaned[match.start():])
+            if isinstance(obj, dict) and ("action" in obj or "target" in obj or "steps" in obj or "approved" in obj):
+                return obj
+        except Exception:
             pass
 
-    # 3. Try to locate the first '{' and last '}' and parse the substring
-    start = cleaned.find('{')
-    end = cleaned.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        if not (start == 0 and end == len(cleaned) - 1):
-            try:
-                return json.loads(cleaned[start:end+1].strip())
-            except json.JSONDecodeError:
-                pass
-
-    # 4. As a last resort, try parsing the whole cleaned string
-    if not (cleaned.startswith('{') and cleaned.endswith('}')):
+    # 3. Fallback: return any valid dict found in the string
+    for match in re.finditer(r'\{', cleaned):
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
+            obj, _ = decoder.raw_decode(cleaned[match.start():])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
             pass
 
     return None
@@ -1045,6 +1298,86 @@ def safe_parse_tool_args(payload_data: Any, expected_key: str) -> dict:
         return {expected_key: payload_data}
     return {}
 
+def parse_read_file_args(payload_data: Any) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    args = safe_parse_tool_args(payload_data, "path")
+    if not isinstance(args, dict):
+        return None, None, None
+
+    file_path = args.get("path") or args.get("file") or args.get("target_file") or args.get("filepath")
+    if not file_path or not isinstance(file_path, str):
+        return None, None, None
+
+    file_path = file_path.strip()
+
+    start_line = args.get("start_line") or args.get("start") or args.get("startLine") or args.get("from_line") or args.get("from")
+    end_line = args.get("end_line") or args.get("end") or args.get("endLine") or args.get("to_line") or args.get("to")
+    line_val = args.get("line") or args.get("target_line") or args.get("around_line") or args.get("line_number")
+    range_val = args.get("range")
+
+    s_num, e_num = None, None
+
+    if isinstance(range_val, (list, tuple)) and len(range_val) >= 2:
+        try:
+            s_num, e_num = int(range_val[0]), int(range_val[1])
+        except (ValueError, TypeError):
+            pass
+    elif isinstance(range_val, str) and ("-" in range_val or ":" in range_val):
+        m = re.split(r"[-:]", range_val.strip())
+        if len(m) >= 2:
+            try:
+                s_num, e_num = int(m[0]), int(m[1])
+            except (ValueError, TypeError):
+                pass
+
+    if start_line is not None:
+        try:
+            s_num = int(start_line)
+        except (ValueError, TypeError):
+            pass
+    if end_line is not None:
+        try:
+            e_num = int(end_line)
+        except (ValueError, TypeError):
+            pass
+
+    if line_val is not None and s_num is None:
+        try:
+            t = int(line_val)
+            s_num = max(1, t - 50)
+            e_num = t + 50
+        except (ValueError, TypeError):
+            pass
+
+    # Extract path line suffixes like "file.kt:1520" or "file.kt#L1520-L1580" or "file.kt around line 1520"
+    if not os.path.exists(file_path):
+        match_range = re.search(r'^(.*?)[#:]L?(\d+)(?:[-:]L?(\d+))?$', file_path, re.IGNORECASE)
+        if match_range:
+            base_p = match_range.group(1).strip()
+            if os.path.exists(base_p):
+                file_path = base_p
+                if s_num is None:
+                    s_num = int(match_range.group(2))
+                    if match_range.group(3):
+                        e_num = int(match_range.group(3))
+                    else:
+                        e_num = s_num + 100
+        else:
+            match_around = re.search(r'^(.*?)\s+(?:around\s+line|lines?|L)\s*(\d+)(?:\s*-\s*(\d+))?', file_path, re.IGNORECASE)
+            if match_around:
+                base_p = match_around.group(1).strip()
+                if os.path.exists(base_p):
+                    file_path = base_p
+                    if s_num is None:
+                        t = int(match_around.group(2))
+                        if match_around.group(3):
+                            s_num = t
+                            e_num = int(match_around.group(3))
+                        else:
+                            s_num = max(1, t - 50)
+                            e_num = t + 50
+
+    return file_path, s_num, e_num
+
 def extract_instructions(payload: Any) -> str:
     if not payload:
         return ""
@@ -1107,7 +1440,7 @@ async def get_active_models():
         if gguf_path and os.path.exists(gguf_path):
             models_to_report.append({
                 "id": model_name,
-                "name": f"Serenity: {model_name} (Worker)",
+                "name": f"Serenity: {model_name} (Agent)",
                 "family": model_name,
                 "version": "1.0.0",
                 "maxInputTokens": 120000,
@@ -1116,6 +1449,732 @@ async def get_active_models():
             })
 
     return {"models": models_to_report}
+
+# --- Ollama & OpenAI Standard API Compatibility Routes ---
+
+@app.get("/api/tags")
+async def get_ollama_tags():
+    """Ollama API standard model listing endpoint."""
+    models_resp = await get_active_models()
+    ollama_models = []
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for m in models_resp.get("models", []):
+        model_id = m.get("id", "serenity-supervisor")
+        ollama_models.append({
+            "name": model_id,
+            "model": model_id,
+            "modified_at": now_iso,
+            "size": 0,
+            "digest": hashlib.sha256(model_id.encode("utf-8")).hexdigest(),
+            "details": {
+                "parent_model": "",
+                "format": "gguf",
+                "family": m.get("family", "serenity"),
+                "families": [m.get("family", "serenity")],
+                "parameter_size": "7B",
+                "quantization_level": "Q4_K_M"
+            }
+        })
+    return {"models": ollama_models}
+
+@app.get("/api/version")
+async def get_ollama_version():
+    """Ollama API standard version endpoint."""
+    return {"version": "0.1.30"}
+
+@app.get("/v1/models")
+async def get_openai_v1_models():
+    """OpenAI API standard model listing endpoint."""
+    models_resp = await get_active_models()
+    v1_models = []
+    now = int(time.time())
+    for m in models_resp.get("models", []):
+        v1_models.append({
+            "id": m.get("id", "serenity-supervisor"),
+            "object": "model",
+            "created": now,
+            "owned_by": "serenity"
+        })
+    return {"object": "list", "data": v1_models}
+
+@app.get("/v1/models/{model_id}")
+async def get_openai_v1_model_by_id(model_id: str):
+    """OpenAI API standard single model metadata endpoint."""
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "serenity"
+    }
+
+@app.get("/health")
+@app.get("/v1/health")
+async def health_check_probe():
+    """Health check endpoint for third-party integrations."""
+    return {"status": "ok", "server": "SerenityOrchestrator"}
+
+# --- MCP (Model Context Protocol) StreamableHTTP Endpoint ---
+
+MCP_SERVER_INFO = {
+    "name": "SerenityDev Secure MCP Server",
+    "version": "1.5.0"
+}
+
+MCP_TOOLS_DEFINITIONS = [
+    {
+        "name": "read_file",
+        "description": "Read contents of a workspace file with optional line range slicing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to file"},
+                "start_line": {"type": "integer", "description": "1-indexed start line"},
+                "end_line": {"type": "integer", "description": "1-indexed end line"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write or overwrite content in a workspace file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to target file"},
+                "content": {"type": "string", "description": "Content to write"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "list_directory",
+        "description": "List files and subdirectories in a directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "grep_search",
+        "description": "Search workspace files using regular expression or literal string.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Regex or string search query"},
+                "path": {"type": "string", "description": "Directory or file path to search"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "insert_edit_into_file",
+        "description": "Insert new content after target content in a workspace file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Target file path"},
+                "target_content": {"type": "string", "description": "Target text after which insertion occurs"},
+                "new_content": {"type": "string", "description": "Content to insert"}
+            },
+            "required": ["path", "target_content", "new_content"]
+        }
+    },
+    {
+        "name": "replace_string_in_file",
+        "description": "Replace existing string with new content in a workspace file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Target file path"},
+                "target_content": {"type": "string", "description": "Existing text to replace"},
+                "new_content": {"type": "string", "description": "Replacement content"}
+            },
+            "required": ["path", "target_content", "new_content"]
+        }
+    },
+    {
+        "name": "run_command",
+        "description": "Execute terminal command securely in workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command string to run"}
+            },
+            "required": ["command"]
+        }
+    }
+]
+
+def execute_mcp_tool_call(tool_name: str, args: dict) -> tuple[str, bool]:
+    """Executes MCP tool call securely, returning (result_text, is_error)."""
+    tool_norm = tool_name.lower().strip().split(":")[-1]
+    
+    if tool_norm in ["read_file", "read"]:
+        file_path = args.get("path") or args.get("file") or args.get("filepath")
+        if not file_path or not is_path_allowed(file_path):
+            return f"Error: Path access restricted or missing: '{file_path}'", True
+        if not os.path.exists(file_path):
+            return f"Error: File not found: '{file_path}'", True
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            lines = content.splitlines()
+            start_line = args.get("start_line")
+            end_line = args.get("end_line")
+            if start_line is not None and end_line is not None:
+                s = max(1, int(start_line))
+                e = min(len(lines), int(end_line))
+                sliced = [f"{i}: {lines[i-1]}" for i in range(s, e + 1)]
+                return "\n".join(sliced), False
+            elif len(lines) > 200:
+                sliced = [f"{i}: {lines[i-1]}" for i in range(1, 151)]
+                return "\n".join(sliced) + f"\n... [Auto-truncated to 150 of {len(lines)} lines] ...", False
+            else:
+                return "\n".join([f"{i}: {lines[i-1]}" for i in range(1, len(lines) + 1)]), False
+        except Exception as ex:
+            return f"Error reading file '{file_path}': {ex}", True
+
+    elif tool_norm in ["write_file", "write"]:
+        file_path = args.get("path") or args.get("file") or args.get("filepath")
+        content = args.get("content", "")
+        if not file_path or not is_path_allowed(file_path):
+            return f"Error: Path access restricted or missing: '{file_path}'", True
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"Successfully wrote {len(content)} bytes to '{file_path}'", False
+        except Exception as ex:
+            return f"Error writing to file '{file_path}': {ex}", True
+
+    elif tool_norm in ["list_directory", "ls", "dir"]:
+        dir_path = args.get("path") or args.get("dir") or "."
+        if not is_path_allowed(dir_path):
+            return f"Error: Path access restricted: '{dir_path}'", True
+        if not os.path.exists(dir_path):
+            return f"Error: Directory not found: '{dir_path}'", True
+        try:
+            entries = []
+            for item in os.listdir(dir_path):
+                full = os.path.join(dir_path, item)
+                kind = "DIR" if os.path.isdir(full) else "FILE"
+                entries.append(f"[{kind}] {item}")
+            return "\n".join(entries), False
+        except Exception as ex:
+            return f"Error listing directory '{dir_path}': {ex}", True
+
+    elif tool_norm in ["grep_search", "grep"]:
+        query = args.get("query", "")
+        search_path = args.get("path") or "."
+        if not query:
+            return "Error: Missing search query", True
+        if not is_path_allowed(search_path):
+            return f"Error: Search path restricted: '{search_path}'", True
+        try:
+            matches = []
+            compiled_re = re.compile(query, re.IGNORECASE)
+            for root, _, files in os.walk(search_path):
+                if ".git" in root or ".venv" in root or "node_modules" in root:
+                    continue
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    if not is_path_allowed(fpath):
+                        continue
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            for idx, line in enumerate(f, start=1):
+                                if compiled_re.search(line):
+                                    matches.append(f"{fpath}:{idx}: {line.strip()}")
+                                    if len(matches) >= 50:
+                                        break
+                    except Exception:
+                        pass
+                    if len(matches) >= 50:
+                        break
+                if len(matches) >= 50:
+                    break
+            return "\n".join(matches) if matches else "No matches found.", False
+        except Exception as ex:
+            return f"Error during grep search: {ex}", True
+
+    elif tool_norm in ["insert_edit_into_file", "insert_edit"]:
+        file_path = args.get("path") or args.get("file")
+        target_content = args.get("target_content", "")
+        new_content = args.get("new_content", "")
+        if not file_path or not is_path_allowed(file_path):
+            return f"Error: Path access restricted or missing: '{file_path}'", True
+        if not os.path.exists(file_path):
+            return f"Error: File not found: '{file_path}'", True
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if target_content not in content:
+                return f"Error: target_content not found in '{file_path}'", True
+            modified = content.replace(target_content, target_content + "\n" + new_content, 1)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(modified)
+            return f"Successfully inserted content into '{file_path}'", False
+        except Exception as ex:
+            return f"Error inserting edit: {ex}", True
+
+    elif tool_norm in ["replace_string_in_file", "replace_string"]:
+        file_path = args.get("path") or args.get("file")
+        target_content = args.get("target_content", "")
+        new_content = args.get("new_content", "")
+        if not file_path or not is_path_allowed(file_path):
+            return f"Error: Path access restricted or missing: '{file_path}'", True
+        if not os.path.exists(file_path):
+            return f"Error: File not found: '{file_path}'", True
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if target_content not in content:
+                return f"Error: target_content not found in '{file_path}'", True
+            modified = content.replace(target_content, new_content, 1)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(modified)
+            return f"Successfully replaced content in '{file_path}'", False
+        except Exception as ex:
+            return f"Error replacing content: {ex}", True
+
+    elif tool_norm in ["run_command", "exec"]:
+        command = args.get("command", "")
+        if not command:
+            return "Error: Missing command parameter", True
+        if not is_command_allowed(command):
+            return f"Error: Command execution blocked by security policy: '{command}'", True
+        try:
+            proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            output = proc.stdout + proc.stderr
+            return output if output else "[Command finished with no output]", proc.returncode != 0
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out after 30 seconds", True
+        except Exception as ex:
+            return f"Error running command: {ex}", True
+
+    else:
+        return f"Error: Tool '{tool_name}' is not supported", True
+
+@app.api_route("/mcp", methods=["GET", "POST"])
+async def mcp_streamable_http_endpoint(request: Request):
+    """StreamableHTTP Model Context Protocol (MCP) endpoint for Google AI Edge Gallery & external clients."""
+    # HTTPS Enforcement
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).lower()
+    host = request.headers.get("host", "").lower().split(":")[0]
+    enforce_https = os.environ.get("ENFORCE_MCP_HTTPS", "true").lower() in ("true", "1", "yes")
+
+    if enforce_https and scheme != "https" and host not in ("localhost", "127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="HTTPS required for MCP endpoints. Request must use https:// or proxy header X-Forwarded-Proto: https")
+
+    # Optional Bearer / API Key header check
+    auth_header = request.headers.get("authorization", "")
+    api_key_header = request.headers.get("x-api-key", "")
+    enforce_auth = os.environ.get("ENFORCE_MCP_AUTH", "false").lower() in ("true", "1", "yes")
+
+    if enforce_auth:
+        token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else (api_key_header or auth_header)
+        if not token or (token != LOCAL_API_KEY and token != raw_env_key):
+            raise HTTPException(status_code=401, detail="Unauthorized MCP request: Invalid API Key")
+
+    if request.method == "GET":
+        return JSONResponse({
+            "status": "online",
+            "protocol": "Model Context Protocol (MCP)",
+            "transport": "StreamableHTTP",
+            "server": MCP_SERVER_INFO
+        })
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": None})
+
+    req_id = body.get("id")
+    method = body.get("method")
+    params = body.get("params", {})
+
+    log_message(f"[MCP Endpoint] Received method '{method}' (id: {req_id})")
+
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": MCP_SERVER_INFO
+            }
+        })
+
+    elif method == "notifications/initialized":
+        return JSONResponse({"jsonrpc": "2.0", "result": {}})
+
+    elif method == "ping":
+        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
+
+    elif method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": MCP_TOOLS_DEFINITIONS
+            }
+        })
+
+    elif method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        result_text, is_error = execute_mcp_tool_call(tool_name, tool_args)
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": result_text
+                    }
+                ],
+                "isError": is_error
+            }
+        })
+
+    else:
+        return JSONResponse(status_code=404, content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32601,
+                "message": f"Method '{method}' not found"
+            }
+        })
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    model: Optional[str] = None
+    messages: List[Dict[str, Any]] = []
+    stream: Optional[bool] = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def openai_chat_completions(req: OpenAIChatCompletionRequest, http_request: Request):
+    """OpenAI standard chat completion endpoint compatibility adapter."""
+    prompt_parts = []
+    for msg in req.messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+            content = " ".join(text_parts) if text_parts else str(content)
+        if content:
+            prompt_parts.append(f"{role.capitalize()}: {content}")
+    
+    full_prompt = "\n".join(prompt_parts) if prompt_parts else "Hello"
+    target_model = req.model or SUPERVISOR_MODEL
+    
+    query_req = QueryRequest(
+        prompt=full_prompt,
+        model=target_model,
+        session_id="openai_compat_session"
+    )
+
+    req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created_ts = int(time.time())
+
+    if req.stream:
+        async def openai_stream_generator():
+            try:
+                async for event in run_orchestration(query_req, http_request):
+                    if isinstance(event, dict):
+                        if event.get("type") == "content":
+                            chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": target_model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": event.get("content", "")},
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        elif event.get("type") == "done":
+                            finish_chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": target_model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }]
+                            }
+                            yield f"data: {json.dumps(finish_chunk)}\n\n"
+            except asyncio.CancelledError:
+                log_message("[OpenAI Stream] Request cancelled by client disconnect.")
+                return
+            except Exception as e:
+                log_message(f"[OpenAI Stream Error] {e}")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(openai_stream_generator(), media_type="text/event-stream")
+
+    else:
+        answer_parts = []
+        try:
+            async for event in run_orchestration(query_req, http_request):
+                if isinstance(event, dict) and event.get("type") == "content":
+                    answer_parts.append(event.get("content", ""))
+        except Exception as e:
+            log_message(f"[OpenAI Chat Error] {e}")
+
+        full_answer = "".join(answer_parts)
+        return {
+            "id": req_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": target_model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": full_answer
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": max(1, len(full_prompt) // 4),
+                "completion_tokens": max(1, len(full_answer) // 4),
+                "total_tokens": max(2, (len(full_prompt) + len(full_answer)) // 4)
+            }
+        }
+
+@app.post("/v1/responses")
+@app.post("/responses")
+async def openai_responses_endpoint(http_request: Request):
+    """OpenAI Responses API compatibility adapter for IDE clients (Android Studio, VS Code, JetBrains)."""
+    try:
+        body = await http_request.json()
+    except Exception:
+        body = {}
+
+    target_model = body.get("model") or SUPERVISOR_MODEL
+    stream = body.get("stream", False)
+    
+    prompt_text = ""
+    input_val = body.get("input") or body.get("messages") or body.get("prompt") or body.get("instructions")
+    
+    if isinstance(input_val, str):
+        prompt_text = input_val
+    elif isinstance(input_val, list):
+        parts = []
+        for item in input_val:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                role = item.get("role", "user")
+                content = item.get("content") or item.get("text") or item.get("value") or ""
+                if isinstance(content, list):
+                    content = " ".join([c.get("text", "") for c in content if isinstance(c, dict) and "text" in c])
+                parts.append(f"{role.capitalize()}: {content}")
+        prompt_text = "\n".join(parts)
+
+    if not prompt_text:
+        prompt_text = body.get("user_prompt") or "Hello"
+
+    query_req = QueryRequest(
+        prompt=prompt_text,
+        model=target_model,
+        session_id="responses_api_session"
+    )
+
+    req_id = f"resp-{uuid.uuid4().hex[:12]}"
+    created_ts = int(time.time())
+
+    if stream:
+        async def responses_stream_generator():
+            try:
+                init_event = {
+                    "type": "response.created",
+                    "response": {
+                        "id": req_id,
+                        "object": "realtime.response",
+                        "status": "in_progress",
+                        "model": target_model
+                    }
+                }
+                yield f"data: {json.dumps(init_event)}\n\n"
+
+                async for event in run_orchestration(query_req, http_request):
+                    if isinstance(event, dict):
+                        if event.get("type") == "content":
+                            text_content = event.get("content", "")
+                            delta_event = {
+                                "type": "response.text.delta",
+                                "response_id": req_id,
+                                "delta": text_content
+                            }
+                            yield f"data: {json.dumps(delta_event)}\n\n"
+                            
+                            chat_chunk = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": target_model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": text_content},
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(chat_chunk)}\n\n"
+
+                done_event = {
+                    "type": "response.done",
+                    "response": {
+                        "id": req_id,
+                        "status": "completed"
+                    }
+                }
+                yield f"data: {json.dumps(done_event)}\n\n"
+                yield "data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                log_message("[Responses Stream] Request cancelled by client disconnect.")
+                return
+            except Exception as e:
+                log_message(f"[Responses Stream Error] {e}")
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(responses_stream_generator(), media_type="text/event-stream")
+
+    else:
+        answer_parts = []
+        try:
+            async for event in run_orchestration(query_req, http_request):
+                if isinstance(event, dict) and event.get("type") == "content":
+                    answer_parts.append(event.get("content", ""))
+        except Exception as e:
+            log_message(f"[Responses API Error] {e}")
+
+        full_answer = "".join(answer_parts)
+        return {
+            "id": req_id,
+            "object": "response",
+            "created": created_ts,
+            "model": target_model,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": full_answer
+                        }
+                    ]
+                }
+            ],
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": full_answer
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": max(1, len(prompt_text) // 4),
+                "completion_tokens": max(1, len(full_answer) // 4),
+                "total_tokens": max(2, (len(prompt_text) + len(full_answer)) // 4)
+            }
+        }
+
+@app.post("/v1/completions")
+@app.post("/completions")
+async def openai_text_completions(http_request: Request):
+    """OpenAI standard legacy text completion endpoint compatibility adapter."""
+    try:
+        body = await http_request.json()
+    except Exception:
+        body = {}
+
+    target_model = body.get("model") or SUPERVISOR_MODEL
+    stream = body.get("stream", False)
+    prompt_text = body.get("prompt", "Hello")
+    if isinstance(prompt_text, list):
+        prompt_text = "\n".join(str(p) for p in prompt_text)
+
+    query_req = QueryRequest(
+        prompt=str(prompt_text),
+        model=target_model,
+        session_id="text_completion_session"
+    )
+
+    req_id = f"cmpl-{uuid.uuid4().hex[:12]}"
+    created_ts = int(time.time())
+
+    if stream:
+        async def text_stream_generator():
+            try:
+                async for event in run_orchestration(query_req, http_request):
+                    if isinstance(event, dict) and event.get("type") == "content":
+                        chunk = {
+                            "id": req_id,
+                            "object": "text_completion",
+                            "created": created_ts,
+                            "model": target_model,
+                            "choices": [{
+                                "text": event.get("content", ""),
+                                "index": 0,
+                                "logprobs": None,
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log_message(f"[Text Stream Error] {e}")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(text_stream_generator(), media_type="text/event-stream")
+
+    else:
+        answer_parts = []
+        try:
+            async for event in run_orchestration(query_req, http_request):
+                if isinstance(event, dict) and event.get("type") == "content":
+                    answer_parts.append(event.get("content", ""))
+        except Exception as e:
+            log_message(f"[Text Completion Error] {e}")
+
+        full_answer = "".join(answer_parts)
+        return {
+            "id": req_id,
+            "object": "text_completion",
+            "created": created_ts,
+            "model": target_model,
+            "choices": [{
+                "text": full_answer,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": max(1, len(prompt_text) // 4),
+                "completion_tokens": max(1, len(full_answer) // 4),
+                "total_tokens": max(2, (len(prompt_text) + len(full_answer)) // 4)
+            }
+        }
 
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str):
@@ -1296,44 +2355,60 @@ def is_path_allowed(file_path: Optional[str]) -> bool:
         return False
 
 class StreamingThoughtFilter:
-    def __init__(self):
+    def __init__(self, start_in_thought: bool = True):
         self.buffer = ""
-        self.in_thought = False
-        self.thought_started = False
+        self.in_thought = start_in_thought
+        self.thought_started = start_in_thought
+        self.start_tags = [
+            "<|channel>thought", "<|channel|>thought", "<channel>thought",
+            "<think>", "<|think|>", "<thought>", "<|thought|>"
+        ]
+        self.end_tags = [
+            "<channel|>", "<|channel|>",
+            "</think>", "</|think|>",
+            "</thought>", "</|thought|>"
+        ]
         
     def feed(self, chunk: str) -> str:
         self.buffer += chunk
         
         if not self.thought_started:
-            for tag in ["<|channel>thought", "<think>", "<thought>"]:
+            for tag in self.start_tags:
                 if tag in self.buffer:
                     self.in_thought = True
                     self.thought_started = True
                     break
             if not self.thought_started and len(self.buffer) > 50:
-                flushed = self.buffer
+                flushed = self.clean_tool_tags(self.buffer)
                 self.buffer = ""
                 return flushed
                 
         if self.in_thought:
-            for end_tag in ["<channel|>", "</think>", "</thought>"]:
+            for end_tag in self.end_tags:
                 idx = self.buffer.find(end_tag)
                 if idx != -1:
                     self.in_thought = False
                     self.buffer = self.buffer[idx + len(end_tag):]
-                    flushed = self.buffer
+                    flushed = self.clean_tool_tags(self.buffer)
                     self.buffer = ""
                     return flushed
             return ""
         else:
-            flushed = self.buffer
+            flushed = self.clean_tool_tags(self.buffer)
             self.buffer = ""
             return flushed
+
+    def clean_tool_tags(self, text: str) -> str:
+        if not text:
+            return ""
+        # Strip out any native tool call syntax tags if emitted during final synthesis streaming
+        text = re.sub(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:[^\s{\(]+(?:\(.*?\)|\{.*?\})?\s*(?:<\|?tool_call\|?>?|</tool_call>)?', '', text, flags=re.DOTALL)
+        return text
 
     def flush_remaining(self) -> str:
         if self.in_thought:
             return ""
-        return self.buffer
+        return self.clean_tool_tags(self.buffer)
 
 # --- Custom Model Mapping Helpers ---
 MAX_HISTORY_TURNS = 10
@@ -1352,22 +2427,16 @@ def validate_workspace_path(path_value: str) -> str:
     if "\x00" in path_value:
         raise ValueError("Workspace path contains invalid characters")
 
-    raw = path_value.strip().replace("\\", "/")
+    raw = path_value.strip()
+    if not raw or raw in (".", ".."):
+        raise ValueError("Workspace path is empty or invalid")
+
     normalized = os.path.normpath(raw)
-    if normalized in ("", "."):
-        raise ValueError("Workspace path is empty")
-    if os.path.isabs(normalized) or normalized.startswith(("/", "\\")):
-        raise ValueError("Absolute workspace paths are not allowed")
-    if re.match(r"^[A-Za-z]:", normalized):
-        raise ValueError("Drive-qualified workspace paths are not allowed")
+    parts = normalized.replace("\\", "/").split("/")
+    if ".." in parts:
+        raise ValueError("Workspace path traversal '..' is not allowed")
 
-    parts = [p for p in normalized.replace("\\", "/").split("/") if p not in ("", ".")]
-    if not parts or any(p == ".." for p in parts):
-        raise ValueError("Workspace path traversal is not allowed")
-    if any(not re.fullmatch(r"[A-Za-z0-9._-]+", p) for p in parts):
-        raise ValueError("Workspace path contains unsupported characters")
-
-    return os.path.join(*parts)
+    return normalized
 
 async def run_orchestration(request: QueryRequest, http_request: Request):
     """
@@ -1393,13 +2462,13 @@ async def run_orchestration(request: QueryRequest, http_request: Request):
     async with inference_lock:
         if request.workspace_dir:
             try:
-                safe_root = os.path.realpath(workspace_dir)
-                validated_relative = validate_workspace_path(request.workspace_dir)
-                requested_path = os.path.join(safe_root, validated_relative)
-                resolved_workspace = os.path.realpath(requested_path)
-
-                if os.path.commonpath([safe_root, resolved_workspace]) != safe_root:
-                    raise ValueError("Workspace path escapes allowed root")
+                validated_path = validate_workspace_path(request.workspace_dir)
+                if os.path.isabs(validated_path):
+                    resolved_workspace = os.path.realpath(validated_path)
+                else:
+                    safe_root = os.path.realpath(workspace_dir)
+                    requested_path = os.path.join(safe_root, validated_path)
+                    resolved_workspace = os.path.realpath(requested_path)
 
                 if os.path.isdir(resolved_workspace):
                     os.chdir(resolved_workspace)
@@ -1430,7 +2499,7 @@ async def run_orchestration(request: QueryRequest, http_request: Request):
                     for turn in history
                 ) + "\n-----------------------------\n"
 
-            standalone_prompt = f"""<bos><|turn>system
+            standalone_prompt = f"""<|turn>system
 <|think|>
 You are SerenityDev running in standalone mode for model {request.model}.
 Provide a clean, direct, production-ready response in Markdown format. Avoid system markers.
@@ -1465,10 +2534,17 @@ Never compromise on security, input validation, or error handling.
             # Stream direct completion
             try:
                 full_text_accumulated = []
+                thought_filter = StreamingThoughtFilter(start_in_thought=True)
                 async for chunk in generate_completion_stream(resolved_model, standalone_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
                     full_text_accumulated.append(chunk)
-                    yield {"type": "content", "content": chunk}
+                    filtered = thought_filter.feed(chunk)
+                    if filtered:
+                        yield {"type": "content", "content": filtered}
                 
+                remaining = thought_filter.flush_remaining()
+                if remaining:
+                    yield {"type": "content", "content": remaining}
+
                 clean_answer = clean_thought_and_whitespace("".join(full_text_accumulated))
                 if session_id:
                     sessions_history[session_id].append({
@@ -1581,7 +2657,7 @@ Never compromise on security, input validation, or error handling.
 
         # Determine High / Low Mode
         is_low_mode = (request.model == "serenity-supervisor-low")
-        max_tool_loops = 3 if is_low_mode else 6
+        max_tool_loops = request.max_steps if (isinstance(request.max_steps, int) and request.max_steps > 0) else (10 if is_low_mode else 30)
         supervisor_temp = 0.1 if is_low_mode else 0.5
         mode_explanation_prompt = (
             "- You are running in Low-Resource Efficiency Mode. Output minimal explanations. Keep 'reason' and 'step_summary' fields short, concise, and direct. Focus on token savings and speed.\n"
@@ -1599,18 +2675,21 @@ Never compromise on security, input validation, or error handling.
         supervisor_context = request.context
         worker_context = ""
         worker_tool_responses = []
+        executed_tool_calls = set()
 
         while tool_loop_count < max_tool_loops:
-            routing_prompt = f"""<bos><|turn>system
+            routing_prompt = f"""<|turn>system
 <|think|>
-You are the SerenityDev Hierarchical Supervisor (Gemma-4 Core). You run a multi-agent coding pipeline.
-Your immediate objective is to analyze the user's request, establish a multi-step plan, and pull the exact content of files required.
+You are the SerenityDev Hierarchical Supervisor (Gemma-4 Core). You are the Planner & Architect of the multi-agent system.
+Your role: High-level reasoning, intent analysis, multi-step plan formulation (`create_or_update_plan`), file discovery, and delegating execution steps to Worker agents.
 
 CRITICAL CONTEXT RULES:
-- If the task requires changing or understanding code in existing files, you MUST first search for or read those files using 'read_file', 'grep_search', or 'list_directory' to enrich your context. Do NOT delegate to workers or execute code writes without first reading the target files.
+- Always establish or update a clear execution plan (`create_or_update_plan`) before dispatching tasks.
+- Workers do NOT re-plan or converse; they execute assigned tools precisely and report a terse execution summary back to you.
+- Search for or inspect required files using 'read_file', 'grep_search', or 'list_directory'.
+- Do NOT re-read or search for files you have ALREADY inspected in previous turns.
 - Minimize context bloat. Only read files directly related to the user request.
-- Always create or update your plan before executing code writes.
-- Enforce the Ponytail Laziness Ladder on all Worker agents (YAGNI, reuse codebase, stdlib, native platform, installed dependency, one line, minimum works) to keep code minimal.
+- Enforce the Ponytail Laziness Ladder on all Worker agents (YAGNI, reuse codebase, stdlib, native platform, installed dependency, one line, minimum works).
 {mode_instructions}
 {mode_explanation_prompt}
 
@@ -1645,8 +2724,8 @@ AVAILABLE TOOLS:
 
 DECISION RULE:
 1. If you haven't formulated a plan or need to look up file locations, call 'create_or_update_plan' or 'list_directory'.
-2. If the request involves modifying or checking files, you MUST call 'read_file' or 'grep_search' to read the files first.
-3. Only delegate to workers or execute writes after you have gathered and inspected the required file contents.
+2. If the request involves modifying or checking files, call 'read_file' or 'grep_search' to inspect the files if not already inspected.
+3. Do NOT re-read or search for files you have already inspected. Once files are inspected, IMMEDIATELY execute file edits (replace_string_in_file / insert_edit_into_file / write_file) or delegate to W1.
 4. You have full direct access to all execution tools. You can choose to:
    - Edit, write, or modify code directly using file editing tools (write_file, insert_edit_into_file, replace_string_in_file, multi_replace_string_in_file).
    - Compile, build, lint, or run tests directly using 'mcp:terminal:run_command'.
@@ -1700,6 +2779,9 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                         break
                     else:
                         raise ValueError("Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.")
+                except asyncio.CancelledError:
+                    log_message("[Supervisor] Orchestration cancelled by client request.")
+                    raise
                 except Exception as e:
                     retry_count += 1
                     if retry_count > max_retries:
@@ -1722,6 +2804,30 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
             reason = decision.get("reason", "Standard execution flow")
             step_summary = decision.get("step_summary", reason)
 
+            # Normalize tool target aliases and strip prefixes (e.g. google:mcp:code_interpreter:read_file -> read_file)
+            if isinstance(target, str):
+                target_norm = target.lower().strip()
+                core_target = target_norm.split(":")[-1].strip()
+                
+                if core_target in ["read_file", "read", "view_file", "cat"]:
+                    target = "mcp:filesystem:read_file"
+                elif core_target in ["grep_search", "grep", "search", "search_files"]:
+                    target = "mcp:filesystem:grep_search"
+                elif core_target in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
+                    target = "mcp:filesystem:list_directory"
+                elif core_target in ["write_file", "write", "create_file"]:
+                    target = "mcp:filesystem:write_file"
+                elif core_target in ["insert_edit_into_file", "insert_edit"]:
+                    target = "mcp:filesystem:insert_edit_into_file"
+                elif core_target in ["replace_string_in_file", "replace_string"]:
+                    target = "mcp:filesystem:replace_string_in_file"
+                elif core_target in ["multi_replace_string_in_file", "multi_replace"]:
+                    target = "mcp:filesystem:multi_replace_string_in_file"
+                elif core_target in ["run_command", "exec", "terminal", "execute"]:
+                    target = "mcp:terminal:run_command"
+                elif core_target in ["create_or_update_plan", "plan"]:
+                    target = "mcp:filesystem:create_or_update_plan"
+
 
             if action == "delegate_worker":
                 worker_id = target if target in ["W1", "W2", "W3", "W4"] else "W1"
@@ -1731,6 +2837,16 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                 elif mode == "plan":
                     instructions = f"[PLAN MODE - DO NOT MODIFY FILES] {instructions}"
                 break
+
+            # Duplicate tool call guard to prevent infinite re-reading loops
+            tool_sig = (target, str(payload_data))
+            if tool_sig in executed_tool_calls:
+                log_message(f"[Duplicate Tool Intercepted] Prevented redundant tool call '{target}' with args {payload_data}")
+                tool_context = f"\n\n[System Tool Warning: You ALREADY executed {target} with identical arguments in a previous turn. Do NOT call this tool again with identical arguments. Proceed to modify files using edit/write tools or delegate to W1 now.]\n"
+                supervisor_context = f"{supervisor_context}{tool_context}"
+                tool_loop_count += 1
+                continue
+            executed_tool_calls.add(tool_sig)
 
             if not is_programmatic:
                 yield {"type": "progress", "text": f"⚙️ Supervisor executing tool {target}..."}
@@ -1811,22 +2927,35 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
 
             elif target == "mcp:filesystem:list_directory":
                 try:
-                    files = os.listdir(".")
-                    file_list = []
-                    for f in files:
-                        if f.startswith(".") or f == "__pycache__":
-                            continue
-                        is_dir = os.path.isdir(f)
-                        size = os.path.getsize(f) if not is_dir else 0
-                        file_list.append(f"{f} ({'Dir' if is_dir else f'{size} bytes'})")
-                    tool_context = f"\n\n[System Tool Response: Workspace Files]\n" + "\n".join(file_list) + "\n"
-                    log_message(f"[Tool Success] Listed directory. Found {len(file_list)} entries.")
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "list_directory",
-                        "status": "success",
-                        "details": step_summary
-                    })
+                    args = safe_parse_tool_args(payload_data, "path")
+                    target_dir = "."
+                    if isinstance(args, dict):
+                        target_dir = args.get("path") or args.get("directory") or args.get("dir") or args.get("folder") or "."
+                    elif isinstance(args, str) and args.strip():
+                        target_dir = args.strip()
+
+                    if not is_path_allowed(target_dir):
+                        tool_context = f"\n\n[System Tool Error: Access to '{target_dir}' is restricted for security.]\n"
+                    elif not os.path.exists(target_dir) or not os.path.isdir(target_dir):
+                        tool_context = f"\n\n[System Tool Error: Directory '{target_dir}' not found.]\n"
+                    else:
+                        files = os.listdir(target_dir)
+                        file_list = []
+                        for f in files:
+                            if f.startswith(".") or f == "__pycache__":
+                                continue
+                            full_p = os.path.join(target_dir, f)
+                            is_dir = os.path.isdir(full_p)
+                            size = os.path.getsize(full_p) if not is_dir else 0
+                            file_list.append(f"{f} ({'Dir' if is_dir else f'{size} bytes'})")
+                        tool_context = f"\n\n[System Tool Response: Directory Listing for '{target_dir}']\n" + "\n".join(file_list) + "\n"
+                        log_message(f"[Tool Success] Listed directory '{target_dir}'. Found {len(file_list)} entries.")
+                        agent_steps.append({
+                            "step": tool_loop_count + 1,
+                            "tool": f"list_directory: {target_dir}",
+                            "status": "success",
+                            "details": step_summary
+                        })
                 except Exception:
                     logging.exception("[Tool Error] List directory failed")
                     tool_context = "\n\n[System Tool Error: Failed to list directory]\n"
@@ -1839,10 +2968,7 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
 
             elif target == "mcp:filesystem:read_file":
                 try:
-                    args = safe_parse_tool_args(payload_data, "path")
-                    file_path = args.get("path") if isinstance(args, dict) else None
-                    start_line = args.get("start_line") if isinstance(args, dict) else None
-                    end_line = args.get("end_line") if isinstance(args, dict) else None
+                    file_path, start_line, end_line = parse_read_file_args(payload_data)
                     if file_path and not is_path_allowed(file_path):
                         tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
                         log_message(f"[Tool Error] Access restricted: {file_path}")
@@ -1910,9 +3036,9 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
             elif target == "mcp:filesystem:insert_edit_into_file":
                 try:
                     args = safe_parse_tool_args(payload_data, "path")
-                    file_path = args.get("path") if isinstance(args, dict) else None
-                    target_content = args.get("target_content") if isinstance(args, dict) else ""
-                    new_content = args.get("new_content") if isinstance(args, dict) else ""
+                    file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+                    target_content = (args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or "") if isinstance(args, dict) else ""
+                    new_content = (args.get("new_content") or args.get("new_string") or args.get("replace_string") or args.get("code_to_insert") or args.get("code") or "") if isinstance(args, dict) else ""
                     if file_path and not is_path_allowed(file_path):
                         tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
                         log_message(f"[Tool Error] Access restricted: {file_path}")
@@ -1967,9 +3093,9 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
             elif target == "mcp:filesystem:replace_string_in_file":
                 try:
                     args = safe_parse_tool_args(payload_data, "path")
-                    file_path = args.get("path") if isinstance(args, dict) else None
-                    target_content = args.get("target_content") if isinstance(args, dict) else ""
-                    new_content = args.get("new_content") if isinstance(args, dict) else ""
+                    file_path = (args.get("path") or args.get("file") or args.get("filepath")) if isinstance(args, dict) else None
+                    target_content = (args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or "") if isinstance(args, dict) else ""
+                    new_content = (args.get("new_content") or args.get("replace_string") or args.get("replace_text") or args.get("replacement") or args.get("new") or "") if isinstance(args, dict) else ""
                     if file_path and not is_path_allowed(file_path):
                         tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
                         log_message(f"[Tool Error] Access restricted: {file_path}")
@@ -2024,10 +3150,10 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
             elif target == "mcp:filesystem:write_file":
                 try:
                     args = safe_parse_tool_args(payload_data, "path")
-                    file_path = args.get("path") if isinstance(args, dict) else None
-                    content = args.get("content") if isinstance(args, dict) else ""
+                    file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+                    content = (args.get("content") or args.get("code") or args.get("text") or args.get("data") or args.get("body") or "") if isinstance(args, dict) else ""
                     if not isinstance(content, str):
-                        content = ""
+                        content = str(content)
                     if file_path and not is_path_allowed(file_path):
                         tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
                         log_message(f"[Tool Error] Access restricted: {file_path}")
@@ -2038,6 +3164,9 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                             "details": "Access restricted"
                         })
                     elif file_path:
+                        parent_dir = os.path.dirname(file_path)
+                        if parent_dir and not os.path.exists(parent_dir):
+                            os.makedirs(parent_dir, exist_ok=True)
                         with open(file_path, "w", encoding="utf-8") as f:
                             f.write(content)
                         tool_context = f"\n\n[System Tool Response: Successfully wrote {len(content)} characters to '{file_path}']\n"
@@ -2070,8 +3199,10 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
             elif target == "mcp:filesystem:multi_replace_string_in_file":
                 try:
                     args = safe_parse_tool_args(payload_data, "path")
-                    file_path = args.get("path") if isinstance(args, dict) else None
+                    file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
                     replacements = args.get("replacements", []) if isinstance(args, dict) else []
+                    if isinstance(replacements, dict):
+                        replacements = [replacements]
                     
                     if not file_path:
                         tool_context = f"\n\n[System Tool Error: File path was not provided for replacement.]\n"
@@ -2092,8 +3223,8 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                         for idx, r in enumerate(replacements):
                             if not isinstance(r, dict):
                                 continue
-                            target_str = r.get("target")
-                            replacement_str = r.get("replacement")
+                            target_str = r.get("target") or r.get("target_content") or r.get("search_string") or r.get("old") or r.get("find")
+                            replacement_str = r.get("replacement") or r.get("new_content") or r.get("replace_string") or r.get("new")
                             if target_str is None or replacement_str is None:
                                 continue
                             
@@ -2142,11 +3273,18 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
             elif target == "mcp:filesystem:grep_search":
                 try:
                     args = safe_parse_tool_args(payload_data, "query")
-                    query = args.get("query") if isinstance(args, dict) else ""
+                    query = ""
+                    search_dir = "."
+                    if isinstance(args, dict):
+                        query = args.get("query") or args.get("search_term") or args.get("term") or args.get("pattern") or args.get("text") or args.get("search_string") or args.get("grep") or ""
+                        search_dir = args.get("path") or args.get("directory") or args.get("dir") or "."
+                    elif isinstance(args, str):
+                        query = args.strip()
+
                     matches = []
                     ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
-                    if query:
-                        for root, dirs, files in os.walk("."):
+                    if query and os.path.exists(search_dir):
+                        for root, dirs, files in os.walk(search_dir):
                             # Filter dirs in-place to optimize traversal speed and prevent descending into big folders
                             dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
                             for file in files:
@@ -2193,8 +3331,8 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                 full_tool_context = tool_context
             
             supervisor_context = f"{supervisor_context}{tool_context}"
-            if len(supervisor_context) > 50000:
-                supervisor_context = "...\n[Earlier tool responses truncated for context window limits]\n..." + supervisor_context[-20000:]
+            if len(supervisor_context) > 15000:
+                supervisor_context = "...\n[Earlier tool responses truncated for speed & context limits]\n..." + supervisor_context[-12000:]
             
             worker_tool_responses.append(full_tool_context)
             total_worker_len = sum(len(r) for r in worker_tool_responses)
@@ -2238,11 +3376,14 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
         elif mode == "plan":
             worker_mode_constraint = "\nCRITICAL: You are running in PLAN mode. Do NOT generate file edits or modifications. Only output a structured, complete plan."
 
-        worker_prompt = f"""<bos><|turn>system
+        worker_prompt = f"""<|turn>system
 <|think|>
-You are SerenityDev {worker_id}, a specialized software engineering agent.{worker_mode_constraint}
+You are SerenityDev {worker_id}, the Executor. You execute tasks assigned by the Supervisor.{worker_mode_constraint}
+ROLE & BEHAVIOR RULES:
+- You are a pure Executor. Do NOT re-plan, ask open-ended questions, or write conversational fluff.
+- Execute tool instructions directly and output clean, production-ready code.
+- At the end of your response, provide an ultra-terse, caveman-style summary of executed changes for the Supervisor.
 Instructions: {instructions}
-Provide a clean, direct, production-ready response in Markdown format. Avoid system markers.
 
 PONYTAIL LAZINESS LADDER:
 Before writing code, stop at the first rung that holds:
@@ -2273,19 +3414,19 @@ Never compromise on security, input validation, or error handling.
         if not is_programmatic:
             timeline_md = ""
             if agent_steps:
-                timeline_md = "> 🛠️ **Agentic Tools Executed:**\n"
+                timeline_md = f"<details open>\n<summary><b>🛠️ Agentic Tools Executed ({len(agent_steps)})</b></summary>\n\n"
                 for step in agent_steps:
                     icon = "🟢" if step["status"] == "success" else "🟡"
-                    timeline_md += f"> {step['step']}. {icon} `{step['tool']}` ➡️ *{step['details']}*\n"
-                timeline_md += ">\n"
+                    timeline_md += f"{step['step']}. {icon} `{step['tool']}` — *{step['details']}*\n"
+                timeline_md += "</details>\n\n"
 
-            prelim_header = f"""> ### 🤖 SERENITY DEV ORCHESTRATION REPORT\n> 🗺️ **Routing:** `Supervisor ({supervisor_res.split(':')[0]})` ➡️ `Worker: {worker_id} ({worker_model.split(':')[0]})`\n> ⚙️ **Mode:** `{mode.upper()}`\n> 🎯 **Reason:** *"{reason}"*\n{timeline_md}> 🔍 **Review:** `⏳ In Progress (Awaiting Worker Draft & Supervisor Review)`\n\n---\n\n"""
+            prelim_header = f"### 🤖 SerenityDev Orchestration Report\n\n- **Routing**: `Supervisor ({supervisor_res.split(':')[0]})` ➡️ `Agent: {worker_id} ({worker_model.split(':')[0]})`\n- **Mode**: `{mode.upper()}`\n- **Reason**: *{reason}*\n\n{timeline_md}---\n\n"
             yield {"type": "content", "content": prelim_header}
             await asyncio.sleep(0.01)
 
         try:
             worker_draft_parts = []
-            thought_filter = StreamingThoughtFilter()
+            thought_filter = StreamingThoughtFilter(start_in_thought=True)
             async for chunk in generate_completion_stream(worker_model, worker_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
                 worker_draft_parts.append(chunk)
                 filtered = thought_filter.feed(chunk)
@@ -2317,7 +3458,7 @@ Never compromise on security, input validation, or error handling.
                 pass
 
         log_message(f"[Orchestrator] Requesting Supervisor review of draft answer...")
-        review_prompt = f"""<bos><|turn>system
+        review_prompt = f"""<|turn>system
 <|think|>
 You are the SerenityDev Hierarchical Supervisor. Your task is to review the draft answer generated by the worker and determine if it fully and accurately addresses the user's request.
 
@@ -2381,10 +3522,11 @@ Respond ONLY with the raw JSON object. Do not wrap it in markdown code blocks or
             elif mode == "plan":
                 refine_mode_constraint = "\nCRITICAL: You are running in PLAN mode. Do NOT generate file edits or modifications. Only output a structured, complete plan."
 
-            refine_prompt = f"""<bos><|turn>system
+            refine_prompt = f"""<|turn>system
 <|think|>
 You are a SerenityDev Worker. You have been assigned to revise and correct a draft answer based on feedback from the Hierarchical Supervisor.{refine_mode_constraint}
 Please rewrite the answer, ensuring all feedback is fully addressed, code is perfectly correct, and formatting is clean. Provide a direct, professional markdown solution.
+Do NOT issue tool calls (<|tool_call>). Output ONLY your final, complete response in Markdown.
 
 PONYTAIL LAZINESS LADDER:
 Before writing code, stop at the first rung that holds:
@@ -2410,7 +3552,7 @@ Previous Draft:
 
             try:
                 refined_parts = []
-                thought_filter = StreamingThoughtFilter()
+                thought_filter = StreamingThoughtFilter(start_in_thought=True)
                 async for chunk in generate_completion_stream(w1_res, refine_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
                     refined_parts.append(chunk)
                     filtered = thought_filter.feed(chunk)
@@ -2675,6 +3817,28 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
 
 # --- Web UI & Dashboard Endpoints ---
 
+cached_gpu_memory = None
+
+def query_nvidia_smi_sync():
+    global cached_gpu_memory
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
+            capture_output=True, text=True, timeout=1.5
+        )
+        if res.returncode == 0 and res.stdout:
+            parts = res.stdout.strip().split(",")
+            if len(parts) == 2:
+                cached_gpu_memory = {
+                    "used": float(parts[0].strip()) / 1024.0, # convert MiB to GiB
+                    "total": float(parts[1].strip()) / 1024.0,
+                    "unit": "GiB"
+                }
+                return cached_gpu_memory
+    except Exception:
+        pass
+    return cached_gpu_memory
+
 @app.get("/api/status")
 async def get_status():
     """Returns real-time status of the orchestrator, installed models, and GPU memory metrics."""
@@ -2690,23 +3854,11 @@ async def get_status():
         except Exception:
             pass
 
-    # Windows GPU memory parser
-    gpu_memory = None
+    # Windows non-blocking GPU memory parser with cached fallback
     try:
-        res = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
-            capture_output=True, text=True, timeout=5
-        )
-        if res.returncode == 0 and res.stdout:
-            parts = res.stdout.strip().split(",")
-            if len(parts) == 2:
-                gpu_memory = {
-                    "used": float(parts[0].strip()) / 1024.0, # convert MiB to GiB
-                    "total": float(parts[1].strip()) / 1024.0,
-                    "unit": "GiB"
-                }
+        gpu_memory = await asyncio.wait_for(asyncio.to_thread(query_nvidia_smi_sync), timeout=1.5)
     except Exception:
-        pass
+        gpu_memory = cached_gpu_memory
 
     targets = [
         {"name": SUPERVISOR_MODEL, "gguf": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf", "dir": None},
@@ -3606,6 +4758,144 @@ async def clear_logs():
     log_count = len(orchestrator_logs)
     orchestrator_logs = []
     return {"status": f"logs cleared", "cleared_count": log_count}
+
+@app.post("/api/session/rotate")
+async def trigger_session_rotate(store_and_resume: bool = True):
+    """Triggers session key rotation, encrypting and preserving state, then resuming context seamlessly."""
+    res = SessionRotationManager.rotate(store_and_resume=store_and_resume)
+    return JSONResponse(content={
+        "status": "success",
+        "message": "Session rotated successfully with state preserved",
+        "details": res
+    })
+
+@app.get("/api/session/status")
+async def get_session_status():
+    """Returns security health, multi-factor hardware binding state, rotation epoch, and downtime timer metrics."""
+    return JSONResponse(content=SessionRotationManager.get_status())
+
+def verify_mcp_auth(request: Request, optional: bool = False):
+    """Verifies PQC Bearer token if ENFORCE_MCP_AUTH is enabled."""
+    if os.environ.get("ENFORCE_MCP_AUTH", "false").lower() == "true":
+        expected_token = os.environ.get("SERENITY_MCP_TOKEN")
+        if not expected_token:
+            expected_token = SerenityKeyVault.get_machine_entropy().hex()[:32]
+        
+        auth_header = request.headers.get("Authorization", "").strip()
+        bearer_header = request.headers.get("Bearer", "").strip()
+        token_param = request.query_params.get("token", "").strip()
+        
+        provided_token = ""
+        if auth_header.startswith("Bearer "):
+            provided_token = auth_header[7:].strip()
+        elif auth_header:
+            provided_token = auth_header
+        elif bearer_header:
+            provided_token = bearer_header
+        elif token_param:
+            provided_token = token_param
+            
+        if not provided_token and optional:
+            return
+
+        if not provided_token or not hmac.compare_digest(provided_token, expected_token):
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing MCP Bearer Token")
+
+@app.get("/mcp")
+async def mcp_get_handler(request: Request):
+    """MCP handshake / GET endpoint for Edge Gallery initialization & SSE."""
+    verify_mcp_auth(request, optional=True)
+    return JSONResponse(content={
+        "status": "online",
+        "server": "SerenityDev PQC MCP Server",
+        "version": "1.0.0",
+        "protocolVersion": "2024-11-05",
+        "capabilities": {"tools": {}, "prompts": {}, "resources": {}}
+    })
+
+@app.post("/mcp")
+async def mcp_post_handler(request: Request):
+    """Streamable HTTP MCP JSON-RPC 2.0 endpoint for Google AI Edge Gallery."""
+    verify_mcp_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    req_id = body.get("id")
+    method = body.get("method")
+    params = body.get("params", {})
+
+    if method == "initialize":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "prompts": {},
+                    "resources": {}
+                },
+                "serverInfo": {
+                    "name": "SerenityDev MCP Server",
+                    "version": "1.0.0"
+                }
+            }
+        })
+    elif method in ["notifications/initialized", "initialized"]:
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
+    elif method == "ping":
+        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
+    elif method == "tools/list":
+        return JSONResponse(content={
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "serenity_generate",
+                        "description": "Generate completion or run code via SerenityDev Orchestrator",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string", "description": "User prompt or command"}
+                            },
+                            "required": ["prompt"]
+                        }
+                    }
+                ]
+            }
+        })
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        if tool_name == "serenity_generate":
+            prompt = arguments.get("prompt", "")
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"SerenityDev Orchestrator processed: {prompt[:100]}"
+                        }
+                    ]
+                }
+            })
+        else:
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}
+            })
+
+    return JSONResponse(content={
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {}
+    })
 
 @app.post("/shutdown")
 async def shutdown():

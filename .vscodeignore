@@ -15,3 +15,9 @@ vsc-extension-quickstart.md
 serenitydev-0.0.1/**
 models/**
 __pycache__/**
+.env
+.venv/**
+scratch/**
+.git/**
+.agents/**
+.serenity_cache/**

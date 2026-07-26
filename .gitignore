@@ -15,11 +15,20 @@ out/
 # Data & Models
 models/
 scratch/
+Edge Gallery/
 
 # Environment & Logs
 *.env
 !.env.example
 *.log
+
+# TLS & Security Credentials
+*.pem
+*.key
+rootCA.pem
+rootCA.key
+cert.pem
+cert.key
 
 # OS
 .DS_Store
