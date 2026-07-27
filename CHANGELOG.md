@@ -1,7 +1,26 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
+## Version 1.5.2
+- Fixed raw native tool call leakage in `StreamingThoughtFilter` (`serenitydevserver.py`): replaced non-greedy regex stripping with `_strip_tool_call_tags()` using `_find_balanced_brace()` for brace-balanced argument parsing, added partial tool call stream buffering to prevent premature chunk flushing across boundaries, and added `[Tool Filter]` logging for stripped tool call text. [Done]
+- Added standalone mini agentic tool loop (Path A) in `serenitydevserver.py`: after each generation, `extract_json()` detects native `<|tool_call>call:X{...}<tool_call|>` output; if a tool call is found, it is dispatched inline (all filesystem + terminal tools, full write access, security-gated), result appended to context, and re-generated. Loop capped at 8 iterations with duplicate call guard. Fixes Gemma-4 native tool calls leaking as plaintext and ending chat. [Done]
+- Added `bash`, `sh`, `shell`, `run` aliases → `mcp:terminal:run_command` in target normalizer (`serenitydevserver.py`) to handle Gemma-4's `call:Bash{command:...}` tool call syntax. [Done]
+- Added per-worker inner tool loop (Phase 2, Path B) in `serenitydevserver.py`: workers can now resolve native tool calls emitted mid-generation (up to 8 iterations, duplicate guard, full tool dispatch), appending results to worker context before re-generating. [Done]
+- Added worker delegation caps in `serenitydevserver.py` supervisor loop: Supervisor Low = max 3 worker delegations per run; Supervisor High = max 5; Orchestrator/Turbo = unlimited. [Done]
+
+## Version 1.5.1
+
+- Fixed native tool call regex parsing in `extract_json()` (`serenitydevserver.py`) to support end tag variants like `<tool_call|>` / `<|tool_call|>` and sanitize template quote escape artifacts (`<|"|>`) prior to JSON deserialization. [Done]
+- Added `shutil.which` resolution and `LLAMA_SERVER_BIN` environment variable lookup in `start_llama_server` (`serenitydevserver.py`) to resolve `FileNotFoundError: [WinError 2]` when `llama-server` binary is missing from PATH. [Done]
+- Configured mode effort levels in `serenitydevserver.py`: Low Mode (8 max steps, low-resource efficiency), High Mode (25 max steps, full reasoning), and Autonomous Turbo Orchestrator Mode (100 max steps for nigh-indefinite sub-agent delegation, plan oversight, and tool execution). [Done]
+- Adjusted duplicate tool call guard thresholds: allowed up to 5 identical retries for terminal polling/test commands (`run_command`) and 3 for identical file operations before breaking loop to Worker W1. [Done]
+- Cleaned up model display names in `/api/models` (`serenitydevserver.py`) and `package.json`: removed redundant `Serenity:` prefix from model names, labeled Orchestrator as `Orchestrator - Turbo Mode`, and updated vendor display name to `SerenityDev`. [Done]
+- Hardened `COMMAND_RULES` in `serenitydevserver.py`: explicitly blacklisted `python -c`, `python -i`, and bare `python`, while explicitly whitelisting `python --version`, `python -m pip (list|check)`, script execution (`python <script>.py`), and module entry points (`python -m <module>`). [Done]
+- Implemented real-time `<details>` block streaming in `serenitydevserver.py` during orchestration, streaming tool args, status icons, and raw output blocks directly to VS Code Copilot Chat UI to eliminate blank "Analyzing" delays. [Done]
+
 ## Version 1.5.0
+- Overhauled `extract_json()` and added `normalize_tool_action()` helper in `serenitydevserver.py` to parse JSON array tool call structures (`[{"tool_name": "...", "args": {...}}]`), extract non-standard schema keys (`tool_name`, `name`, `tool`, `function`, `args`, `arguments`, `parameters`), and eliminate raw tool call JSON string leakage in chat stream outputs. [Done]
+- Hardened MCP tool execution parameter fallbacks in `execute_mcp_tool_call()` and supervisor tool handlers (`file_path` -> `path`, `replace_string` / `replacement` -> `new_content`, `search_string` / `old_content` -> `target_content`) in `serenitydevserver.py`. [Done]
 - Hardened `SerenityKeyVault` with composite multi-factor hardware entropy (OS MAC, Windows `MachineGuid`, BIOS UUID) to prevent user-space MAC address spoofing attacks, squeezed 96-bit nonces directly from SHAKE-256 to prevent GCM nonce reuse catastrophes, enforced constant-time digest comparisons (`hmac.compare_digest`), implemented `SessionRotationManager` with encrypted state preservation/resumption, added `/api/session/rotate` and `/api/session/status` endpoints, and launched an autonomous downtime session rotation loop (default 10-minute idle threshold). [Done]
 - Limited server process permissions & .env rogue agent isolation. Added is_path_allowed checks to read/write/edit/grep tools, blacklisted .env in command execution rules, filtered list_directory, and sanitized subprocess environment. [Done]
 - Fixed LOCAL_API_KEY structure in dotenv loading & fallback to prevent ValueError startup crash and handle local key configuration. [Done]

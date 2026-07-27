@@ -6,40 +6,35 @@ File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
+ONGOING - resolve tool call failures: when a tool is called, it goes to the chat as a response. possible regex mismatch or aggressive cleaning.
+Add debugging to see why. for testing, add extra info to prompt for tool calls.
+
+[2026-07-27] DEFERRED: Focused subagent spawning architecture — Supervisor/Orchestrator should be able to spawn worker subagents with only the specific tools and instructions they need (tool allowlist scoped per delegation). Workers currently receive all tools from the global list. Implement per-delegation tool scoping in Path B `delegate_worker` branch: pass a `tool_subset` list alongside `instructions` so the spawned worker prompt only advertises the relevant tools. Cap: worker inner loop already at 8; supervisor delegation already capped (Low=3, High=5, Turbo=unlimited).
+
 New models and ones displayed should be given Agent role, reserving the Worker role purely for delegation by a Supervisor or Orchestrator.
 
 1. resolve llm output is massdumping instead of streaming response.
-   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Done] 
+   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Verify] 
 
-2. kv cache compression settings (add to UI and verify it works / changes) [Done] 
+2. kv cache compression settings (add to UI and verify it works / changes) [Verify] 
 
 3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq [Done] 
 
-4. implement terminal command whitelist / blacklist filtering in devserver for run_command. [Done]
+4. Adapted gork-build Rust architecture to improve this codebase. Added: 1) Tool-Pair-Safe context trimming, 2) Workspace/Session prompt queue manager & decongestion, 3) Sliding-window CircuitBreaker for API/tool resilience. Annotated Rust-exclusive features (Alacritty PTY handles, Ratatui TUI rendering, D-Bus sleep listeners). [Verify]
 
-5. High and Low modes, split logic in two:
-   - gemma-4-26B-A4B (High) explains everything it does, uses thinking to the max, as many tokens and tool uses as needed to solve the issue with utmost accuracy. Prioritizes self-optimizable pipeline: research - plan - worker selections - permission (if necessary) - execution - test.
-   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test. [Done] 
+5. fix the extension icon not showing up in VSCode.
 
-6. ensure for each task and worker the temp and such is set properly thruout. [Done] 
-
-7. Adapted gork-build Rust architecture to improve this codebase. Added: 1) Tool-Pair-Safe context trimming, 2) Workspace/Session prompt queue manager & decongestion, 3) Sliding-window CircuitBreaker for API/tool resilience. Annotated Rust-exclusive features (Alacritty PTY handles, Ratatui TUI rendering, D-Bus sleep listeners). [Done]
-
-8. fix the extension icon not showing up in VSCode.
-
-9. map MOE router sizes
+6. map MOE router sizes
 test and learn gemma-4 params. figure out: what works best for coding? what has the lowest probability of skipping the response/ what parameters provide the most complete and accurate response?
 add git commands to harness
 
-10. review FIM handling and VRAM usage; let it be on unless VRAM is to be saturated especially by a large LLM being loaded. load FIM if there is space, auto-offload for Orchestrator / Supervisor and secondary routing phases.
-11.  Smart App Control & Cache Localization:
-   - Localize TEMP/TMP and CUDA compiler cache paths to the workspace to bypass Windows security policy blocks.
-   - Ensure all subprocess backends (MSVC, CMake, Pip, PyTorch, Triton) respect the localized variables. [Done] 
-"when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints." [Done] 
+7. review FIM handling and VRAM usage; let it be on unless VRAM is to be saturated especially by a large LLM being loaded. load FIM if there is space, auto-offload for Orchestrator / Supervisor and secondary routing phases.
 
-12. Implement HTTPS-enforced StreamableHTTP MCP server endpoint (`/mcp`) in `serenitydevserver.py` for Google AI Edge Gallery integration. [Done]
+8. It seems to be working, but i'm not seeing anything [see below #87]
 
-13. Hardened SerenityKeyVault multi-factor hardware entropy (OS MAC + Windows MachineGuid + BIOS UUID), SHAKE-256 GCM nonces (zero collision across 10k squeezes), constant-time comparisons, SessionRotationManager with encrypted store-and-resume, and autonomous downtime rotation loop (default 10-minute idle threshold). [Done]
+9. Implement HTTPS-enforced StreamableHTTP MCP server endpoint (`/mcp`) in `serenitydevserver.py` for Google AI Edge Gallery integration. [Done]
+
+10. Hardened SerenityKeyVault multi-factor hardware entropy (OS MAC + Windows MachineGuid + BIOS UUID), SHAKE-256 GCM nonces (zero collision across 10k squeezes), constant-time comparisons, SessionRotationManager with encrypted store-and-resume, and autonomous downtime rotation loop (default 10-minute idle threshold). [Done]
 
 [TBD] make auto-pushing verified updates a thing. 
 
@@ -58,25 +53,158 @@ add git commands to harness
 [Last] update README and create LICENSE.md
 
 =========================================
+NOTE ITEMS & EVOLVING CONSIDERATIONS
+=========================================
+N.  Smart App Control & Cache Localization:
+- Ensure all subprocess backends (MSVC, CMake, Pip, PyTorch, Triton) respect the localized variables. [Done] 
+"when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints." [Evolving] 
+
+N. High and Low modes, split logic in two:
+   - gemma-4-26B-A4B (High) explains everything it does, uses thinking to the max, as many tokens and tool uses as needed to solve the issue with utmost accuracy. Prioritizes self-optimizable pipeline: research - plan - worker selections - permission (if necessary) - execution - test.
+   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test. [Note] 
+
+N. ensure for each task and worker the temp and such is set properly thruout. [Evolving] 
+
+=========================================
 HISTORICAL REFERENCE & LOGS
 =========================================
-(The following transcript logs represent a timed-out attempt to execute TODO #13 in the SerenityPC workspace)
+#87: [...] Initiating SerenityDev Secure Boot...
+[+] Environment Validated: Hardware-bound identity confirmed.
+[Port Initializer] Scanning port 8002...
+[Server] Starting SerenityDev Orchestrator...
+[...] Initiating SerenityDev Secure Boot...
+[+] Environment Validated: Hardware-bound identity confirmed.
+INFO:     Started server process [3396]
+INFO:     Waiting for application startup.
+[Startup] Scanning for local model files...
+[Startup] Found models: ['gemma-4-26B-A4B-it-qat-UD-Q4_K_XL', 'codegemma-2b-f16', 'codegemma-7b-it-f16', 'gemma4-v2-Q4_K_M', 'gemma4-coding-Q4_K_M', 'gemma-4-E4B-it-Coder.Q4_K_M']
+[Startup] Auto-Assigned Supervisor: gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+[Startup] Auto-Assigned Agent (Code): gemma-4-E4B-it-Coder.Q4_K_M
+[Startup] Auto-Assigned Agent (FIM): codegemma-2b-f16
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8002 (Press CTRL+C to quit)
+INFO:     127.0.0.1:51799 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51800 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51802 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51803 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53003 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53004 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53005 - "GET /api/models HTTP/1.1" 200 OK
+[Orchestrator] Changed working directory to: C:\Users\ccrg6\Desktop\Desktop\Hub\Serenity Live
+[Orchestrator] Consolidated Models Enabled -> Using 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' for all phases.
+INFO:     127.0.0.1:53007 - "POST /ask_stream HTTP/1.1" 200 OK
+--- DYNAMIC VRAM REPORT ---
+Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+Total GPU VRAM:   6144.0 MiB
+Free VRAM:        4961.3 MiB
+Self VRAM:        0.0 MiB
+Total Layers:     30
+File Size:        13589.0 MiB (~453.0 MiB/layer)
+Est. KV Cache:    1050.0 MiB (Offloaded: True)
+Target VRAM:      4661.3 MiB
+Action:           Offloading 7/30 layers to GPU
+----------------------------
+[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=16384, gpu_layers=7) with KV cache compression K=f16, V=f16...
+llama_context: n_ctx_seq (16384) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+[Llama-CPP] Prompt tokens (24082) + headroom (2048) exceeds loaded context limit (16384). Dynamic reloading to n_ctx=26130...
+[Llama-CPP] Unloading active model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' to reload for 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
+[Llama-CPP] Unloading model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
+[Llama-CPP] Direct model offloaded successfully.
+--- DYNAMIC VRAM REPORT ---
+Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+Total GPU VRAM:   6144.0 MiB
+Free VRAM:        4912.8 MiB
+Self VRAM:        0.0 MiB
+Total Layers:     30
+File Size:        13589.0 MiB (~453.0 MiB/layer)
+Est. KV Cache:    1674.6 MiB (Offloaded: True)
+Target VRAM:      4612.8 MiB
+Action:           Offloading 6/30 layers to GPU
+----------------------------
+[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=26130, gpu_layers=6) with KV cache compression K=f16, V=f16...
+llama_context: n_ctx_seq (26368) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+[Tool Success] Plan state updated locally with 8 steps.
+[Tool Success] Plan state updated locally with 0 steps.
+[Tool Success] Plan state updated locally with 11 steps.
+[Duplicate Tool Intercepted] Prevented redundant tool call 'mcp:filesystem:create_or_update_plan' with args
 
-I got this:
-SerenityDev: Gemma-4 Active Planning Pipeline Initialized. Ready for queries.
-You: TODO #13: MoE Mapping, Gemma-4 Parameter Optimization, and Git Tests Background We will address the tasks under TODO #13: Map MoE router sizes by enhancing the GGUF metadata parsing logic to read the total experts and active experts, then reporting them in the Dynamic VRAM report. Optimize Gemma-4 parameters (especially for coding/reasoning) by specifying ideal presets (lower temperature, low/no repeat penalty, and appropriate min_p) to reduce generation skipping and improve accuracy. Add git commands to the Wringer harness to evaluate code/scripting capabilities on standard developer flows. Proposed Changes 1. MoE Router Mapping in GGUF Parsers We will update calculate_dynamic_gpu_layers in: main.py System/tests/benchmarks/wringer/Wringer.py System/tests/benchmarks/debate/Debate.py Changes in calculate_dynamic_gpu_layers: Scan the entire KV metadata list (instead of breaking immediately on .block_count) to extract .expert_count and .expert_used_count. Update the print statement/report to output Model Type: Mixture of Experts (MoE) and MoE Router Map: X/Y experts active per token when a router is found. 2. Git Command Evaluation in Wringer Test Suite We will add Git-specific questions to: System/tests/benchmarks/wringer/Wringer.py Questions to add: Level 2 (Developer / Search tasks) "How do I undo the last local commit in git without losing my changes?" "Write a git command to discard all unstaged changes in the working directory." Level 3 (Scripting / Complex Developer Tasks) "Draft a bash script that automatically pulls the latest main, runs tests, and pushes to origin if successful." Level 5 (Advanced Coding / Logic) "Explain how git rebasing works compared to git merging, detailing pros and cons for a team workflow." Matching answers will be added to the reference answer key. 3. Gemma-4 Parameter Optimization & Study We will document the learned parameters for Gemma-4 in a new notes file: System/tests/benchmarks/wringer/gemma4_param_notes.md Key Findings / Coding Presets: Temperature: 0.3 to 0.5 for coding, rather than 1.0. Low temperature prevents divergence and incomplete code blocks. Repeat Penalty: 1.0 (disabled) or 1.05. High repeat penalty breaks syntax repetition (such as repeated import, def, for, spaces, brackets), causing early termination/skipping. Min P: 0.05 to 0.1 to filter out low-probability junk tokens while preserving multiple candidate paths. Stop Tokens: Ensure and <|end_of_turn|> are registered. Verification Plan Automated Tests Run python -m py_compile on modified Python scripts. Run Wringer tests on a test model to verify the new questions are evaluated.
-⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
-⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
-⚙️ [Orchestrator] Header stripped to fit Copilot Chat limit. Answer 1055 chars.
-⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
-⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
-SerenityDev: ### Implementation Checklist #### Phase 1: GGUF Metadata Update - [ ] Update `calculate_dynamic_gpu_layers` in `main.py`. - [ ] Update `calculate_dynamic_gpu_layers` in `Wringer.py`. - [ ] Update `calculate_dynamic_gpu_layers` in `Debate.py`. - [ ] Verify that non-MoE models do not trigger "MoE Router Map" errors. #### Phase 2: Wringer Test Expansion - [ ] Add Level 2 Git questions to `Wringer.py`. - [ ] Add Level 3 Git scripting questions to `Wringer.py`. - [ ] Add Level 5 Git logic questions to `Wringer.py`. - [ ] Update the reference answer key for all new questions. - [ ] Run `python -m py_compile` on all modified files. #### Phase 3: Documentation - [ ] Create `System/tests/benchmarks/wringer/gemma4_param_notes.md`. - [ ] Document the specific `temperature`, `repeat_penalty`, and `min_p` settings for Gemma-4 coding benchmarks. #### Phase 4: Verification - [ ] Execute Wringer harness against a known MoE model (e.g., Mixtral) to verify metadata reporting. - [ ] Execute Wringer harness against Gemma-4 to verify Git question accuracy.
-🗺️ Plan Step Count: 0
-Worker: gemma-4-26B-A4B
-You: proceed with changes
-⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
-⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
-⚙️ [Orchestrator] Header stripped to fit Copilot Chat limit. Answer 1055 chars.
-⚙️ [Orchestrator] Changed working directory to: c:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC
-⚙️ [Orchestrator] Standalone execution requested for model: gemma-4-26B-A4B (gemma-4-26B-A4B-it-qat-UD-Q4_K_XL)
-❌ Error: timeout of 180000ms exceeded
+[Llama-CPP] Direct model offloaded successfully.
+--- DYNAMIC VRAM REPORT ---
+Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+Total GPU VRAM:   6144.0 MiB
+Free VRAM:        4652.8 MiB
+Self VRAM:        0.0 MiB
+Total Layers:     30
+File Size:        13589.0 MiB (~453.0 MiB/layer)
+Est. KV Cache:    1691.2 MiB (Offloaded: True)
+Target VRAM:      4352.8 MiB
+Action:           Offloading 5/30 layers to GPU
+----------------------------
+[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=26389, gpu_layers=5) with KV cache compression K=f16, V=f16...
+llama_context: n_ctx_seq (26624) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+[OpenAI Stream] Request cancelled by client disconnect.
+[Supervisor Self-Healing] Attempt 1 failed: Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.. Retrying with error details...
+[Llama-CPP] Prompt tokens (26444) + headroom (2048) exceeds loaded context limit (26624). Dynamic reloading to n_ctx=28492...
+[Llama-CPP] Unloading active model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' to reload for 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
+[Llama-CPP] Unloading model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
+[Llama-CPP] Direct model offloaded successfully.
+--- DYNAMIC VRAM REPORT ---
+Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+Total GPU VRAM:   6144.0 MiB
+Free VRAM:        4705.2 MiB
+Self VRAM:        0.0 MiB
+Total Layers:     30
+File Size:        13589.0 MiB (~453.0 MiB/layer)
+Est. KV Cache:    1826.0 MiB (Offloaded: True)
+Target VRAM:      4405.2 MiB
+Action:           Offloading 5/30 layers to GPU
+----------------------------
+[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=28492, gpu_layers=5) with KV cache compression K=f16, V=f16...
+llama_context: n_ctx_seq (28672) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+[Supervisor Self-Healing] Attempt 2 failed: Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.. Retrying with error details...
+.
+[Tool Success] Plan state updated locally with 6 steps.
+[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=30151, gpu_layers=5) with KV cache compression K=f16, V=f16...
+llama_context: n_ctx_seq (30208) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+[Tool Success] Plan state updated locally with 9 steps.
+INFO:     127.0.0.1:63841 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[OpenAI Stream] Request cancelled by client disconnect.
+INFO:     127.0.0.1:52410 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52412 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52413 - "GET /api/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52452 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[OpenAI Stream] Request cancelled by client disconnect.
+[Tool Success] Plan state updated locally with 8 steps.
+[Llama-CPP] Prompt tokens (28165) + headroom (2048) exceeds loaded context limit (30208). Dynamic reloading to n_ctx=30213...
+[Llama-CPP] Unloading active model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' to reload for 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
+[Llama-CPP] Unloading model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
+[Llama-CPP] Direct model offloaded successfully.
+--- DYNAMIC VRAM REPORT ---
+Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+Total GPU VRAM:   6144.0 MiB
+Free VRAM:        4619.9 MiB
+Self VRAM:        0.0 MiB
+Total Layers:     30
+File Size:        13589.0 MiB (~453.0 MiB/layer)
+Est. KV Cache:    1936.3 MiB (Offloaded: True)
+Target VRAM:      4319.9 MiB
+Action:           Offloading 5/30 layers to GPU
+----------------------------
+[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=30213, gpu_layers=5) with KV cache compression K=f16, V=f16...
+llama_context: n_ctx_seq (30464) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+INFO:     127.0.0.1:53631 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[OpenAI Stream] Request cancelled by client disconnect.
+INFO:     127.0.0.1:53783 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+[Duplicate Tool Intercepted] Prevented redundant tool call 'mcp:filesystem:create_or_update_plan' with args
+[OpenAI Stream] Request cancelled by client disconnect.
+[Tool Success] Plan state updated locally with 11 steps.
+[Llama-CPP Stream] Stream cancelled by client connection drop.
+[Llama-CPP Stream] Generation cancelled.
+[Completion Cancelled] Task cancelled for model gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
+[Supervisor] Orchestration cancelled by client request.
