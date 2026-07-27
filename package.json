@@ -47,7 +47,7 @@
     "languageModelChatProviders": [
       {
         "vendor": "serenitydev",
-        "displayName": "SerenityDev Local Server"
+        "displayName": "SerenityDev"
       }
     ],
     "viewsContainers": {

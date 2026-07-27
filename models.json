@@ -5,5 +5,6 @@
     "Qwen3.6-35B-A3B-UD-Q4_K_XL": "C:\\Users\\ccrg6\\SerenityDev\\models\\Qwen3.6-35B-A3B\\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
     "gemma4-v2-Q4_K_M": "C:\\Users\\ccrg6\\SerenityDev\\models\\yuxinlu1 fable5\\gemma4-v2-Q4_K_M.gguf",
     "gemma4-coding-Q4_K_M": "C:\\Users\\ccrg6\\SerenityDev\\models\\gemma4-coding-Q4_K_M.gguf",
-    "gemma-4-E4B-it-Coder.Q4_K_M": "C:\\Users\\ccrg6\\SerenityDev\\models\\gemma-4-E4B Coder\\gemma-4-E4B-it-Coder.Q4_K_M.gguf"
+    "gemma-4-E4B-it-Coder.Q4_K_M": "C:\\Users\\ccrg6\\SerenityDev\\models\\gemma-4-E4B Coder\\gemma-4-E4B-it-Coder.Q4_K_M.gguf",
+    "gemma-4-E4B-it-qat-UD-Q4_K_XL": "C:\\Users\\ccrg6\\SerenityDev\\models\\gemma-4-E4B-qat\\gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"
 }
