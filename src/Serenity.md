@@ -86,7 +86,7 @@ SerenityDev supports native `<|tool_call>` syntax, short aliases, and namespace 
 
 ### Pipeline Execution Phases
 1. **Supervisor Routing**: Query analysis, plan maintenance, file context retrieval.
-2. **Tool Execution**: Autonomous filesystem and terminal tool execution.
+2. **Tool Execution**: Autonomous filesystem and terminal tool execution. Outputs real-time `<details>` collapsible blocks into client stream. Hard capped at 10 loops max (8 in Low mode) with automatic duplicate tool termination (max 2 attempts per identical call).
 3. **Worker Delegation**: Targeted context passed to specialist workers (`W1`-`W4`).
 4. **Draft Synthesis & Review**: Supervisor quality review; auto re-routes to W1 refinement on failure.
 

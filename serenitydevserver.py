@@ -498,8 +498,14 @@ async def start_llama_server(model_name: str, n_ctx: int):
 
     log_message(f"[Llama-Server] Starting server for {model_name} from {gguf_path} (n_ctx={n_ctx}, gpu_layers={gpu_layers}, offload_kqv={offload_kqv})...")
     
+    import shutil
+    llama_bin = os.environ.get("LLAMA_SERVER_BIN") or shutil.which("llama-server") or shutil.which("llama-server.exe")
+    if not llama_bin:
+        log_message("[Llama-Server] llama-server executable not found in PATH or LLAMA_SERVER_BIN.")
+        raise FileNotFoundError("llama-server executable not found in PATH. Set LLAMA_SERVER_BIN or install llama-server.")
+
     cmd = [
-        "llama-server",
+        llama_bin,
         "-m", gguf_path,
         "-c", str(n_ctx),
         "-ngl", str(gpu_layers),
@@ -1160,32 +1166,289 @@ def clean_thought_and_whitespace(text: str) -> str:
         return orig_text.strip()
     return cleaned
 
+def normalize_tool_action(obj: Any) -> Optional[Dict[str, Any]]:
+    """Normalizes parsed JSON dicts or arrays into standard Serenity tool call structures."""
+    if isinstance(obj, list) and len(obj) > 0:
+        obj = obj[0]
+        
+    if isinstance(obj, dict):
+        if "action" in obj and "target" in obj:
+            return obj
+        tool_name = obj.get("tool_name") or obj.get("name") or obj.get("tool") or obj.get("function") or obj.get("target")
+        args = obj.get("args") or obj.get("arguments") or obj.get("parameters") or obj.get("arguments_or_instructions") or {}
+        reason = obj.get("reason") or obj.get("explanation") or "Parsed tool action"
+        summary = obj.get("step_summary") or obj.get("summary") or (f"Execute tool: {tool_name}" if tool_name else "Execute step")
+        
+        if tool_name:
+            action_type = "delegate_worker" if tool_name in ["W1", "W2", "W3", "W4"] else "call_tool"
+            return {
+                "action": action_type,
+                "target": tool_name,
+                "arguments_or_instructions": args,
+                "step_summary": summary,
+                "reason": reason
+            }
+        if "steps" in obj or "focus" in obj:
+            return {
+                "action": "call_tool",
+                "target": "mcp:filesystem:create_or_update_plan",
+                "arguments_or_instructions": obj,
+                "step_summary": "Plan updated",
+                "reason": "Plan update"
+            }
+    return None
+
+def _strip_tool_call_tags(text: str) -> str:
+    """Strips native tool call tags and tool invocation statements from text using brace-balanced matching."""
+    if not text:
+        return ""
+    
+    # Fast check
+    if "call:" not in text and "<|tool_call" not in text and "<tool_call" not in text and "tool_call" not in text:
+        return text
+
+    result = []
+    i = 0
+    length = len(text)
+    
+    # Match prefixes like <|channel>thought <|tool_call>call:func_name or simple call:func_name
+    tool_prefix_pattern = re.compile(
+        r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)*\s*call:\s*([^\s{\(]+)\s*',
+        re.DOTALL
+    )
+
+    while i < length:
+        match = tool_prefix_pattern.search(text, i)
+        if not match:
+            result.append(text[i:])
+            break
+        
+        # Append text prior to the tool call
+        result.append(text[i:match.start()])
+        
+        start_idx = match.end()
+        end_idx = start_idx
+
+        # Check for brace args block
+        if start_idx < length and text[start_idx] == '{':
+            balanced_end = _find_balanced_brace(text, start_idx)
+            if balanced_end != -1:
+                end_idx = balanced_end + 1
+            else:
+                # Unbalanced brace - consume to end or next tag
+                end_idx = length
+        elif start_idx < length and text[start_idx] == '(':
+            # Fallback parenthesized args
+            paren_close = text.find(')', start_idx)
+            if paren_close != -1:
+                end_idx = paren_close + 1
+            else:
+                end_idx = length
+
+        # Consume trailing closing tool_call tags if present
+        tail = text[end_idx:]
+        end_tag_match = re.match(r'\s*(?:<\|?tool_call\|?>?|<\|?tool_call\|?>|</tool_call>|<tool_call\|?>)', tail)
+        if end_tag_match:
+            end_idx += end_tag_match.end()
+
+        stripped_content = text[match.start():end_idx]
+        log_message(f"[Tool Filter] Stripped native tool call text ({len(stripped_content)} chars): {stripped_content[:80]}...")
+
+        i = end_idx
+
+    cleaned_text = "".join(result)
+    # Secondary pass to strip any orphaned <|tool_call>, <tool_call|>, </tool_call> tags left in stream
+    cleaned_text = re.sub(r'<\|?tool_call\|?>?|<\|?tool_call\|?>|</tool_call>|<tool_call\|?>', '', cleaned_text)
+    return cleaned_text
+
+def _find_balanced_brace(text: str, start: int = 0) -> int:
+    """Find index of the matching closing brace, skipping braces inside string literals and quotes."""
+    if start >= len(text) or text[start] != '{':
+        return -1
+    depth = 0
+    i = start
+    in_tq = False     # inside """..."""
+    in_tmpl = False   # inside <|"|>...<|"|>
+    in_str = False    # inside standard "..."
+    str_char = None
+    
+    while i < len(text):
+        if not in_str and text[i:i+3] == '"""' and not in_tmpl:
+            in_tq = not in_tq
+            i += 3
+            continue
+        if not in_str and text[i:i+5] == '<|"|>' and not in_tq:
+            in_tmpl = not in_tmpl
+            i += 5
+            continue
+            
+        if not in_tq and not in_tmpl:
+            ch = text[i]
+            if in_str:
+                if ch == '\\':
+                    i += 2  # skip escaped character
+                    continue
+                elif ch == str_char:
+                    in_str = False
+                    str_char = None
+            else:
+                if ch in ('"', "'"):
+                    in_str = True
+                    str_char = ch
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return i
+        i += 1
+    return -1
+
+def _parse_native_tool_args(args_str: str) -> dict:
+    """Parse Gemma-style native tool call args with triple-quote and template-quote delimiters."""
+    s = args_str.strip()
+    if s.startswith('{'):
+        s = s[1:]
+    if s.endswith('}'):
+        s = s[:-1]
+    result = {}
+    i = 0
+    while i < len(s):
+        # Skip whitespace and commas
+        while i < len(s) and s[i] in ' \t\n\r,':
+            i += 1
+        if i >= len(s):
+            break
+        # Extract key
+        colon_idx = s.find(':', i)
+        if colon_idx == -1:
+            break
+        key = s[i:colon_idx].strip()
+        i = colon_idx + 1
+        # Skip whitespace after colon
+        while i < len(s) and s[i] in ' \t\n\r':
+            i += 1
+        if i >= len(s):
+            result[key] = ""
+            break
+        # Extract value based on delimiter
+        if s[i:i+3] == '"""':
+            i += 3
+            end = s.find('"""', i)
+            if end == -1:
+                result[key] = s[i:]
+                break
+            result[key] = s[i:end]
+            i = end + 3
+        elif s[i:i+5] == '<|"|>':
+            i += 5
+            end = s.find('<|"|>', i)
+            if end == -1:
+                result[key] = s[i:]
+                break
+            result[key] = s[i:end]
+            i = end + 5
+        elif s[i] == '"':
+            i += 1
+            val_start = i
+            while i < len(s) and s[i] != '"':
+                if s[i] == '\\':
+                    i += 2
+                    continue
+                i += 1
+            result[key] = s[val_start:i]
+            if i < len(s):
+                i += 1
+        elif s[i] == '{':
+            brace_end = _find_balanced_brace(s, i)
+            if brace_end == -1:
+                result[key] = s[i:]
+                break
+            nested = s[i:brace_end+1]
+            try:
+                result[key] = json.loads(nested)
+            except Exception:
+                result[key] = nested
+            i = brace_end + 1
+        elif s[i] == '[':
+            bracket_depth = 1
+            j = i + 1
+            while j < len(s) and bracket_depth > 0:
+                if s[j] == '[': bracket_depth += 1
+                elif s[j] == ']': bracket_depth -= 1
+                j += 1
+            nested = s[i:j]
+            try:
+                result[key] = json.loads(nested)
+            except Exception:
+                result[key] = nested
+            i = j
+        else:
+            val_start = i
+            while i < len(s) and s[i] not in ',}\n':
+                i += 1
+            val = s[val_start:i].strip()
+            if val.lower() == 'true':
+                result[key] = True
+            elif val.lower() == 'false':
+                result[key] = False
+            else:
+                try:
+                    result[key] = int(val)
+                except ValueError:
+                    try:
+                        result[key] = float(val)
+                    except ValueError:
+                        result[key] = val
+    return result
+
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
     """Defensively extracts and parses JSON from raw LLM output."""
     cleaned = clean_thought_and_whitespace(text).strip()
-    if not cleaned or ('{' not in cleaned and '<|tool_call' not in cleaned):
+    if not cleaned or ('{' not in cleaned and '[' not in cleaned and '<|tool_call' not in cleaned and '<tool_call' not in cleaned):
         return None
 
     # 0. Intercept native tool call syntax (<|tool_call>, <tool_call>, call:...)
     if "<|tool_call" in cleaned or "<tool_call" in cleaned or "call:" in cleaned:
-        match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*(\{.*?\})\s*(?:<\|?tool_call\|?>?|</tool_call>)?', cleaned, re.DOTALL)
-        if match:
-            func_name = match.group(1).strip()
-            args_str = match.group(2).strip()
-            try:
-                args = json.loads(args_str)
-            except Exception:
-                args = args_str
-            return {
-                "action": "call_tool",
-                "target": func_name,
-                "arguments_or_instructions": args,
-                "step_summary": f"Native tool call: {func_name}",
-                "reason": "Parsed from native tool call"
-            }
+        # Find function name via regex, then use brace-balanced capture for args
+        name_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*', cleaned)
+        if name_match:
+            func_name = name_match.group(1).strip()
+            rest = cleaned[name_match.end():]
+
+            # Brace-balanced arg capture (handles inner braces in f-strings, nested dicts)
+            if rest.startswith('{'):
+                brace_end = _find_balanced_brace(rest)
+                if brace_end > 0:
+                    args_str = rest[:brace_end + 1]
+                    args = _parse_native_tool_args(args_str)
+                    return {
+                        "action": "call_tool",
+                        "target": func_name,
+                        "arguments_or_instructions": args,
+                        "step_summary": f"Native tool call: {func_name}",
+                        "reason": "Parsed from native tool call"
+                    }
+
+            # Fallback: original non-greedy regex for simple args
+            simple_match = re.search(r'(\{.*?\})', rest, re.DOTALL)
+            if simple_match:
+                args_str = simple_match.group(1).strip()
+                cleaned_args_str = re.sub(r'<\|"\|>', '"', args_str)
+                try:
+                    args = json.loads(cleaned_args_str)
+                except Exception:
+                    args = cleaned_args_str
+                return {
+                    "action": "call_tool",
+                    "target": func_name,
+                    "arguments_or_instructions": args,
+                    "step_summary": f"Native tool call: {func_name}",
+                    "reason": "Parsed from native tool call"
+                }
         
         # Fallback for parenthesized syntaxes like <|tool_call>call:run_task(task_id="npm: 3")<tool_call|>
-        alt_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\((.*?)\)\s*(?:<\|?tool_call\|?>?|</tool_call>)?', cleaned, re.DOTALL)
+        alt_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\((.*?)\)\s*(?:<\|?tool_call\|?>?|<\|?tool_call\|?>|</tool_call>)?', cleaned, re.DOTALL)
         if alt_match:
             func_name = alt_match.group(1).strip()
             args = alt_match.group(2).strip()
@@ -1197,33 +1460,27 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                 "reason": "Parsed from native tool call"
             }
 
+    decoder = json.JSONDecoder()
+
     # 1. Try to extract from markdown code blocks first
     if "```" in cleaned:
-        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', cleaned, re.DOTALL)
+        match = re.search(r'```(?:json)?\s*([\{\[].*?[\}\]])\s*```', cleaned, re.DOTALL)
         if match:
             try:
-                obj, _ = json.JSONDecoder().raw_decode(match.group(1).strip())
-                if isinstance(obj, dict):
-                    return obj
+                obj, _ = decoder.raw_decode(match.group(1).strip())
+                norm = normalize_tool_action(obj)
+                if norm:
+                    return norm
             except Exception:
                 pass
 
-    # 2. Iterate over all '{' matches using raw_decode to parse valid JSON dicts surrounded by text
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'\{', cleaned):
+    # 2. Iterate over all '{' and '[' matches using raw_decode to parse valid JSON surrounded by text
+    for match in re.finditer(r'[\{\[]', cleaned):
         try:
             obj, _ = decoder.raw_decode(cleaned[match.start():])
-            if isinstance(obj, dict) and ("action" in obj or "target" in obj or "steps" in obj or "approved" in obj):
-                return obj
-        except Exception:
-            pass
-
-    # 3. Fallback: return any valid dict found in the string
-    for match in re.finditer(r'\{', cleaned):
-        try:
-            obj, _ = decoder.raw_decode(cleaned[match.start():])
-            if isinstance(obj, dict):
-                return obj
+            norm = normalize_tool_action(obj)
+            if norm:
+                return norm
         except Exception:
             pass
 
@@ -1408,7 +1665,7 @@ async def get_active_models():
     models_to_report = [
         {
             "id": "serenity-supervisor-high",
-            "name": f"Serenity: Supervisor - High Mode ({SUPERVISOR_MODEL})",
+            "name": f"Supervisor - High Mode ({SUPERVISOR_MODEL})",
             "family": "serenity-supervisor",
             "version": "1.0.0",
             "maxInputTokens": 120000,
@@ -1417,7 +1674,7 @@ async def get_active_models():
         },
         {
             "id": "serenity-supervisor-low",
-            "name": f"Serenity: Supervisor - Low Mode ({SUPERVISOR_MODEL})",
+            "name": f"Supervisor - Low Mode ({SUPERVISOR_MODEL})",
             "family": "serenity-supervisor",
             "version": "1.0.0",
             "maxInputTokens": 120000,
@@ -1426,7 +1683,7 @@ async def get_active_models():
         },
         {
             "id": "serenity-supervisor",
-            "name": f"Serenity: Orchestrator ({SUPERVISOR_MODEL}) [Default/High]",
+            "name": f"Orchestrator - Turbo Mode ({SUPERVISOR_MODEL})",
             "family": "serenity-supervisor",
             "version": "1.0.0",
             "maxInputTokens": 120000,
@@ -1440,7 +1697,7 @@ async def get_active_models():
         if gguf_path and os.path.exists(gguf_path):
             models_to_report.append({
                 "id": model_name,
-                "name": f"Serenity: {model_name} (Agent)",
+                "name": f"{model_name} (Agent)",
                 "family": model_name,
                 "version": "1.0.0",
                 "maxInputTokens": 120000,
@@ -1721,9 +1978,9 @@ def execute_mcp_tool_call(tool_name: str, args: dict) -> tuple[str, bool]:
             return f"Error inserting edit: {ex}", True
 
     elif tool_norm in ["replace_string_in_file", "replace_string"]:
-        file_path = args.get("path") or args.get("file")
-        target_content = args.get("target_content", "")
-        new_content = args.get("new_content", "")
+        file_path = args.get("path") or args.get("file") or args.get("file_path") or args.get("filepath") or args.get("target_file")
+        target_content = args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or ""
+        new_content = args.get("new_content") or args.get("replace_string") or args.get("replace_text") or args.get("replacement") or args.get("new") or ""
         if not file_path or not is_path_allowed(file_path):
             return f"Error: Path access restricted or missing: '{file_path}'", True
         if not os.path.exists(file_path):
@@ -2212,6 +2469,10 @@ COMMAND_RULES = [
     (r"^wget\b", False),
     (r"\.env\b", False),
     (r"\b\.env", False),
+    (r"^python(\.exe)?\s+-c\b", False),
+    (r"^py\s+-c\b", False),
+    (r"^python(\.exe)?(\s+-i\b|\s*$)", False),
+    (r"^py(\s+-i\b|\s*$)", False),
 
     # Whitelisted rules
     (r"^cd(\s+|$)", True),
@@ -2293,7 +2554,16 @@ COMMAND_RULES = [
     (r"^pnpm\s+config\s+(list|get)\b", True),
     (r"^npm\s+ci\b", True),
     (r"^yarn\s+install\s+--frozen-lockfile\b", True),
-    (r"^pnpm\s+install\s+--frozen-lockfile\b", True)
+    (r"^pnpm\s+install\s+--frozen-lockfile\b", True),
+    (r"^python(\.exe)?\s+(--version|-V)\b", True),
+    (r"^py\s+(--version|-V)\b", True),
+    (r"^python(\.exe)?\s+-m\s+pip\s+(list|check)\b", True),
+    (r"^py\s+-m\s+pip\s+(list|check)\b", True),
+    (r"^python(\.exe)?\s+[A-Za-z0-9_\-\.\/\\\\]+\.py(\s+.*)?$", True),
+    (r"^py\s+[A-Za-z0-9_\-\.\/\\\\]+\.py(\s+.*)?$", True),
+    (r"^python(\.exe)?\s+-m\s+[A-Za-z0-9_\-\.]+(\s+.*)?$", True),
+    (r"^py\s+-m\s+[A-Za-z0-9_\-\.]+(\s+.*)?$", True),
+    (r"^pytest\b", True)
 ]
 
 def split_command_statements(command_line: str) -> List[str]:
@@ -2355,10 +2625,11 @@ def is_path_allowed(file_path: Optional[str]) -> bool:
         return False
 
 class StreamingThoughtFilter:
-    def __init__(self, start_in_thought: bool = True):
+    def __init__(self, start_in_thought: bool = True, max_buffer_limit: int = 16384):
         self.buffer = ""
         self.in_thought = start_in_thought
         self.thought_started = start_in_thought
+        self.max_buffer_limit = max_buffer_limit
         self.start_tags = [
             "<|channel>thought", "<|channel|>thought", "<channel>thought",
             "<think>", "<|think|>", "<thought>", "<|thought|>"
@@ -2369,6 +2640,18 @@ class StreamingThoughtFilter:
             "</thought>", "</|thought|>"
         ]
         
+    def _is_incomplete_tool_call(self, text: str) -> bool:
+        """Detects if text contains a tool call prefix whose arguments brace/paren has not closed yet."""
+        match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*', text, re.DOTALL)
+        if not match:
+            return False
+        start_idx = match.end()
+        if start_idx < len(text) and text[start_idx] == '{':
+            return _find_balanced_brace(text, start_idx) == -1
+        elif start_idx < len(text) and text[start_idx] == '(':
+            return text.find(')', start_idx) == -1
+        return True
+
     def feed(self, chunk: str) -> str:
         self.buffer += chunk
         
@@ -2379,6 +2662,8 @@ class StreamingThoughtFilter:
                     self.thought_started = True
                     break
             if not self.thought_started and len(self.buffer) > 50:
+                if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
+                    return ""
                 flushed = self.clean_tool_tags(self.buffer)
                 self.buffer = ""
                 return flushed
@@ -2389,26 +2674,28 @@ class StreamingThoughtFilter:
                 if idx != -1:
                     self.in_thought = False
                     self.buffer = self.buffer[idx + len(end_tag):]
+                    if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
+                        return ""
                     flushed = self.clean_tool_tags(self.buffer)
                     self.buffer = ""
                     return flushed
             return ""
         else:
+            if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
+                return ""
             flushed = self.clean_tool_tags(self.buffer)
             self.buffer = ""
             return flushed
 
     def clean_tool_tags(self, text: str) -> str:
-        if not text:
-            return ""
-        # Strip out any native tool call syntax tags if emitted during final synthesis streaming
-        text = re.sub(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:[^\s{\(]+(?:\(.*?\)|\{.*?\})?\s*(?:<\|?tool_call\|?>?|</tool_call>)?', '', text, flags=re.DOTALL)
-        return text
+        return _strip_tool_call_tags(text)
 
     def flush_remaining(self) -> str:
         if self.in_thought:
             return ""
-        return self.clean_tool_tags(self.buffer)
+        flushed = self.clean_tool_tags(self.buffer)
+        self.buffer = ""
+        return flushed
 
 # --- Custom Model Mapping Helpers ---
 MAX_HISTORY_TURNS = 10
@@ -2531,21 +2818,216 @@ Never compromise on security, input validation, or error handling.
                 yield {"type": "progress", "text": f"Worker generating response..."}
                 await asyncio.sleep(0.01)
 
-            # Stream direct completion
+            # Stream direct completion — mini agentic loop to handle native tool calls
+            MAX_STANDALONE_TOOL_LOOPS = 8
+            standalone_loop_count = 0
+            standalone_executed_calls = set()
+            standalone_context_accum = ""
+            current_standalone_prompt = standalone_prompt
+            clean_answer = ""
             try:
-                full_text_accumulated = []
-                thought_filter = StreamingThoughtFilter(start_in_thought=True)
-                async for chunk in generate_completion_stream(resolved_model, standalone_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
-                    full_text_accumulated.append(chunk)
-                    filtered = thought_filter.feed(chunk)
-                    if filtered:
-                        yield {"type": "content", "content": filtered}
-                
-                remaining = thought_filter.flush_remaining()
-                if remaining:
-                    yield {"type": "content", "content": remaining}
+                while standalone_loop_count < MAX_STANDALONE_TOOL_LOOPS:
+                    full_text_accumulated = []
+                    thought_filter = StreamingThoughtFilter(start_in_thought=True)
+                    async for chunk in generate_completion_stream(resolved_model, current_standalone_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
+                        full_text_accumulated.append(chunk)
+                        filtered = thought_filter.feed(chunk)
+                        if filtered:
+                            yield {"type": "content", "content": filtered}
 
-                clean_answer = clean_thought_and_whitespace("".join(full_text_accumulated))
+                    remaining = thought_filter.flush_remaining()
+                    if remaining:
+                        yield {"type": "content", "content": remaining}
+
+                    raw_output = "".join(full_text_accumulated)
+                    clean_answer = clean_thought_and_whitespace(raw_output)
+
+                    # Detect native tool call in output
+                    parsed_tool = extract_json(raw_output)
+                    if parsed_tool and parsed_tool.get("action") == "call_tool":
+                        sa_target_raw = parsed_tool.get("target", "")
+                        sa_payload = parsed_tool.get("arguments_or_instructions", {})
+
+                        # Normalize target alias (same logic as Path B)
+                        sa_target_norm = sa_target_raw.lower().strip()
+                        sa_core = sa_target_norm.split(":")[-1].strip()
+                        if sa_core in ["read_file", "read", "view_file", "cat"]:
+                            sa_target = "mcp:filesystem:read_file"
+                        elif sa_core in ["grep_search", "grep", "search", "search_files"]:
+                            sa_target = "mcp:filesystem:grep_search"
+                        elif sa_core in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
+                            sa_target = "mcp:filesystem:list_directory"
+                        elif sa_core in ["write_file", "write", "create_file"]:
+                            sa_target = "mcp:filesystem:write_file"
+                        elif sa_core in ["insert_edit_into_file", "insert_edit"]:
+                            sa_target = "mcp:filesystem:insert_edit_into_file"
+                        elif sa_core in ["replace_string_in_file", "replace_string"]:
+                            sa_target = "mcp:filesystem:replace_string_in_file"
+                        elif sa_core in ["multi_replace_string_in_file", "multi_replace"]:
+                            sa_target = "mcp:filesystem:multi_replace_string_in_file"
+                        elif sa_core in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
+                            sa_target = "mcp:terminal:run_command"
+                        else:
+                            sa_target = sa_target_raw  # pass-through unknown
+
+                        # Duplicate call guard
+                        sa_sig = (sa_target, str(sa_payload))
+                        if sa_sig in standalone_executed_calls:
+                            log_message(f"[Standalone] Duplicate tool call blocked: {sa_target}")
+                            break
+                        standalone_executed_calls.add(sa_sig)
+
+                        if not is_programmatic:
+                            yield {"type": "progress", "text": f"⚙️ Standalone executing tool {sa_target}..."}
+                            await asyncio.sleep(0.01)
+
+                        # Dispatch — reuse Path B tool logic via inline dispatch
+                        tool_result = ""
+                        sa_step = standalone_loop_count + 1
+
+                        if sa_target == "mcp:terminal:run_command":
+                            try:
+                                args = safe_parse_tool_args(sa_payload, "command")
+                                command = args.get("command") if isinstance(args, dict) else None
+                                if command:
+                                    if not is_command_allowed(command):
+                                        tool_result = f"\n\n[System Tool Error: Command execution blocked by security policy: '{command}']\n"
+                                        log_message(f"[Standalone Constraint] Blocked command: {command}")
+                                    else:
+                                        full_cmd = f"powershell -NoProfile -Command \"{command}\""
+                                        sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
+                                        result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
+                                        tool_result = f"\n\n[System Tool Response: Command Exited with {result.returncode}]\nSTDOUT:\n{result.stdout[:2000]}\nSTDERR:\n{result.stderr[:2000]}\n"
+                                        log_message(f"[Standalone Tool] Executed command: {command}")
+                                else:
+                                    tool_result = "\n\n[System Tool Error: No command provided]\n"
+                            except subprocess.TimeoutExpired:
+                                tool_result = "\n\n[System Tool Error: Command timed out after 30 seconds]\n"
+                            except Exception as e:
+                                tool_result = f"\n\n[System Tool Error: Command failed: {e}]\n"
+
+                        elif sa_target == "mcp:filesystem:list_directory":
+                            try:
+                                args = safe_parse_tool_args(sa_payload, "path")
+                                target_dir = (args.get("path") or args.get("directory") or ".") if isinstance(args, dict) else "."
+                                if not is_path_allowed(target_dir):
+                                    tool_result = f"\n\n[System Tool Error: Access to '{target_dir}' is restricted]\n"
+                                elif not os.path.isdir(target_dir):
+                                    tool_result = f"\n\n[System Tool Error: Directory '{target_dir}' not found]\n"
+                                else:
+                                    files = [f"{f} ({'Dir' if os.path.isdir(os.path.join(target_dir, f)) else f'{os.path.getsize(os.path.join(target_dir, f))} bytes'})" for f in os.listdir(target_dir) if not f.startswith(".") and f != "__pycache__"]
+                                    tool_result = f"\n\n[System Tool Response: Directory Listing for '{target_dir}']\n" + "\n".join(files) + "\n"
+                            except Exception as e:
+                                tool_result = f"\n\n[System Tool Error: list_directory failed: {e}]\n"
+
+                        elif sa_target == "mcp:filesystem:read_file":
+                            try:
+                                file_path, start_line, end_line = parse_read_file_args(sa_payload)
+                                if not file_path or not is_path_allowed(file_path):
+                                    tool_result = f"\n\n[System Tool Error: Access restricted or no path: '{file_path}']\n"
+                                elif os.path.exists(file_path):
+                                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                        lines = f.readlines()
+                                    if start_line and end_line:
+                                        s, e = max(1, int(start_line)), min(len(lines), int(end_line))
+                                        content = "".join(lines[s-1:e])
+                                        tool_result = f"\n\n[System Tool Response: '{file_path}' Lines {s}-{e}]\n{content}\n"
+                                    else:
+                                        content = "".join(lines[:150])
+                                        tool_result = f"\n\n[System Tool Response: '{file_path}']\n{content}\n"
+                                else:
+                                    tool_result = f"\n\n[System Tool Error: File '{file_path}' not found]\n"
+                            except Exception as e:
+                                tool_result = f"\n\n[System Tool Error: read_file failed: {e}]\n"
+
+                        elif sa_target == "mcp:filesystem:write_file":
+                            try:
+                                args = safe_parse_tool_args(sa_payload, "path")
+                                file_path = (args.get("path") or args.get("file") or args.get("target_file")) if isinstance(args, dict) else None
+                                content = (args.get("content") or args.get("code") or args.get("text") or "") if isinstance(args, dict) else ""
+                                if not isinstance(content, str):
+                                    content = str(content)
+                                if not file_path or not is_path_allowed(file_path):
+                                    tool_result = f"\n\n[System Tool Error: Access restricted or no path]\n"
+                                else:
+                                    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+                                    with open(file_path, "w", encoding="utf-8") as f:
+                                        f.write(content)
+                                    tool_result = f"\n\n[System Tool Response: Wrote {len(content)} chars to '{file_path}']\n"
+                                    log_message(f"[Standalone Tool] Wrote file: {file_path}")
+                            except Exception as e:
+                                tool_result = f"\n\n[System Tool Error: write_file failed: {e}]\n"
+
+                        elif sa_target in ["mcp:filesystem:replace_string_in_file", "mcp:filesystem:insert_edit_into_file"]:
+                            try:
+                                args = safe_parse_tool_args(sa_payload, "path")
+                                file_path = (args.get("path") or args.get("file")) if isinstance(args, dict) else None
+                                target_content = (args.get("target_content") or args.get("target") or "") if isinstance(args, dict) else ""
+                                new_content = (args.get("new_content") or args.get("replacement") or args.get("code_to_insert") or "") if isinstance(args, dict) else ""
+                                if not file_path or not is_path_allowed(file_path) or not os.path.exists(file_path):
+                                    tool_result = f"\n\n[System Tool Error: File not found or restricted: '{file_path}']\n"
+                                elif target_content not in open(file_path, encoding="utf-8", errors="ignore").read():
+                                    tool_result = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
+                                else:
+                                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                        fc = f.read()
+                                    if sa_target.endswith("insert_edit_into_file"):
+                                        fc = fc.replace(target_content, target_content + "\n" + new_content, 1)
+                                    else:
+                                        fc = fc.replace(target_content, new_content, 1)
+                                    with open(file_path, "w", encoding="utf-8") as f:
+                                        f.write(fc)
+                                    tool_result = f"\n\n[System Tool Response: Updated '{file_path}' successfully]\n"
+                                    log_message(f"[Standalone Tool] Edited file: {file_path}")
+                            except Exception as e:
+                                tool_result = f"\n\n[System Tool Error: edit failed: {e}]\n"
+
+                        elif sa_target == "mcp:filesystem:grep_search":
+                            try:
+                                args = safe_parse_tool_args(sa_payload, "query")
+                                query = (args.get("query") or args.get("search_term") or args.get("pattern") or "") if isinstance(args, dict) else (args.strip() if isinstance(args, str) else "")
+                                search_dir = (args.get("path") or ".") if isinstance(args, dict) else "."
+                                matches = []
+                                ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
+                                if query and os.path.exists(search_dir):
+                                    for root, dirs, files in os.walk(search_dir):
+                                        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+                                        for file in files:
+                                            if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md")):
+                                                fp = os.path.join(root, file)
+                                                try:
+                                                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                                                        for lnum, line in enumerate(f, 1):
+                                                            if query.lower() in line.lower():
+                                                                matches.append(f"{fp}:{lnum}: {line.strip()}")
+                                                except Exception:
+                                                    pass
+                                tool_result = f"\n\n[System Tool Response: {len(matches)} matches for '{query}']\n" + "\n".join(matches[:20]) + "\n"
+                            except Exception as e:
+                                tool_result = f"\n\n[System Tool Error: grep_search failed: {e}]\n"
+
+                        else:
+                            tool_result = f"\n\n[System Tool Error: Unknown tool target '{sa_target}']\n"
+
+                        # Show tool result in UI
+                        if not is_programmatic and tool_result:
+                            is_err = "error" in tool_result.lower()
+                            open_attr = " open" if is_err else ""
+                            details_md = f"<details{open_attr}>\n<summary><strong>Tool (Step {sa_step}):</strong> <code>{sa_target}</code></summary>\n\n```text\n{tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
+                            yield {"type": "content", "content": details_md}
+                            await asyncio.sleep(0.01)
+
+                        # Append result to prompt for next iteration
+                        standalone_context_accum += tool_result
+                        current_standalone_prompt = (
+                            standalone_prompt.rstrip()
+                            + f"\n{standalone_context_accum}\n<|turn|>\n<|turn>model\n<|channel>thought\n"
+                        )
+                        standalone_loop_count += 1
+                    else:
+                        # No tool call — plain response, we're done
+                        break
+
                 if session_id:
                     sessions_history[session_id].append({
                         "prompt": request.prompt,
@@ -2562,7 +3044,7 @@ Never compromise on security, input validation, or error handling.
                         "worker_model": resolved_model,
                         "reason": "Standalone model selected",
                         "review_badge": "N/A",
-                        "steps": []
+                        "steps": [{"step": i+1, "tool": t, "status": "success"} for i, (t, _) in enumerate(standalone_executed_calls)]
                     }
                 }
             except Exception:
@@ -2655,15 +3137,26 @@ Never compromise on security, input validation, or error handling.
             w4_res = await resolve_model(W4_MODEL)
             log_message(f"[Orchestrator] Resolved Models -> Supervisor/W1: {supervisor_res}, W2: {w2_res}, W3: {w3_res}, W4: {w4_res}")
 
-        # Determine High / Low Mode
+        # Determine Execution Mode (Low / High / Turbo-Orchestrator)
         is_low_mode = (request.model == "serenity-supervisor-low")
-        max_tool_loops = request.max_steps if (isinstance(request.max_steps, int) and request.max_steps > 0) else (10 if is_low_mode else 30)
-        supervisor_temp = 0.1 if is_low_mode else 0.5
-        mode_explanation_prompt = (
-            "- You are running in Low-Resource Efficiency Mode. Output minimal explanations. Keep 'reason' and 'step_summary' fields short, concise, and direct. Focus on token savings and speed.\n"
-            if is_low_mode else
-            "- You are running in High-Capacity Reasoning Mode. Explain your thoughts fully. Detail your plan, rationale, and validation checks in 'reason' and 'step_summary' to ensure maximum accuracy.\n"
-        )
+        is_high_mode = (request.model == "serenity-supervisor-high")
+
+        if isinstance(request.max_steps, int) and request.max_steps > 0:
+            max_tool_loops = request.max_steps
+        elif is_low_mode:
+            max_tool_loops = 8
+        elif is_high_mode:
+            max_tool_loops = 25
+        else:  # Turbo Mode / Orchestrator: Autonomous, nigh-indefinite execution
+            max_tool_loops = 100
+
+        supervisor_temp = 0.1 if is_low_mode else 0.4
+        if is_low_mode:
+            mode_explanation_prompt = "- You are running in Low-Resource Efficiency Mode. Output minimal explanations. Keep 'reason' and 'step_summary' fields short, concise, and direct. Focus on token savings and speed.\n"
+        elif is_high_mode:
+            mode_explanation_prompt = "- You are running in High-Capacity Reasoning Mode. Detail your plan, rationale, and validation checks in 'reason' and 'step_summary' to ensure maximum accuracy.\n"
+        else:
+            mode_explanation_prompt = "- You are running in Autonomous Turbo Orchestrator Mode. Iterate through multi-step plans, spawn Worker sub-agents, execute tools, and oversee planning until full task completion.\n"
 
         # Phase 1: Autonomous Multi-Turn Tool Loop
         tool_loop_count = 0
@@ -2676,6 +3169,10 @@ Never compromise on security, input validation, or error handling.
         worker_context = ""
         worker_tool_responses = []
         executed_tool_calls = set()
+        duplicate_tool_counts = {}
+        delegation_count = 0
+        # Orchestrator: unlimited delegations; High: 5; Low: 3
+        max_delegations = 3 if is_low_mode else (5 if is_high_mode else None)
 
         while tool_loop_count < max_tool_loops:
             routing_prompt = f"""<|turn>system
@@ -2823,7 +3320,7 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     target = "mcp:filesystem:replace_string_in_file"
                 elif core_target in ["multi_replace_string_in_file", "multi_replace"]:
                     target = "mcp:filesystem:multi_replace_string_in_file"
-                elif core_target in ["run_command", "exec", "terminal", "execute"]:
+                elif core_target in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
                     target = "mcp:terminal:run_command"
                 elif core_target in ["create_or_update_plan", "plan"]:
                     target = "mcp:filesystem:create_or_update_plan"
@@ -2836,12 +3333,23 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                     instructions = f"[EXPLORE MODE - READ ONLY] {instructions}"
                 elif mode == "plan":
                     instructions = f"[PLAN MODE - DO NOT MODIFY FILES] {instructions}"
+                delegation_count += 1
+                if max_delegations is not None and delegation_count >= max_delegations:
+                    log_message(f"[Supervisor] Delegation cap ({max_delegations}) reached. Proceeding to worker.")
                 break
 
             # Duplicate tool call guard to prevent infinite re-reading loops
             tool_sig = (target, str(payload_data))
             if tool_sig in executed_tool_calls:
-                log_message(f"[Duplicate Tool Intercepted] Prevented redundant tool call '{target}' with args {payload_data}")
+                dup_count = duplicate_tool_counts.get(tool_sig, 0) + 1
+                duplicate_tool_counts[tool_sig] = dup_count
+                max_allowed_dups = 5 if target == "mcp:terminal:run_command" else 3
+                log_message(f"[Duplicate Tool Intercepted] Redundant tool call '{target}' with args {payload_data} (Attempt {dup_count}/{max_allowed_dups})")
+                if dup_count >= max_allowed_dups:
+                    log_message(f"[Supervisor Loop Guard] Duplicate limit reached for '{target}'. Forcibly breaking loop & routing to W1.")
+                    worker_id = "W1"
+                    instructions = f"Fulfill request using gathered context. Redundant tool call blocked for {target}."
+                    break
                 tool_context = f"\n\n[System Tool Warning: You ALREADY executed {target} with identical arguments in a previous turn. Do NOT call this tool again with identical arguments. Proceed to modify files using edit/write tools or delegate to W1 now.]\n"
                 supervisor_context = f"{supervisor_context}{tool_context}"
                 tool_loop_count += 1
@@ -3348,6 +3856,23 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                 worker_context = "".join(rebuilt_responses)
             else:
                 worker_context = "".join(worker_tool_responses)
+
+            if not is_programmatic and tool_context:
+                step_num = tool_loop_count + 1
+                is_err = "error" in tool_context.lower() or "blocked" in tool_context.lower() or "failed" in tool_context.lower()
+                step_icon = "🔴" if is_err else "🟢"
+                open_attr = " open" if is_err else ""
+                tool_args_str = str(payload_data)
+                if len(tool_args_str) > 120:
+                    tool_args_str = tool_args_str[:120] + "..."
+                tool_summary_text = tool_context.strip()
+                if len(tool_summary_text) > 1000:
+                    tool_summary_text = tool_summary_text[:1000] + "\n... [Truncated for UI display]"
+                
+                details_md = f"<details{open_attr}>\n<summary><strong>Tool ({step_icon} Step {step_num}):</strong> <code>{target}</code> (Args: <code>{tool_args_str}</code>)</summary>\n\n```text\n{tool_summary_text}\n```\n\n</details>\n\n"
+                yield {"type": "content", "content": details_md}
+                await asyncio.sleep(0.01)
+
             tool_loop_count += 1
 
         if tool_loop_count >= max_tool_loops:
@@ -3425,20 +3950,197 @@ Never compromise on security, input validation, or error handling.
             await asyncio.sleep(0.01)
 
         try:
-            worker_draft_parts = []
-            thought_filter = StreamingThoughtFilter(start_in_thought=True)
-            async for chunk in generate_completion_stream(worker_model, worker_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
-                worker_draft_parts.append(chunk)
-                filtered = thought_filter.feed(chunk)
-                if filtered:
-                    yield {"type": "content", "content": filtered}
-            
-            remaining = thought_filter.flush_remaining()
-            if remaining:
-                yield {"type": "content", "content": remaining}
-                
-            worker_draft_raw = "".join(worker_draft_parts)
-            final_answer = clean_thought_and_whitespace(worker_draft_raw)
+            MAX_WORKER_TOOL_LOOPS = 8
+            worker_tool_loop_count = 0
+            worker_executed_calls = set()
+            worker_tool_accum = ""
+            current_worker_prompt = worker_prompt
+            worker_draft_raw = ""
+            final_answer = ""
+
+            while worker_tool_loop_count < MAX_WORKER_TOOL_LOOPS:
+                worker_draft_parts = []
+                thought_filter = StreamingThoughtFilter(start_in_thought=True)
+                async for chunk in generate_completion_stream(worker_model, current_worker_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
+                    worker_draft_parts.append(chunk)
+                    filtered = thought_filter.feed(chunk)
+                    if filtered:
+                        yield {"type": "content", "content": filtered}
+
+                remaining = thought_filter.flush_remaining()
+                if remaining:
+                    yield {"type": "content", "content": remaining}
+
+                worker_draft_raw = "".join(worker_draft_parts)
+                final_answer = clean_thought_and_whitespace(worker_draft_raw)
+
+                # Detect native tool call in worker output
+                w_parsed = extract_json(worker_draft_raw)
+                if w_parsed and w_parsed.get("action") == "call_tool":
+                    w_target_raw = w_parsed.get("target", "")
+                    w_payload = w_parsed.get("arguments_or_instructions", {})
+
+                    # Normalize alias
+                    w_core = w_target_raw.lower().strip().split(":")[-1].strip()
+                    if w_core in ["read_file", "read", "view_file", "cat"]:
+                        w_target = "mcp:filesystem:read_file"
+                    elif w_core in ["grep_search", "grep", "search", "search_files"]:
+                        w_target = "mcp:filesystem:grep_search"
+                    elif w_core in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
+                        w_target = "mcp:filesystem:list_directory"
+                    elif w_core in ["write_file", "write", "create_file"]:
+                        w_target = "mcp:filesystem:write_file"
+                    elif w_core in ["insert_edit_into_file", "insert_edit"]:
+                        w_target = "mcp:filesystem:insert_edit_into_file"
+                    elif w_core in ["replace_string_in_file", "replace_string"]:
+                        w_target = "mcp:filesystem:replace_string_in_file"
+                    elif w_core in ["multi_replace_string_in_file", "multi_replace"]:
+                        w_target = "mcp:filesystem:multi_replace_string_in_file"
+                    elif w_core in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
+                        w_target = "mcp:terminal:run_command"
+                    else:
+                        w_target = w_target_raw
+
+                    w_sig = (w_target, str(w_payload))
+                    if w_sig in worker_executed_calls:
+                        log_message(f"[Worker {worker_id}] Duplicate tool call blocked: {w_target}")
+                        break
+                    worker_executed_calls.add(w_sig)
+
+                    if not is_programmatic:
+                        yield {"type": "progress", "text": f"⚙️ Worker {worker_id} executing tool {w_target}..."}
+                        await asyncio.sleep(0.01)
+
+                    # Dispatch — reuse the same inline dispatch via Path B tool blocks
+                    # (worker shares supervisor context; tool_loop_count set to worker step)
+                    w_tool_result = ""
+                    w_step = tool_loop_count + worker_tool_loop_count + 1
+
+                    if w_target == "mcp:terminal:run_command":
+                        try:
+                            args = safe_parse_tool_args(w_payload, "command")
+                            command = args.get("command") if isinstance(args, dict) else None
+                            if command:
+                                if not is_command_allowed(command):
+                                    w_tool_result = f"\n\n[System Tool Error: Command blocked: '{command}']\n"
+                                else:
+                                    full_cmd = f"powershell -NoProfile -Command \"{command}\""
+                                    sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
+                                    result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
+                                    w_tool_result = f"\n\n[System Tool Response: Exit {result.returncode}]\nSTDOUT:\n{result.stdout[:2000]}\nSTDERR:\n{result.stderr[:2000]}\n"
+                                    log_message(f"[Worker {worker_id} Tool] Executed: {command}")
+                                    agent_steps.append({"step": w_step, "tool": f"run_command: {command}", "status": "success" if result.returncode == 0 else "error", "details": f"Exit {result.returncode}"})
+                            else:
+                                w_tool_result = "\n\n[System Tool Error: No command provided]\n"
+                        except subprocess.TimeoutExpired:
+                            w_tool_result = "\n\n[System Tool Error: Command timed out]\n"
+                        except Exception as e:
+                            w_tool_result = f"\n\n[System Tool Error: {e}]\n"
+
+                    elif w_target == "mcp:filesystem:read_file":
+                        try:
+                            file_path, start_line, end_line = parse_read_file_args(w_payload)
+                            if not file_path or not is_path_allowed(file_path):
+                                w_tool_result = f"\n\n[System Tool Error: Access restricted: '{file_path}']\n"
+                            elif os.path.exists(file_path):
+                                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    lines = f.readlines()
+                                if start_line and end_line:
+                                    s, e = max(1, int(start_line)), min(len(lines), int(end_line))
+                                    w_tool_result = f"\n\n[System Tool Response: '{file_path}' L{s}-{e}]\n{''.join(lines[s-1:e])}\n"
+                                else:
+                                    w_tool_result = f"\n\n[System Tool Response: '{file_path}']\n{''.join(lines[:150])}\n"
+                                agent_steps.append({"step": w_step, "tool": f"read_file: {file_path}", "status": "success", "details": "Read by worker"})
+                            else:
+                                w_tool_result = f"\n\n[System Tool Error: File '{file_path}' not found]\n"
+                        except Exception as e:
+                            w_tool_result = f"\n\n[System Tool Error: read_file: {e}]\n"
+
+                    elif w_target == "mcp:filesystem:write_file":
+                        try:
+                            args = safe_parse_tool_args(w_payload, "path")
+                            file_path = (args.get("path") or args.get("file") or args.get("target_file")) if isinstance(args, dict) else None
+                            content = (args.get("content") or args.get("code") or args.get("text") or "") if isinstance(args, dict) else ""
+                            if not isinstance(content, str):
+                                content = str(content)
+                            if not file_path or not is_path_allowed(file_path):
+                                w_tool_result = "\n\n[System Tool Error: No path or restricted]\n"
+                            else:
+                                os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+                                with open(file_path, "w", encoding="utf-8") as f:
+                                    f.write(content)
+                                w_tool_result = f"\n\n[System Tool Response: Wrote {len(content)} chars to '{file_path}']\n"
+                                agent_steps.append({"step": w_step, "tool": f"write_file: {file_path}", "status": "success", "details": "Written by worker"})
+                        except Exception as e:
+                            w_tool_result = f"\n\n[System Tool Error: write_file: {e}]\n"
+
+                    elif w_target in ["mcp:filesystem:replace_string_in_file", "mcp:filesystem:insert_edit_into_file"]:
+                        try:
+                            args = safe_parse_tool_args(w_payload, "path")
+                            file_path = (args.get("path") or args.get("file")) if isinstance(args, dict) else None
+                            target_content = (args.get("target_content") or args.get("target") or "") if isinstance(args, dict) else ""
+                            new_content = (args.get("new_content") or args.get("replacement") or args.get("code_to_insert") or "") if isinstance(args, dict) else ""
+                            if not file_path or not is_path_allowed(file_path) or not os.path.exists(file_path):
+                                w_tool_result = f"\n\n[System Tool Error: File not found or restricted]\n"
+                            elif target_content not in open(file_path, encoding="utf-8", errors="ignore").read():
+                                w_tool_result = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
+                            else:
+                                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                    fc = f.read()
+                                if w_target.endswith("insert_edit_into_file"):
+                                    fc = fc.replace(target_content, target_content + "\n" + new_content, 1)
+                                else:
+                                    fc = fc.replace(target_content, new_content, 1)
+                                with open(file_path, "w", encoding="utf-8") as f:
+                                    f.write(fc)
+                                w_tool_result = f"\n\n[System Tool Response: Updated '{file_path}']\n"
+                                agent_steps.append({"step": w_step, "tool": f"edit: {file_path}", "status": "success", "details": "Edited by worker"})
+                        except Exception as e:
+                            w_tool_result = f"\n\n[System Tool Error: edit: {e}]\n"
+
+                    elif w_target == "mcp:filesystem:grep_search":
+                        try:
+                            args = safe_parse_tool_args(w_payload, "query")
+                            query = (args.get("query") or args.get("pattern") or "") if isinstance(args, dict) else (args.strip() if isinstance(args, str) else "")
+                            search_dir = (args.get("path") or ".") if isinstance(args, dict) else "."
+                            matches = []
+                            ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
+                            if query and os.path.exists(search_dir):
+                                for root, dirs, files in os.walk(search_dir):
+                                    dirs[:] = [d for d in dirs if d not in ignore_dirs]
+                                    for file in files:
+                                        if file.endswith((".py", ".ts", ".js", ".txt", ".json", ".md")):
+                                            fp = os.path.join(root, file)
+                                            try:
+                                                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                                                    for lnum, line in enumerate(f, 1):
+                                                        if query.lower() in line.lower():
+                                                            matches.append(f"{fp}:{lnum}: {line.strip()}")
+                                            except Exception:
+                                                pass
+                            w_tool_result = f"\n\n[System Tool Response: {len(matches)} matches for '{query}']\n" + "\n".join(matches[:20]) + "\n"
+                        except Exception as e:
+                            w_tool_result = f"\n\n[System Tool Error: grep: {e}]\n"
+
+                    else:
+                        w_tool_result = f"\n\n[System Tool Error: Unknown tool '{w_target}']\n"
+
+                    if not is_programmatic and w_tool_result:
+                        is_err = "error" in w_tool_result.lower()
+                        open_attr = " open" if is_err else ""
+                        details_md = f"<details{open_attr}>\n<summary><strong>Worker Tool (Step {w_step}):</strong> <code>{w_target}</code></summary>\n\n```text\n{w_tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
+                        yield {"type": "content", "content": details_md}
+                        await asyncio.sleep(0.01)
+
+                    worker_tool_accum += w_tool_result
+                    current_worker_prompt = (
+                        worker_prompt.rstrip()
+                        + f"\n{worker_tool_accum}\n<|turn|>\n<|turn>model\n<|channel>thought\n"
+                    )
+                    worker_tool_loop_count += 1
+                else:
+                    break  # no tool call — worker is done
+
         except Exception:
             logging.exception("Worker failure during synthesis")
             yield {"type": "error", "detail": "Worker failure during synthesis due to an internal error."}
