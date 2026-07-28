@@ -101,16 +101,22 @@
     "test": "vscode-test"
   },
   "dependencies": {
-    "axios": "^1.6.0"
+    "axios": "^1.18.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
+<<<<<<< HEAD
     "@types/vscode": "^1.107.0",
     "@vscode/test-cli": "^0.0.11",
     "@vscode/test-electron": "^2.5.2",
     "esbuild": "^0.28.1",
     "eslint": "^10.8.0",
+=======
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "esbuild": "^0.28.1",
+>>>>>>> cc1a3a99df692e02f95f38ff11b2965a1ed83c86
     "npm-run-all": "^4.1.5",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.1"
