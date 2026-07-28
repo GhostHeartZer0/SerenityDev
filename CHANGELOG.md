@@ -2,6 +2,7 @@
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
 ## Version 1.5.2
+- Added `brace-expansion` override (`^5.0.8`) to `package.json` to enforce security patch for nested dependency resolution. [Done]
 - Hardened `axios` against inherited prototype proxy/auth bypass (GHSA-gcfj-64vw-6mp9 / GHSA-xj6q-8x83-jv6g): normalized request configs in `Axios.prototype.request` via `mergeConfig` and `dispatchRequest` using null-prototype own-property checks, and restricted `setProxy` and `mergeConfig` map parsing to own properties (`proxy`, `auth`). [Done]
 - Patched CWE-407 quadratic complexity / DoS vulnerability in `node_modules/shell-quote` (`parse.js`): replaced $O(n^2)$ `acc.concat` in `.reduce()` with linear `forEach`/`push` accumulator mutation and added defensive input length cap (`MAX_INPUT_LENGTH = 1,000,000`). [Done]
 - Patched CWE-93 CRLF injection vulnerability (GHSA-hmw2-7cc7-3qxx) in `node_modules/form-data`: escaped `\r`, `\n`, and `"` as `%0D`, `%0A`, and `%22` in `_multiPartHeader` field names and `_getContentDisposition` filenames. [Done]
