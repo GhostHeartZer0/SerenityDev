@@ -107,7 +107,6 @@
     "@types/vscode": "^1.107.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "@types/Antigravity IDE": "^2.0.0",
     "typescript-eslint": "^8.56.1",
     "eslint": "^9.39.3",
     "esbuild": "^0.27.3",
@@ -115,5 +114,11 @@
     "typescript": "^5.9.3",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.5",
+    "js-yaml": "^4.2.1",
+    "brace-expansion": "^2.1.2",
+    "diff": "^8.0.3"
   }
 }
