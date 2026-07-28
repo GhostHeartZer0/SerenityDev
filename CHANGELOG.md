@@ -2,6 +2,7 @@
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
 ## Version 1.5.2
+- Added `diff` (`^8.0.3`) and `mocha` (`^12.0.0`) overrides to `package.json` to patch `jsdiff` DoS vulnerability (GHSA-73rr-hh4g-fpgx). [Done]
 - Added `brace-expansion` override (`^5.0.8`) to `package.json` to enforce security patch for nested dependency resolution. [Done]
 - Hardened `axios` against inherited prototype proxy/auth bypass (GHSA-gcfj-64vw-6mp9 / GHSA-xj6q-8x83-jv6g): normalized request configs in `Axios.prototype.request` via `mergeConfig` and `dispatchRequest` using null-prototype own-property checks, and restricted `setProxy` and `mergeConfig` map parsing to own properties (`proxy`, `auth`). [Done]
 - Patched CWE-407 quadratic complexity / DoS vulnerability in `node_modules/shell-quote` (`parse.js`): replaced $O(n^2)$ `acc.concat` in `.reduce()` with linear `forEach`/`push` accumulator mutation and added defensive input length cap (`MAX_INPUT_LENGTH = 1,000,000`). [Done]
