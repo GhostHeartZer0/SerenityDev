@@ -19,7 +19,7 @@ the supervisor routes to a system pictured below. To skip all this, select a wor
 ![The general idea behind Supervisor mode.](ModelChart.jpg)
 
 This is simply an extension for Local Agentic purposes, because I'm picky and don't like any available options.
-its not meant to work for many purposes, yet.
+it's not meant to work for many purposes, yet.
 this isn't a professional app, I'm still improving and finding out what works and how to do all this, so consider this a learning experiment project.
 
 > Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
@@ -39,8 +39,8 @@ This extension contributes the following settings:
 
 Probably a lot.
 Blank icon
-further response testing is needed, I just got it responsing again.
-Models reason directly in chat, not seperated properly.
+further response testing is needed, I just got it responding again.
+Models reason directly in chat, not separated properly.
 Additional testing and tweaking overall is still needed 
 
 

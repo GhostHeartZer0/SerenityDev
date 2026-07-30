@@ -1,4 +1,4 @@
-# serenitydevserver.py
+# Added by SerenityDev for testing tool-calling functionality# serenitydevserver.py
 from startup import initialize_environment
 
 try:
@@ -31,6 +31,7 @@ import httpx
 import uvicorn
 import signal
 import cryptography
+import difflib
 
 class SerenityKeyVault:
     """Hardware-bound Key Vault using SHA3-512 & SHAKE-256 (Keccak XOF) multi-factor entropy binding."""
@@ -49,8 +50,9 @@ class SerenityKeyVault:
         except Exception:
             pass
         # 2. BIOS / Motherboard UUID
+        # NOTE: Security hardened - shell=False subprocess execution to prevent string interpolation exploits
         try:
-            res = subprocess.run("wmic csproduct get UUID", shell=True, capture_output=True, text=True, timeout=2)
+            res = subprocess.run(["wmic", "csproduct", "get", "UUID"], shell=False, capture_output=True, text=True, timeout=2)
             if res.returncode == 0 and res.stdout:
                 lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip() and "UUID" not in l]
                 if lines:
@@ -178,6 +180,51 @@ MAX_RESPONSE_LENGTH = 1200          # Character limit for responses to Copilot C
 # KV Cache Compression Settings
 cache_type_k = "f16"
 cache_type_v = "f16"
+
+# --- Security & Validation Helpers ---
+# NOTE: Security hardened - Subprocess command execution & path containment module
+def validate_path_containment(target_path: str, base_workspace: str, allowed_dirs: Optional[List[str]] = None) -> bool:
+    """Validates that target_path stays within base_workspace or user-allowed directories (resolving symlinks)."""
+    if not target_path:
+        return False
+    try:
+        real_target = os.path.realpath(target_path)
+        bases = [os.path.realpath(base_workspace)]
+        if allowed_dirs:
+            for d in allowed_dirs:
+                if d:
+                    bases.append(os.path.realpath(d))
+        for base in bases:
+            if real_target == base or real_target.startswith(base + os.sep):
+                return True
+        return False
+    except Exception:
+        return False
+
+def extract_json(raw_text: str) -> Optional[Dict[str, Any]]:
+    """Safely parses JSON output from LLM responses, stripping code fences and validating structure."""
+    if not raw_text:
+        return None
+    cleaned = raw_text.strip()
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+    elif "```" in cleaned:
+        cleaned = cleaned.split("```")[1].split("```")[0].strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return None
 
 # Global State Management
 inference_lock = asyncio.Lock()
@@ -659,12 +706,14 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                         llm = get_llama_model(model_name, num_ctx)
                         # Dynamically check if prompt length exceeds current context window
                         try:
+                            import math
                             prompt_tokens = llm.tokenize(prompt.encode('utf-8'))
                             token_count = len(prompt_tokens)
-                            # Give a safety buffer (default to 2048 if max_tokens is -1 or None)
-                            headroom = max_tokens if max_tokens > 0 else 2048
-                            required_ctx = token_count + headroom
-                            if required_ctx > llm.n_ctx():
+                            # Give a safety buffer (default to 8192 if max_tokens is -1 or None)
+                            headroom = max_tokens if max_tokens > 0 else 8192
+                            needed_ctx = token_count + headroom
+                            if needed_ctx > llm.n_ctx():
+                                required_ctx = math.ceil(needed_ctx / 8192) * 8192
                                 log_message(f"[Llama-CPP] Prompt tokens ({token_count}) + headroom ({headroom}) exceeds loaded context limit ({llm.n_ctx()}). Dynamic reloading to n_ctx={required_ctx}...")
                                 llm = get_llama_model(model_name, required_ctx)
                         except Exception as token_ex:
@@ -764,10 +813,12 @@ SUPERVISOR_PROMPT = """
 You are the Orchestrator of a multi-agent system. Your goal is to manage tasks by delegating to specialized workers or using available tools.
 
 AVAILABLE WORKERS:
-- Worker 1: Specialized in [Worker 1 Description]
-- Worker 2: Specialized in [Worker 2 Description]
-- Worker 3: Specialized in [Worker 3 Description]
-- Worker 4: Specialized in [Worker 4 Description]
+- gemma-4-26B-A4B-it-qat-UD-Q4_K_XL(Agent): Specializes in complex tasks that require deep reasoning
+- gemma-4-E4B-it-qat-UD-Q4_K_XL(Agent): Specializes in fast and efficient reasoning and architecture tasks
+- codegemma-2b-it(Agent): Specializes in code synthesis and inline autocomplete tasks
+- gemma-4-E4B-it-Coder.Q4_K_M(Agent): Competent, small but suprisingly capable all-around agent
+- codegemma-7b-it-f16(Agent): Specializes in heavy code synthesis and complex programming tasks
+- gemma-4-v2-Q4_K_M(Agent): Built on the 12B architecture for coding + agentic work — writing code, running commands, using tools, debugging, multi-step technical tasks.
 
 AVAILABLE TOOLS:
 - [Tool Name]: [Tool Description]
@@ -1146,13 +1197,14 @@ async def resolve_model(target: str) -> str:
     return SUPERVISOR_MODEL
 
 def clean_thought_and_whitespace(text: str) -> str:
-    """Removes thinking blocks and leading/trailing blank lines/whitespace."""
+    """Removes thinking blocks, tool call tags, and leading/trailing blank lines/whitespace."""
     if not text:
         return ""
     orig_text = text
     text = re.sub(r'ễ.*?ễ', '', text, flags=re.DOTALL)
     text = re.sub(r'<\|?(?:thought|think)\|?>.*?(?:</\|?(?:thought|think)\|?>)', '', text, flags=re.DOTALL)
     text = re.sub(r'<\|?channel\|?>?thought.*?(?:<channel\|?>?)', '', text, flags=re.DOTALL)
+    text = _strip_tool_call_tags(text)
     
     cleaned = text.strip()
     if not cleaned:
@@ -1160,6 +1212,7 @@ def clean_thought_and_whitespace(text: str) -> str:
         unclosed_stripped = orig_text
         unclosed_stripped = re.sub(r'<\|?(?:thought|think)\|?>.*$', '', unclosed_stripped, flags=re.DOTALL)
         unclosed_stripped = re.sub(r'<\|?channel\|?>?thought.*$', '', unclosed_stripped, flags=re.DOTALL)
+        unclosed_stripped = _strip_tool_call_tags(unclosed_stripped)
         cleaned_unclosed = unclosed_stripped.strip()
         if cleaned_unclosed:
             return cleaned_unclosed
@@ -1204,8 +1257,11 @@ def _strip_tool_call_tags(text: str) -> str:
         return ""
     
     # Fast check
-    if "call:" not in text and "<|tool_call" not in text and "<tool_call" not in text and "tool_call" not in text:
+    if "call:" not in text and "<|tool_call" not in text and "<tool_call" not in text and "tool_call" not in text and "```json" not in text:
         return text
+
+    # Pre-pass: Strip markdown code blocks containing tool call JSON
+    text = re.sub(r'```json\s*\{\s*["\']action["\']\s*:\s*["\'](?:call_tool|delegate_worker)["\'].*?```', '', text, flags=re.DOTALL)
 
     result = []
     i = 0
@@ -1865,155 +1921,673 @@ MCP_TOOLS_DEFINITIONS = [
     }
 ]
 
-def execute_mcp_tool_call(tool_name: str, args: dict) -> tuple[str, bool]:
-    """Executes MCP tool call securely, returning (result_text, is_error)."""
-    tool_norm = tool_name.lower().strip().split(":")[-1]
-    
-    if tool_norm in ["read_file", "read"]:
-        file_path = args.get("path") or args.get("file") or args.get("filepath")
-        if not file_path or not is_path_allowed(file_path):
-            return f"Error: Path access restricted or missing: '{file_path}'", True
-        if not os.path.exists(file_path):
-            return f"Error: File not found: '{file_path}'", True
+def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step_num: int = 1) -> Dict[str, Any]:
+    """
+    Centralized Unified Tool Execution Engine.
+    Handles target normalization, mode permissions, security rules, edit backups, diff calculations,
+    line range formatting, output truncation, and returns a structured result dictionary.
+    """
+    target_raw = (target or "").strip()
+    target_norm = target_raw.lower()
+    core = target_norm.split(":")[-1].strip()
+
+    if core in ["read_file", "read", "view_file", "cat"]:
+        normalized_target = "mcp:filesystem:read_file"
+    elif core in ["grep_search", "grep", "search", "search_files"]:
+        normalized_target = "mcp:filesystem:grep_search"
+    elif core in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
+        normalized_target = "mcp:filesystem:list_directory"
+    elif core in ["write_file", "write", "create_file"]:
+        normalized_target = "mcp:filesystem:write_file"
+    elif core in ["insert_edit_into_file", "insert_edit"]:
+        normalized_target = "mcp:filesystem:insert_edit_into_file"
+    elif core in ["replace_string_in_file", "replace_string"]:
+        normalized_target = "mcp:filesystem:replace_string_in_file"
+    elif core in ["multi_replace_string_in_file", "multi_replace"]:
+        normalized_target = "mcp:filesystem:multi_replace_string_in_file"
+    elif core in ["create_or_update_plan", "update_plan", "plan"]:
+        normalized_target = "mcp:filesystem:create_or_update_plan"
+    elif core in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
+        normalized_target = "mcp:terminal:run_command"
+    else:
+        normalized_target = target_raw
+
+    # Read-only mode check
+    is_edit_tool = normalized_target in [
+        "mcp:filesystem:write_file",
+        "mcp:filesystem:insert_edit_into_file",
+        "mcp:filesystem:replace_string_in_file",
+        "mcp:filesystem:multi_replace_string_in_file"
+    ]
+    if mode in ["explore", "plan"] and is_edit_tool:
+        err_msg = f"[System Tool Error: Action blocked. You are in {mode.upper()} mode, which is read-only. Modifying files is forbidden.]"
+        log_message(f"[Constraint Blocked] Blocked write tool {normalized_target} in {mode} mode.")
+        return {
+            "tool_context": f"\n\n{err_msg}\n",
+            "raw_output": err_msg,
+            "is_error": True,
+            "proof_tag": None,
+            "backup_id": None,
+            "status": "error",
+            "details": f"Blocked by read-only mode ({mode})",
+            "target_norm": normalized_target,
+            "file_path": None
+        }
+
+    # 1. run_command
+    if normalized_target == "mcp:terminal:run_command":
         try:
+            args = safe_parse_tool_args(payload_data, "command")
+            command = args.get("command") if isinstance(args, dict) else (payload_data if isinstance(payload_data, str) else None)
+            if command:
+                if not is_command_allowed(command):
+                    err_msg = f"[System Tool Error: Command execution blocked by security policy: '{command}']"
+                    log_message(f"[Constraint Blocked] Blocked command execution: {command}")
+                    return {
+                        "tool_context": f"\n\n{err_msg}\n",
+                        "raw_output": err_msg,
+                        "is_error": True,
+                        "proof_tag": None,
+                        "backup_id": None,
+                        "status": "error",
+                        "details": "Blocked by security policy",
+                        "target_norm": normalized_target,
+                        "file_path": None
+                    }
+                full_cmd = f"powershell -NoProfile -Command \"{command}\""
+                sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
+                result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
+                stdout = result.stdout[:2000] if result.stdout else ""
+                stderr = result.stderr[:2000] if result.stderr else ""
+                is_err = result.returncode != 0
+                out_text = f"Command Exited with {result.returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+                tool_ctx = f"\n\n[System Tool Response: {out_text}]\n"
+                log_message(f"[Tool Success] Executed command: {command}")
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": stdout + stderr,
+                    "is_error": is_err,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "success" if not is_err else "error",
+                    "details": f"Exit {result.returncode}",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            else:
+                return {
+                    "tool_context": "\n\n[System Tool Error: No command provided]\n",
+                    "raw_output": "Error: No command provided",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "No command provided",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+        except subprocess.TimeoutExpired:
+            return {
+                "tool_context": "\n\n[System Tool Error: Command timed out after 30 seconds]\n",
+                "raw_output": "Error: Command timed out after 30 seconds",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Timed out after 30s",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Command failed: {e}]\n",
+                "raw_output": f"Error: Command failed: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": f"Error: {e}",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    # 2. create_or_update_plan
+    elif normalized_target == "mcp:filesystem:create_or_update_plan":
+        try:
+            global active_system_plan
+            args = safe_parse_tool_args(payload_data, "steps")
+            steps = args.get("steps", []) if isinstance(args, dict) else []
+            focus = (args.get("current_focus") or args.get("focus") or "Unknown") if isinstance(args, dict) else "Unknown"
+            active_system_plan = {"focus": focus, "steps": steps}
+            log_message(f"[Tool Success] Plan state updated locally with {len(steps)} steps.")
+            return {
+                "tool_context": f"\n[System: Execution plan successfully synchronized. Current focus: {focus}. Proceed to next step.]\n",
+                "raw_output": f"Plan focus: {focus}, steps: {len(steps)}",
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"Plan focus: {focus}",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Failed to update plan: {e}]\n",
+                "raw_output": f"Error: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Plan update failed",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    # 3. list_directory
+    elif normalized_target == "mcp:filesystem:list_directory":
+        try:
+            args = safe_parse_tool_args(payload_data, "path")
+            target_dir = "."
+            if isinstance(args, dict):
+                target_dir = args.get("path") or args.get("directory") or args.get("dir") or args.get("folder") or "."
+            elif isinstance(args, str) and args.strip():
+                target_dir = args.strip()
+
+            if not is_path_allowed(target_dir):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Access to '{target_dir}' is restricted.]\n",
+                    "raw_output": f"Error: Path access restricted: '{target_dir}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Access restricted",
+                    "target_norm": normalized_target,
+                    "file_path": target_dir
+                }
+            if not os.path.exists(target_dir) or not os.path.isdir(target_dir):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Directory '{target_dir}' not found.]\n",
+                    "raw_output": f"Error: Directory not found: '{target_dir}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Directory not found",
+                    "target_norm": normalized_target,
+                    "file_path": target_dir
+                }
+            files = os.listdir(target_dir)
+            file_list = []
+            for f in files:
+                if f.startswith(".") or f == "__pycache__":
+                    continue
+                full_p = os.path.join(target_dir, f)
+                is_dir = os.path.isdir(full_p)
+                size = os.path.getsize(full_p) if not is_dir else 0
+                file_list.append(f"[{'DIR' if is_dir else 'FILE'}] {f}" + ("" if is_dir else f" ({size} bytes)"))
+
+            total_entries = len(file_list)
+            if total_entries > 100:
+                truncated_list = file_list[:100]
+                raw_out = "\n".join(file_list)
+                tool_ctx = f"\n\n[System Tool Response: Directory Listing for '{target_dir}' (Showing 100 of {total_entries} items)]\n" + "\n".join(truncated_list) + f"\n... [{total_entries - 100} more items omitted] ...\n"
+            else:
+                raw_out = "\n".join(file_list)
+                tool_ctx = f"\n\n[System Tool Response: Directory Listing for '{target_dir}']\n{raw_out}\n"
+
+            log_message(f"[Tool Success] Listed directory '{target_dir}'. Found {total_entries} entries.")
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": raw_out,
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"Found {total_entries} entries",
+                "target_norm": normalized_target,
+                "file_path": target_dir
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: list_directory failed: {e}]\n",
+                "raw_output": f"Error: list_directory failed: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Failed to list directory",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    # 4. read_file
+    elif normalized_target == "mcp:filesystem:read_file":
+        try:
+            file_path, start_line, end_line = parse_read_file_args(payload_data)
+            if not file_path or not is_path_allowed(file_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Access to '{file_path}' is restricted or path missing.]\n",
+                    "raw_output": f"Error: Access restricted or path missing: '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Access restricted",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            if not os.path.exists(file_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: File '{file_path}' was not found.]\n",
+                    "raw_output": f"Error: File not found: '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "File not found",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            lines = content.splitlines()
-            start_line = args.get("start_line")
-            end_line = args.get("end_line")
+                file_contents = f.read()
+
+            file_lines = file_contents.splitlines()
+            total_lines = len(file_lines)
+
             if start_line is not None and end_line is not None:
                 s = max(1, int(start_line))
-                e = min(len(lines), int(end_line))
-                sliced = [f"{i}: {lines[i-1]}" for i in range(s, e + 1)]
-                return "\n".join(sliced), False
-            elif len(lines) > 200:
-                sliced = [f"{i}: {lines[i-1]}" for i in range(1, 151)]
-                return "\n".join(sliced) + f"\n... [Auto-truncated to 150 of {len(lines)} lines] ...", False
+                e = min(total_lines, int(end_line))
+                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[s-1:e], start=s)]
+                response_content = "\n".join(sliced_lines)
+                tool_ctx = f"\n\n[System Tool Response: Contents of file '{file_path}' (Lines {s}-{e} of {total_lines})]\n{response_content}\n"
             else:
-                return "\n".join([f"{i}: {lines[i-1]}" for i in range(1, len(lines) + 1)]), False
-        except Exception as ex:
-            return f"Error reading file '{file_path}': {ex}", True
+                if total_lines > 150:
+                    sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[:100], start=1)]
+                    response_content = "\n".join(sliced_lines)
+                    warn_msg = f"\n... [File too large ({total_lines} lines). Auto-truncated to first 100 lines. Use 'read_file' with 'start_line' and 'end_line' or 'grep_search' to target code.] ...\n"
+                    tool_ctx = f"\n\n[System Tool Response: Contents of file '{file_path}' (First 100 lines of {total_lines})]\n{response_content}{warn_msg}"
+                else:
+                    sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines, start=1)]
+                    response_content = "\n".join(sliced_lines)
+                    tool_ctx = f"\n\n[System Tool Response: Contents of file '{file_path}']\n{response_content}\n"
 
-    elif tool_norm in ["write_file", "write"]:
-        file_path = args.get("path") or args.get("file") or args.get("filepath")
-        content = args.get("content", "")
-        if not file_path or not is_path_allowed(file_path):
-            return f"Error: Path access restricted or missing: '{file_path}'", True
+            log_message(f"[Tool Success] Read {len(file_contents)} characters from: {file_path}")
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": response_content,
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"Read {total_lines} lines",
+                "target_norm": normalized_target,
+                "file_path": file_path
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Failed to read file: {e}]\n",
+                "raw_output": f"Error: Failed to read file: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Failed to read file",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    # 5. write_file
+    elif normalized_target == "mcp:filesystem:write_file":
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+            args = safe_parse_tool_args(payload_data, "path")
+            file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+            content = (args.get("content") or args.get("code") or args.get("text") or args.get("data") or args.get("body") or "") if isinstance(args, dict) else ""
+            if not isinstance(content, str):
+                content = str(content)
+            if not file_path or not is_path_allowed(file_path):
+                return {
+                    "tool_context": "\n\n[System Tool Error: Access restricted or path missing for write_file.]\n",
+                    "raw_output": "Error: Access restricted or path missing for write_file",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Access restricted",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            b_id, old_c = create_edit_backup(file_path)
+            parent_dir = os.path.dirname(file_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            return f"Successfully wrote {len(content)} bytes to '{file_path}'", False
-        except Exception as ex:
-            return f"Error writing to file '{file_path}': {ex}", True
+            dels, adds = calculate_diff_counts(old_c, content)
+            rel_name = os.path.basename(file_path)
+            proof_tag = f"edited:{rel_name}-{dels}+{adds}"
+            tool_ctx = f"\n\n[System Tool Response: Successfully wrote {len(content)} characters to '{file_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
+            log_message(f"[Tool Success] Wrote file: {file_path} ({proof_tag})")
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": f"Successfully wrote {len(content)} bytes to '{file_path}'",
+                "is_error": False,
+                "proof_tag": proof_tag,
+                "backup_id": b_id,
+                "status": "success",
+                "details": f"{proof_tag} (backup:{b_id})",
+                "target_norm": normalized_target,
+                "file_path": file_path
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Failed to write file: {e}]\n",
+                "raw_output": f"Error: Failed to write file: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Failed to write file",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
 
-    elif tool_norm in ["list_directory", "ls", "dir"]:
-        dir_path = args.get("path") or args.get("dir") or "."
-        if not is_path_allowed(dir_path):
-            return f"Error: Path access restricted: '{dir_path}'", True
-        if not os.path.exists(dir_path):
-            return f"Error: Directory not found: '{dir_path}'", True
+    # 6 & 7. insert_edit_into_file / replace_string_in_file
+    elif normalized_target in ["mcp:filesystem:insert_edit_into_file", "mcp:filesystem:replace_string_in_file"]:
         try:
-            entries = []
-            for item in os.listdir(dir_path):
-                full = os.path.join(dir_path, item)
-                kind = "DIR" if os.path.isdir(full) else "FILE"
-                entries.append(f"[{kind}] {item}")
-            return "\n".join(entries), False
-        except Exception as ex:
-            return f"Error listing directory '{dir_path}': {ex}", True
+            args = safe_parse_tool_args(payload_data, "path")
+            file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+            target_content = (args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or "") if isinstance(args, dict) else ""
+            new_content = (args.get("new_content") or args.get("new_string") or args.get("replace_string") or args.get("code_to_insert") or args.get("replacement") or args.get("code") or "") if isinstance(args, dict) else ""
+            if not file_path or not is_path_allowed(file_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n",
+                    "raw_output": f"Error: Path access restricted: '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Access restricted",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            if not os.path.exists(file_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: File '{file_path}' not found.]\n",
+                    "raw_output": f"Error: File not found: '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "File not found",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            b_id, old_c = create_edit_backup(file_path)
+            if target_content in old_c:
+                if normalized_target.endswith("insert_edit_into_file"):
+                    modified = old_c.replace(target_content, target_content + "\n" + new_content, 1)
+                    action_word = "inserted content in"
+                else:
+                    modified = old_c.replace(target_content, new_content, 1)
+                    action_word = "replaced content in"
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(modified)
+                dels, adds = calculate_diff_counts(old_c, modified)
+                rel_name = os.path.basename(file_path)
+                proof_tag = f"edited:{rel_name}-{dels}+{adds}"
+                tool_ctx = f"\n\n[System Tool Response: Successfully {action_word} '{file_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
+                log_message(f"[Tool Success] {action_word}: {file_path} ({proof_tag})")
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Successfully {action_word} '{file_path}'",
+                    "is_error": False,
+                    "proof_tag": proof_tag,
+                    "backup_id": b_id,
+                    "status": "success",
+                    "details": f"{proof_tag} (backup:{b_id})",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            else:
+                tool_ctx = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
+                log_message(f"[Tool Warning] Target content not found in {file_path}")
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Error: target_content not found in '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "warning",
+                    "details": "Target content not found",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Edit failed: {e}]\n",
+                "raw_output": f"Error: Edit failed: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Edit failed",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
 
-    elif tool_norm in ["grep_search", "grep"]:
-        query = args.get("query", "")
-        search_path = args.get("path") or "."
-        if not query:
-            return "Error: Missing search query", True
-        if not is_path_allowed(search_path):
-            return f"Error: Search path restricted: '{search_path}'", True
+    # 8. multi_replace_string_in_file
+    elif normalized_target == "mcp:filesystem:multi_replace_string_in_file":
         try:
-            matches = []
-            compiled_re = re.compile(query, re.IGNORECASE)
-            for root, _, files in os.walk(search_path):
-                if ".git" in root or ".venv" in root or "node_modules" in root:
+            args = safe_parse_tool_args(payload_data, "path")
+            file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+            replacements = args.get("replacements", []) if isinstance(args, dict) else []
+            if isinstance(replacements, dict):
+                replacements = [replacements]
+
+            if not file_path or not is_path_allowed(file_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Access to '{file_path}' is restricted or missing.]\n",
+                    "raw_output": f"Error: Path restricted or missing: '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Access restricted",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            if not os.path.exists(file_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: File '{file_path}' not found.]\n",
+                    "raw_output": f"Error: File not found: '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "File not found",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+            if not replacements or not isinstance(replacements, list):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Replacements list empty or invalid.]\n",
+                    "raw_output": "Error: Replacements list empty or invalid",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Replacements empty",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            modified_content = content
+            applied_count = 0
+            not_found = []
+
+            for idx, r in enumerate(replacements):
+                if not isinstance(r, dict):
                     continue
-                for fname in files:
-                    fpath = os.path.join(root, fname)
-                    if not is_path_allowed(fpath):
-                        continue
-                    try:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                            for idx, line in enumerate(f, start=1):
-                                if compiled_re.search(line):
-                                    matches.append(f"{fpath}:{idx}: {line.strip()}")
-                                    if len(matches) >= 50:
-                                        break
-                    except Exception:
-                        pass
-                    if len(matches) >= 50:
+                target_str = r.get("target") or r.get("target_content") or r.get("search_string") or r.get("old") or r.get("find")
+                replacement_str = r.get("replacement") or r.get("new_content") or r.get("replace_string") or r.get("new")
+                if target_str is None or replacement_str is None:
+                    continue
+                occurrences = modified_content.count(target_str)
+                if occurrences == 0:
+                    not_found.append(f"Replacement {idx+1}: Target string not found (target: {repr(target_str[:50])})")
+                else:
+                    modified_content = modified_content.replace(target_str, replacement_str)
+                    applied_count += occurrences
+
+            if not_found and applied_count == 0:
+                tool_ctx = f"\n\n[System Tool Error: None of the target strings were found in '{file_path}'. No changes were made.]\n"
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Error: None of the targets were found in '{file_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "warning",
+                    "details": "No targets found",
+                    "target_norm": normalized_target,
+                    "file_path": file_path
+                }
+
+            b_id, old_c = create_edit_backup(file_path)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(modified_content)
+            dels, adds = calculate_diff_counts(old_c, modified_content)
+            rel_name = os.path.basename(file_path)
+            proof_tag = f"edited:{rel_name}-{dels}+{adds}"
+            status_msg = f"Successfully applied {applied_count} replacements to '{file_path}'."
+            tool_ctx = f"\n\n[System Tool Response: {status_msg}]\nPROOF: {proof_tag} (backup:{b_id})\n"
+            log_message(f"[Tool Success] Multi-replaced {applied_count} occurrences in {file_path} ({proof_tag})")
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": status_msg,
+                "is_error": False,
+                "proof_tag": proof_tag,
+                "backup_id": b_id,
+                "status": "success",
+                "details": f"{proof_tag} (backup:{b_id})",
+                "target_norm": normalized_target,
+                "file_path": file_path
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Multi-replace failed: {e}]\n",
+                "raw_output": f"Error: Multi-replace failed: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Multi-replace failed",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    # 9. grep_search
+    elif normalized_target == "mcp:filesystem:grep_search":
+        try:
+            args = safe_parse_tool_args(payload_data, "query")
+            query = ""
+            search_dir = "."
+            if isinstance(args, dict):
+                query = args.get("query") or args.get("search_term") or args.get("term") or args.get("pattern") or args.get("text") or args.get("search_string") or args.get("grep") or ""
+                search_dir = args.get("path") or args.get("directory") or args.get("dir") or "."
+            elif isinstance(args, str):
+                query = args.strip()
+
+            matches = []
+            ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
+            if query and os.path.exists(search_dir):
+                for root, dirs, files in os.walk(search_dir):
+                    dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+                    for file in files:
+                        if file.startswith(".env") or not is_path_allowed(file):
+                            continue
+                        if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md", ".java", ".cpp", ".h")):
+                            path = os.path.join(root, file)
+                            try:
+                                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                                    for line_num, line in enumerate(f, 1):
+                                        if query.lower() in line.lower():
+                                            matches.append(f"{path}:{line_num}: {line.strip()}")
+                                            if len(matches) >= 100:
+                                                break
+                            except Exception:
+                                pass
+                        if len(matches) >= 100:
+                            break
+                    if len(matches) >= 100:
                         break
-                if len(matches) >= 50:
-                    break
-            return "\n".join(matches) if matches else "No matches found.", False
-        except Exception as ex:
-            return f"Error during grep search: {ex}", True
 
-    elif tool_norm in ["insert_edit_into_file", "insert_edit"]:
-        file_path = args.get("path") or args.get("file")
-        target_content = args.get("target_content", "")
-        new_content = args.get("new_content", "")
-        if not file_path or not is_path_allowed(file_path):
-            return f"Error: Path access restricted or missing: '{file_path}'", True
-        if not os.path.exists(file_path):
-            return f"Error: File not found: '{file_path}'", True
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            if target_content not in content:
-                return f"Error: target_content not found in '{file_path}'", True
-            modified = content.replace(target_content, target_content + "\n" + new_content, 1)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(modified)
-            return f"Successfully inserted content into '{file_path}'", False
-        except Exception as ex:
-            return f"Error inserting edit: {ex}", True
-
-    elif tool_norm in ["replace_string_in_file", "replace_string"]:
-        file_path = args.get("path") or args.get("file") or args.get("file_path") or args.get("filepath") or args.get("target_file")
-        target_content = args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or ""
-        new_content = args.get("new_content") or args.get("replace_string") or args.get("replace_text") or args.get("replacement") or args.get("new") or ""
-        if not file_path or not is_path_allowed(file_path):
-            return f"Error: Path access restricted or missing: '{file_path}'", True
-        if not os.path.exists(file_path):
-            return f"Error: File not found: '{file_path}'", True
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            if target_content not in content:
-                return f"Error: target_content not found in '{file_path}'", True
-            modified = content.replace(target_content, new_content, 1)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(modified)
-            return f"Successfully replaced content in '{file_path}'", False
-        except Exception as ex:
-            return f"Error replacing content: {ex}", True
-
-    elif tool_norm in ["run_command", "exec"]:
-        command = args.get("command", "")
-        if not command:
-            return "Error: Missing command parameter", True
-        if not is_command_allowed(command):
-            return f"Error: Command execution blocked by security policy: '{command}'", True
-        try:
-            proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
-            output = proc.stdout + proc.stderr
-            return output if output else "[Command finished with no output]", proc.returncode != 0
-        except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 30 seconds", True
-        except Exception as ex:
-            return f"Error running command: {ex}", True
+            if matches:
+                total = len(matches)
+                sliced = matches[:20]
+                tool_ctx = f"\n\n[System Tool Response: Found {total} matches for grep query '{query}']\n" + "\n".join(sliced) + ("\n... [Truncated context] ...\n" if total > 20 else "\n")
+                log_message(f"[Tool Success] Grep found {total} matches for '{query}'.")
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": "\n".join(matches),
+                    "is_error": False,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "success",
+                    "details": f"Found {total} matches",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            else:
+                tool_ctx = f"\n\n[System Tool Response: No occurrences of '{query}' were found in the workspace.]\n"
+                log_message(f"[Tool Warning] Grep found 0 matches for '{query}'.")
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"No matches found for '{query}'",
+                    "is_error": False,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "warning",
+                    "details": "0 matches found",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Grep search failed: {e}]\n",
+                "raw_output": f"Error: Grep search failed: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Grep search failed",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
 
     else:
-        return f"Error: Tool '{tool_name}' is not supported", True
+        err_msg = f"[System Tool Error: Tool '{target_raw}' is unknown or not supported]"
+        return {
+            "tool_context": f"\n\n{err_msg}\n",
+            "raw_output": err_msg,
+            "is_error": True,
+            "proof_tag": None,
+            "backup_id": None,
+            "status": "error",
+            "details": f"Unknown tool: {target_raw}",
+            "target_norm": normalized_target,
+            "file_path": None
+        }
+
+def execute_mcp_tool_call(tool_name: str, args: dict) -> tuple[str, bool]:
+    """Executes MCP tool call securely via central dispatch engine, returning (result_text, is_error)."""
+    res = dispatch_tool_call(tool_name, args, mode="agent", step_num=1)
+    return res["raw_output"] or res["tool_context"].strip(), res["is_error"]
 
 @app.api_route("/mcp", methods=["GET", "POST"])
 async def mcp_streamable_http_endpoint(request: Request):
@@ -2624,6 +3198,35 @@ def is_path_allowed(file_path: Optional[str]) -> bool:
     except Exception:
         return False
 
+file_edit_backups: Dict[str, Dict[str, Any]] = {}
+
+def create_edit_backup(file_path: str) -> tuple:
+    """Reads current file content before edit and returns (backup_id, old_content)."""
+    old_content = ""
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                old_content = f.read()
+        except Exception:
+            pass
+    backup_id = f"bak_{uuid.uuid4().hex[:8]}"
+    file_edit_backups[backup_id] = {
+        "file_path": os.path.abspath(file_path),
+        "content": old_content,
+        "timestamp": time.time()
+    }
+    return backup_id, old_content
+
+def calculate_diff_counts(old_content: str, new_content: str) -> tuple:
+    """Calculates lines removed and added using difflib unified_diff."""
+    old_lines = old_content.splitlines()
+    new_lines = new_content.splitlines()
+    diff = list(difflib.unified_diff(old_lines, new_lines, lineterm=""))
+    dels = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    adds = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    return dels, adds
+
+
 class StreamingThoughtFilter:
     def __init__(self, start_in_thought: bool = True, max_buffer_limit: int = 16384):
         self.buffer = ""
@@ -2641,9 +3244,17 @@ class StreamingThoughtFilter:
         ]
         
     def _is_incomplete_tool_call(self, text: str) -> bool:
-        """Detects if text contains a tool call prefix whose arguments brace/paren has not closed yet."""
+        """Detects if text contains a tool call prefix whose arguments brace/paren has not closed yet, or trailing partial tags."""
+        if not text:
+            return False
+        # Check for trailing partial tag or call prefix at the end of text
+        if re.search(r'(?:<\|?tool_call\|?>?|<\|?channel\|?>*|<tool_call|call:?|call:[^\s{\(]*)$', text.strip(), re.DOTALL):
+            return True
         match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*', text, re.DOTALL)
         if not match:
+            # Also check for markdown json block starting for tool call
+            if re.search(r'```json\s*\{\s*["\']action["\']\s*:\s*["\']call_tool["\']', text, re.DOTALL) and not text.rstrip().endswith("```"):
+                return True
             return False
         start_idx = match.end()
         if start_idx < len(text) and text[start_idx] == '{':
@@ -2881,140 +3492,17 @@ Never compromise on security, input validation, or error handling.
                             yield {"type": "progress", "text": f"⚙️ Standalone executing tool {sa_target}..."}
                             await asyncio.sleep(0.01)
 
-                        # Dispatch — reuse Path B tool logic via inline dispatch
-                        tool_result = ""
+                        # Dispatch — execute via unified tool engine
                         sa_step = standalone_loop_count + 1
+                        res = dispatch_tool_call(sa_target, sa_payload, mode="agent", step_num=sa_step)
+                        tool_result = res["tool_context"]
+                        sa_target = res["target_norm"]
 
-                        if sa_target == "mcp:terminal:run_command":
-                            try:
-                                args = safe_parse_tool_args(sa_payload, "command")
-                                command = args.get("command") if isinstance(args, dict) else None
-                                if command:
-                                    if not is_command_allowed(command):
-                                        tool_result = f"\n\n[System Tool Error: Command execution blocked by security policy: '{command}']\n"
-                                        log_message(f"[Standalone Constraint] Blocked command: {command}")
-                                    else:
-                                        full_cmd = f"powershell -NoProfile -Command \"{command}\""
-                                        sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
-                                        result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
-                                        tool_result = f"\n\n[System Tool Response: Command Exited with {result.returncode}]\nSTDOUT:\n{result.stdout[:2000]}\nSTDERR:\n{result.stderr[:2000]}\n"
-                                        log_message(f"[Standalone Tool] Executed command: {command}")
-                                else:
-                                    tool_result = "\n\n[System Tool Error: No command provided]\n"
-                            except subprocess.TimeoutExpired:
-                                tool_result = "\n\n[System Tool Error: Command timed out after 30 seconds]\n"
-                            except Exception as e:
-                                tool_result = f"\n\n[System Tool Error: Command failed: {e}]\n"
-
-                        elif sa_target == "mcp:filesystem:list_directory":
-                            try:
-                                args = safe_parse_tool_args(sa_payload, "path")
-                                target_dir = (args.get("path") or args.get("directory") or ".") if isinstance(args, dict) else "."
-                                if not is_path_allowed(target_dir):
-                                    tool_result = f"\n\n[System Tool Error: Access to '{target_dir}' is restricted]\n"
-                                elif not os.path.isdir(target_dir):
-                                    tool_result = f"\n\n[System Tool Error: Directory '{target_dir}' not found]\n"
-                                else:
-                                    files = [f"{f} ({'Dir' if os.path.isdir(os.path.join(target_dir, f)) else f'{os.path.getsize(os.path.join(target_dir, f))} bytes'})" for f in os.listdir(target_dir) if not f.startswith(".") and f != "__pycache__"]
-                                    tool_result = f"\n\n[System Tool Response: Directory Listing for '{target_dir}']\n" + "\n".join(files) + "\n"
-                            except Exception as e:
-                                tool_result = f"\n\n[System Tool Error: list_directory failed: {e}]\n"
-
-                        elif sa_target == "mcp:filesystem:read_file":
-                            try:
-                                file_path, start_line, end_line = parse_read_file_args(sa_payload)
-                                if not file_path or not is_path_allowed(file_path):
-                                    tool_result = f"\n\n[System Tool Error: Access restricted or no path: '{file_path}']\n"
-                                elif os.path.exists(file_path):
-                                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                        lines = f.readlines()
-                                    if start_line and end_line:
-                                        s, e = max(1, int(start_line)), min(len(lines), int(end_line))
-                                        content = "".join(lines[s-1:e])
-                                        tool_result = f"\n\n[System Tool Response: '{file_path}' Lines {s}-{e}]\n{content}\n"
-                                    else:
-                                        content = "".join(lines[:150])
-                                        tool_result = f"\n\n[System Tool Response: '{file_path}']\n{content}\n"
-                                else:
-                                    tool_result = f"\n\n[System Tool Error: File '{file_path}' not found]\n"
-                            except Exception as e:
-                                tool_result = f"\n\n[System Tool Error: read_file failed: {e}]\n"
-
-                        elif sa_target == "mcp:filesystem:write_file":
-                            try:
-                                args = safe_parse_tool_args(sa_payload, "path")
-                                file_path = (args.get("path") or args.get("file") or args.get("target_file")) if isinstance(args, dict) else None
-                                content = (args.get("content") or args.get("code") or args.get("text") or "") if isinstance(args, dict) else ""
-                                if not isinstance(content, str):
-                                    content = str(content)
-                                if not file_path or not is_path_allowed(file_path):
-                                    tool_result = f"\n\n[System Tool Error: Access restricted or no path]\n"
-                                else:
-                                    os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-                                    with open(file_path, "w", encoding="utf-8") as f:
-                                        f.write(content)
-                                    tool_result = f"\n\n[System Tool Response: Wrote {len(content)} chars to '{file_path}']\n"
-                                    log_message(f"[Standalone Tool] Wrote file: {file_path}")
-                            except Exception as e:
-                                tool_result = f"\n\n[System Tool Error: write_file failed: {e}]\n"
-
-                        elif sa_target in ["mcp:filesystem:replace_string_in_file", "mcp:filesystem:insert_edit_into_file"]:
-                            try:
-                                args = safe_parse_tool_args(sa_payload, "path")
-                                file_path = (args.get("path") or args.get("file")) if isinstance(args, dict) else None
-                                target_content = (args.get("target_content") or args.get("target") or "") if isinstance(args, dict) else ""
-                                new_content = (args.get("new_content") or args.get("replacement") or args.get("code_to_insert") or "") if isinstance(args, dict) else ""
-                                if not file_path or not is_path_allowed(file_path) or not os.path.exists(file_path):
-                                    tool_result = f"\n\n[System Tool Error: File not found or restricted: '{file_path}']\n"
-                                elif target_content not in open(file_path, encoding="utf-8", errors="ignore").read():
-                                    tool_result = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
-                                else:
-                                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                        fc = f.read()
-                                    if sa_target.endswith("insert_edit_into_file"):
-                                        fc = fc.replace(target_content, target_content + "\n" + new_content, 1)
-                                    else:
-                                        fc = fc.replace(target_content, new_content, 1)
-                                    with open(file_path, "w", encoding="utf-8") as f:
-                                        f.write(fc)
-                                    tool_result = f"\n\n[System Tool Response: Updated '{file_path}' successfully]\n"
-                                    log_message(f"[Standalone Tool] Edited file: {file_path}")
-                            except Exception as e:
-                                tool_result = f"\n\n[System Tool Error: edit failed: {e}]\n"
-
-                        elif sa_target == "mcp:filesystem:grep_search":
-                            try:
-                                args = safe_parse_tool_args(sa_payload, "query")
-                                query = (args.get("query") or args.get("search_term") or args.get("pattern") or "") if isinstance(args, dict) else (args.strip() if isinstance(args, str) else "")
-                                search_dir = (args.get("path") or ".") if isinstance(args, dict) else "."
-                                matches = []
-                                ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
-                                if query and os.path.exists(search_dir):
-                                    for root, dirs, files in os.walk(search_dir):
-                                        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
-                                        for file in files:
-                                            if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md")):
-                                                fp = os.path.join(root, file)
-                                                try:
-                                                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                                                        for lnum, line in enumerate(f, 1):
-                                                            if query.lower() in line.lower():
-                                                                matches.append(f"{fp}:{lnum}: {line.strip()}")
-                                                except Exception:
-                                                    pass
-                                tool_result = f"\n\n[System Tool Response: {len(matches)} matches for '{query}']\n" + "\n".join(matches[:20]) + "\n"
-                            except Exception as e:
-                                tool_result = f"\n\n[System Tool Error: grep_search failed: {e}]\n"
-
-                        else:
-                            tool_result = f"\n\n[System Tool Error: Unknown tool target '{sa_target}']\n"
-
-                        # Show tool result in UI
+                        # Emit tool result as progress update
                         if not is_programmatic and tool_result:
-                            is_err = "error" in tool_result.lower()
-                            open_attr = " open" if is_err else ""
-                            details_md = f"<details{open_attr}>\n<summary><strong>Tool (Step {sa_step}):</strong> <code>{sa_target}</code></summary>\n\n```text\n{tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
-                            yield {"type": "content", "content": details_md}
+                            is_err = res["is_error"]
+                            step_icon = "🔴" if is_err else "🟢"
+                            yield {"type": "progress", "text": f"⚙️ {step_icon} Standalone step {sa_step}: {sa_target}"}
                             await asyncio.sleep(0.01)
 
                         # Append result to prompt for next iteration
@@ -3360,484 +3848,20 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                 yield {"type": "progress", "text": f"⚙️ Supervisor executing tool {target}..."}
                 await asyncio.sleep(0.01)
 
-            # Execute tool code
-            tool_context = ""
-            full_tool_context = None
+            # Execute tool code via unified dispatch engine
+            step_num = tool_loop_count + 1
+            res = dispatch_tool_call(target, payload_data, mode=mode, step_num=step_num)
+            tool_context = res["tool_context"]
+            full_tool_context = tool_context
+            target = res["target_norm"]
 
-            # Hardened constraint check for read-only modes
-            if mode in ["explore", "plan"] and target in [
-                "mcp:filesystem:write_file",
-                "mcp:filesystem:insert_edit_into_file",
-                "mcp:filesystem:replace_string_in_file",
-                "mcp:filesystem:multi_replace_string_in_file"
-            ]:
-                tool_context = f"\n\n[System Tool Error: Action blocked. You are in {mode.upper()} mode, which is read-only. Modifying files is forbidden.]\n"
-                log_message(f"[Constraint Blocked] Blocked write tool {target} in {mode} mode.")
-                agent_steps.append({
-                    "step": tool_loop_count + 1,
-                    "tool": target,
-                    "status": "error",
-                    "details": "Blocked by read-only mode"
-                })
+            agent_steps.append({
+                "step": step_num,
+                "tool": f"{target.split(':')[-1]}: {res['file_path'] or ''}".strip(": "),
+                "status": res["status"],
+                "details": res["details"]
+            })
 
-            if target == "mcp:terminal:run_command":
-                try:
-                    args = safe_parse_tool_args(payload_data, "command")
-                    command = args.get("command")
-                    if command:
-                        if not is_command_allowed(command):
-                            tool_context = f"\n\n[System Tool Error: Command execution blocked by security policy: '{command}']\n"
-                            log_message(f"[Constraint Blocked] Blocked command execution: {command}")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"run_command: {command}",
-                                "status": "error",
-                                "details": "Blocked by security policy"
-                            })
-                        else:
-                            # Wrap command in PowerShell to support standard aliases like 'ls'
-                            full_cmd = f"powershell -NoProfile -Command \"{command}\""
-                            sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
-                            result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
-                        stdout = result.stdout[:2000]
-                        stderr = result.stderr[:2000]
-                        tool_context = f"\n\n[System Tool Response: Command Exited with {result.returncode}]\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}\n"
-                        log_message(f"[Tool Success] Executed command: {command}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"run_command: {command}",
-                            "status": "success" if result.returncode == 0 else "error",
-                            "details": f"Exit {result.returncode}"
-                        })
-                    else:
-                        tool_context = f"\n\n[System Tool Error: No command provided]\n"
-                except subprocess.TimeoutExpired:
-                    tool_context = f"\n\n[System Tool Error: Command timed out after 30 seconds]\n"
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Command failed: {e}]\n"
-
-            elif target == "mcp:filesystem:create_or_update_plan":
-                try:
-                    args = safe_parse_tool_args(payload_data, "steps")
-                    steps = args.get("steps", [])
-                    focus = args.get("current_focus", "Unknown")
-                    active_system_plan = {"focus": focus, "steps": steps}
-                    tool_context = f"\n[System: Execution plan successfully synchronized. Current focus: {focus}. Proceed to next step.]\n"
-                    log_message(f"[Tool Success] Plan state updated locally with {len(steps)} steps.")
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "create_or_update_plan",
-                        "status": "success",
-                        "details": f"Plan focus: {focus}"
-                    })
-                except Exception as e:
-                    tool_context = f"\n\n[System Tool Error: Failed to update plan: {str(e)}]\n"
-
-            elif target == "mcp:filesystem:list_directory":
-                try:
-                    args = safe_parse_tool_args(payload_data, "path")
-                    target_dir = "."
-                    if isinstance(args, dict):
-                        target_dir = args.get("path") or args.get("directory") or args.get("dir") or args.get("folder") or "."
-                    elif isinstance(args, str) and args.strip():
-                        target_dir = args.strip()
-
-                    if not is_path_allowed(target_dir):
-                        tool_context = f"\n\n[System Tool Error: Access to '{target_dir}' is restricted for security.]\n"
-                    elif not os.path.exists(target_dir) or not os.path.isdir(target_dir):
-                        tool_context = f"\n\n[System Tool Error: Directory '{target_dir}' not found.]\n"
-                    else:
-                        files = os.listdir(target_dir)
-                        file_list = []
-                        for f in files:
-                            if f.startswith(".") or f == "__pycache__":
-                                continue
-                            full_p = os.path.join(target_dir, f)
-                            is_dir = os.path.isdir(full_p)
-                            size = os.path.getsize(full_p) if not is_dir else 0
-                            file_list.append(f"{f} ({'Dir' if is_dir else f'{size} bytes'})")
-                        tool_context = f"\n\n[System Tool Response: Directory Listing for '{target_dir}']\n" + "\n".join(file_list) + "\n"
-                        log_message(f"[Tool Success] Listed directory '{target_dir}'. Found {len(file_list)} entries.")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"list_directory: {target_dir}",
-                            "status": "success",
-                            "details": step_summary
-                        })
-                except Exception:
-                    logging.exception("[Tool Error] List directory failed")
-                    tool_context = "\n\n[System Tool Error: Failed to list directory]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "list_directory",
-                        "status": "error",
-                        "details": "Failed to list directory due to an internal error."
-                    })
-
-            elif target == "mcp:filesystem:read_file":
-                try:
-                    file_path, start_line, end_line = parse_read_file_args(payload_data)
-                    if file_path and not is_path_allowed(file_path):
-                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
-                        log_message(f"[Tool Error] Access restricted: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"read_file: {file_path}",
-                            "status": "error",
-                            "details": "Access restricted"
-                        })
-                    elif file_path and os.path.exists(file_path):
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                             file_contents = f.read()
-                        
-                        file_lines = file_contents.splitlines()
-                        total_lines = len(file_lines)
-                        
-                        if start_line is not None and end_line is not None:
-                            try:
-                                s = max(1, int(start_line))
-                                e = min(total_lines, int(end_line))
-                                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[s-1:e], start=s)]
-                                response_content = "\n".join(sliced_lines)
-                                full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}' (Lines {s}-{e} of {total_lines})]\n{response_content}\n"
-                            except Exception as ex:
-                                raise ValueError(f"Invalid line range parameters: {ex}")
-                        else:
-                            # Auto-truncation threshold for files without explicit ranges
-                            if len(file_lines) > 150:
-                                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[:100], start=1)]
-                                response_content = "\n".join(sliced_lines)
-                                warn_msg = f"\n... [File too large ({len(file_lines)} lines). Auto-truncated to first 100 lines to prevent bloat. Use 'read_file' with 'start_line' and 'end_line' or use 'grep_search' to locate target code.] ...\n"
-                                full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}' (First 100 lines of {total_lines})]\n{response_content}{warn_msg}"
-                            else:
-                                sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines, start=1)]
-                                response_content = "\n".join(sliced_lines)
-                                full_tool_context = f"\n\n[System Tool Response: Contents of file '{file_path}']\n{response_content}\n"
-                        
-                        tool_context = full_tool_context
-                        log_message(f"[Tool Success] Read {len(file_contents)} characters from: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"read_file: {file_path}",
-                            "status": "success",
-                            "details": step_summary
-                        })
-                    else:
-                        tool_context = f"\n\n[System Tool Error: File '{file_path}' was not found in the workspace.]\n"
-                        log_message(f"[Tool Error] File not found: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"read_file: {file_path}",
-                            "status": "error",
-                            "details": "File not found"
-                        })
-                except Exception:
-                    logging.exception("[Tool Error] Read file failed")
-                    tool_context = "\n\n[System Tool Error: Failed to read file]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "read_file",
-                        "status": "error",
-                        "details": "Failed to read file due to an internal error."
-                    })
-
-            elif target == "mcp:filesystem:insert_edit_into_file":
-                try:
-                    args = safe_parse_tool_args(payload_data, "path")
-                    file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
-                    target_content = (args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or "") if isinstance(args, dict) else ""
-                    new_content = (args.get("new_content") or args.get("new_string") or args.get("replace_string") or args.get("code_to_insert") or args.get("code") or "") if isinstance(args, dict) else ""
-                    if file_path and not is_path_allowed(file_path):
-                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
-                        log_message(f"[Tool Error] Access restricted: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"insert_edit_into_file: {file_path}",
-                            "status": "error",
-                            "details": "Access restricted"
-                        })
-                    elif file_path and os.path.exists(file_path):
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        if target_content in content:
-                            modified = content.replace(target_content, target_content + "\n" + new_content, 1)
-                            with open(file_path, "w", encoding="utf-8") as f:
-                                f.write(modified)
-                            tool_context = f"\n\n[System Tool Response: Successfully inserted content in '{file_path}']\n"
-                            log_message(f"[Tool Success] Inserted content in: {file_path}")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"insert_edit_into_file: {file_path}",
-                                "status": "success",
-                                "details": step_summary
-                            })
-                        else:
-                            tool_context = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
-                            log_message(f"[Tool Warning] insert_edit_into_file target_content not found in {file_path}")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"insert_edit_into_file: {file_path}",
-                                "status": "warning",
-                                "details": "Target content not found"
-                            })
-                    else:
-                        tool_context = f"\n\n[System Tool Error: File '{file_path}' not found]\n"
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"insert_edit_into_file: {file_path}",
-                            "status": "error",
-                            "details": "File not found"
-                        })
-                except Exception:
-                    logging.exception("[Tool Error] Insert content failed")
-                    tool_context = "\n\n[System Tool Error: Failed to insert content]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "insert_edit_into_file",
-                        "status": "error",
-                        "details": "Failed to insert content due to an internal error."
-                    })
-
-            elif target == "mcp:filesystem:replace_string_in_file":
-                try:
-                    args = safe_parse_tool_args(payload_data, "path")
-                    file_path = (args.get("path") or args.get("file") or args.get("filepath")) if isinstance(args, dict) else None
-                    target_content = (args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or "") if isinstance(args, dict) else ""
-                    new_content = (args.get("new_content") or args.get("replace_string") or args.get("replace_text") or args.get("replacement") or args.get("new") or "") if isinstance(args, dict) else ""
-                    if file_path and not is_path_allowed(file_path):
-                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
-                        log_message(f"[Tool Error] Access restricted: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"replace_string_in_file: {file_path}",
-                            "status": "error",
-                            "details": "Access restricted"
-                        })
-                    elif file_path and os.path.exists(file_path):
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        if target_content in content:
-                            modified = content.replace(target_content, new_content, 1)
-                            with open(file_path, "w", encoding="utf-8") as f:
-                                f.write(modified)
-                            tool_context = f"\n\n[System Tool Response: Successfully replaced content in '{file_path}']\n"
-                            log_message(f"[Tool Success] Replaced content in: {file_path}")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"replace_string_in_file: {file_path}",
-                                "status": "success",
-                                "details": step_summary
-                            })
-                        else:
-                            tool_context = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
-                            log_message(f"[Tool Warning] replace_string_in_file target_content not found in {file_path}")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"replace_string_in_file: {file_path}",
-                                "status": "warning",
-                                "details": "Target content not found"
-                            })
-                    else:
-                        tool_context = f"\n\n[System Tool Error: File '{file_path}' not found]\n"
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"replace_string_in_file: {file_path}",
-                            "status": "error",
-                            "details": "File not found"
-                        })
-                except Exception:
-                    logging.exception("[Tool Error] Replace content failed")
-                    tool_context = "\n\n[System Tool Error: Failed to replace content]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "replace_string_in_file",
-                        "status": "error",
-                        "details": "Failed to replace content due to an internal error."
-                    })
-
-            elif target == "mcp:filesystem:write_file":
-                try:
-                    args = safe_parse_tool_args(payload_data, "path")
-                    file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
-                    content = (args.get("content") or args.get("code") or args.get("text") or args.get("data") or args.get("body") or "") if isinstance(args, dict) else ""
-                    if not isinstance(content, str):
-                        content = str(content)
-                    if file_path and not is_path_allowed(file_path):
-                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
-                        log_message(f"[Tool Error] Access restricted: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"write_file: {file_path}",
-                            "status": "error",
-                            "details": "Access restricted"
-                        })
-                    elif file_path:
-                        parent_dir = os.path.dirname(file_path)
-                        if parent_dir and not os.path.exists(parent_dir):
-                            os.makedirs(parent_dir, exist_ok=True)
-                        with open(file_path, "w", encoding="utf-8") as f:
-                            f.write(content)
-                        tool_context = f"\n\n[System Tool Response: Successfully wrote {len(content)} characters to '{file_path}']\n"
-                        log_message(f"[Tool Success] Wrote file: {file_path}")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"write_file: {file_path}",
-                            "status": "success",
-                            "details": step_summary
-                        })
-                    else:
-                        tool_context = f"\n\n[System Tool Error: File path was not provided for writing.]\n"
-                        log_message(f"[Tool Error] Write file failed: path not provided")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": "write_file",
-                            "status": "error",
-                            "details": "No path provided"
-                        })
-                except Exception:
-                    logging.exception("[Tool Error] Write file failed")
-                    tool_context = "\n\n[System Tool Error: Failed to write file]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "write_file",
-                        "status": "error",
-                        "details": "Failed to write file due to an internal error."
-                    })
-
-            elif target == "mcp:filesystem:multi_replace_string_in_file":
-                try:
-                    args = safe_parse_tool_args(payload_data, "path")
-                    file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
-                    replacements = args.get("replacements", []) if isinstance(args, dict) else []
-                    if isinstance(replacements, dict):
-                        replacements = [replacements]
-                    
-                    if not file_path:
-                        tool_context = f"\n\n[System Tool Error: File path was not provided for replacement.]\n"
-                    elif not is_path_allowed(file_path):
-                        tool_context = f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n"
-                    elif not os.path.exists(file_path):
-                        tool_context = f"\n\n[System Tool Error: File '{file_path}' was not found in the workspace.]\n"
-                    elif not replacements or not isinstance(replacements, list):
-                        tool_context = f"\n\n[System Tool Error: Replacements list was empty or invalid format.]\n"
-                    else:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        
-                        modified_content = content
-                        applied_count = 0
-                        not_found = []
-                        
-                        for idx, r in enumerate(replacements):
-                            if not isinstance(r, dict):
-                                continue
-                            target_str = r.get("target") or r.get("target_content") or r.get("search_string") or r.get("old") or r.get("find")
-                            replacement_str = r.get("replacement") or r.get("new_content") or r.get("replace_string") or r.get("new")
-                            if target_str is None or replacement_str is None:
-                                continue
-                            
-                            occurrences = modified_content.count(target_str)
-                            if occurrences == 0:
-                                not_found.append(f"Replacement {idx+1}: Target string not found (target: {repr(target_str[:50])})")
-                            else:
-                                modified_content = modified_content.replace(target_str, replacement_str)
-                                applied_count += occurrences
-                        
-                        if not_found and applied_count == 0:
-                            tool_context = f"\n\n[System Tool Error: None of the target strings were found in '{file_path}'. No changes were made. Details:\n" + "\n".join(not_found) + "]\n"
-                            log_message(f"[Tool Warning] Multi replace failed on {file_path}. Target strings not found.")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"multi_replace_string_in_file: {file_path}",
-                                "status": "warning",
-                                "details": "No targets found"
-                            })
-                        else:
-                            with open(file_path, "w", encoding="utf-8") as f:
-                                f.write(modified_content)
-                            
-                            status_msg = f"Successfully applied {applied_count} replacements to '{file_path}'."
-                            if not_found:
-                                status_msg += f" Note: some replacements were not found:\n" + "\n".join(not_found)
-                            
-                            tool_context = f"\n\n[System Tool Response: {status_msg}]\n"
-                            log_message(f"[Tool Success] Multi replaced {applied_count} occurrences in: {file_path}")
-                            agent_steps.append({
-                                "step": tool_loop_count + 1,
-                                "tool": f"multi_replace_string_in_file: {file_path}",
-                                "status": "success",
-                                "details": step_summary
-                            })
-                except Exception:
-                    logging.exception("[Tool Error] Multi-replace failed")
-                    tool_context = "\n\n[System Tool Error: Failed to perform multi-replace]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "multi_replace_string_in_file",
-                        "status": "error",
-                        "details": "Failed to perform multi-replace due to an internal error."
-                    })
-
-            elif target == "mcp:filesystem:grep_search":
-                try:
-                    args = safe_parse_tool_args(payload_data, "query")
-                    query = ""
-                    search_dir = "."
-                    if isinstance(args, dict):
-                        query = args.get("query") or args.get("search_term") or args.get("term") or args.get("pattern") or args.get("text") or args.get("search_string") or args.get("grep") or ""
-                        search_dir = args.get("path") or args.get("directory") or args.get("dir") or "."
-                    elif isinstance(args, str):
-                        query = args.strip()
-
-                    matches = []
-                    ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
-                    if query and os.path.exists(search_dir):
-                        for root, dirs, files in os.walk(search_dir):
-                            # Filter dirs in-place to optimize traversal speed and prevent descending into big folders
-                            dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
-                            for file in files:
-                                if file.startswith(".env") or not is_path_allowed(file):
-                                    continue
-                                if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md", ".java", ".cpp", ".h")):
-                                    path = os.path.join(root, file)
-                                    try:
-                                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                                            for line_num, line in enumerate(f, 1):
-                                                if query.lower() in line.lower():
-                                                    matches.append(f"{path}:{line_num}: {line.strip()}")
-                                    except Exception:
-                                        pass
-                    if matches:
-                        tool_context = f"\n\n[System Tool Response: Found {len(matches)} matches for grep query '{query}']\n" + "\n".join(matches[:20]) + "\n"
-                        log_message(f"[Tool Success] Grep found {len(matches)} matches for '{query}'.")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"grep_search: '{query}'",
-                            "status": "success",
-                            "details": step_summary
-                        })
-                    else:
-                        tool_context = f"\n\n[System Tool Response: No occurrences of '{query}' were found in the workspace.]\n"
-                        log_message(f"[Tool Warning] Grep found 0 matches for '{query}'.")
-                        agent_steps.append({
-                            "step": tool_loop_count + 1,
-                            "tool": f"grep_search: '{query}'",
-                            "status": "warning",
-                            "details": step_summary
-                        })
-                except Exception:
-                    logging.exception("[Tool Error] Grep search failed")
-                    tool_context = "\n\n[System Tool Error: Failed to perform grep search]\n"
-                    agent_steps.append({
-                        "step": tool_loop_count + 1,
-                        "tool": "grep_search",
-                        "status": "error",
-                        "details": "Failed to perform grep search due to an internal error."
-                    })
-
-            if full_tool_context is None:
-                full_tool_context = tool_context
-            
             supervisor_context = f"{supervisor_context}{tool_context}"
             if len(supervisor_context) > 15000:
                 supervisor_context = "...\n[Earlier tool responses truncated for speed & context limits]\n..." + supervisor_context[-12000:]
@@ -3861,16 +3885,12 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
                 step_num = tool_loop_count + 1
                 is_err = "error" in tool_context.lower() or "blocked" in tool_context.lower() or "failed" in tool_context.lower()
                 step_icon = "🔴" if is_err else "🟢"
-                open_attr = " open" if is_err else ""
                 tool_args_str = str(payload_data)
                 if len(tool_args_str) > 120:
                     tool_args_str = tool_args_str[:120] + "..."
-                tool_summary_text = tool_context.strip()
-                if len(tool_summary_text) > 1000:
-                    tool_summary_text = tool_summary_text[:1000] + "\n... [Truncated for UI display]"
                 
-                details_md = f"<details{open_attr}>\n<summary><strong>Tool ({step_icon} Step {step_num}):</strong> <code>{target}</code> (Args: <code>{tool_args_str}</code>)</summary>\n\n```text\n{tool_summary_text}\n```\n\n</details>\n\n"
-                yield {"type": "content", "content": details_md}
+                # Emit tool execution as a progress update rather than polluting the markdown content stream
+                yield {"type": "progress", "text": f"⚙️ {step_icon} Step {step_num}: {target} ({tool_args_str})"}
                 await asyncio.sleep(0.01)
 
             tool_loop_count += 1
@@ -4011,122 +4031,21 @@ Never compromise on security, input validation, or error handling.
                         yield {"type": "progress", "text": f"⚙️ Worker {worker_id} executing tool {w_target}..."}
                         await asyncio.sleep(0.01)
 
-                    # Dispatch — reuse the same inline dispatch via Path B tool blocks
-                    # (worker shares supervisor context; tool_loop_count set to worker step)
-                    w_tool_result = ""
+                    # Dispatch — execute via central tool engine
                     w_step = tool_loop_count + worker_tool_loop_count + 1
+                    res = dispatch_tool_call(w_target, w_payload, mode=mode, step_num=w_step)
+                    w_tool_result = res["tool_context"]
+                    w_target = res["target_norm"]
 
-                    if w_target == "mcp:terminal:run_command":
-                        try:
-                            args = safe_parse_tool_args(w_payload, "command")
-                            command = args.get("command") if isinstance(args, dict) else None
-                            if command:
-                                if not is_command_allowed(command):
-                                    w_tool_result = f"\n\n[System Tool Error: Command blocked: '{command}']\n"
-                                else:
-                                    full_cmd = f"powershell -NoProfile -Command \"{command}\""
-                                    sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
-                                    result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
-                                    w_tool_result = f"\n\n[System Tool Response: Exit {result.returncode}]\nSTDOUT:\n{result.stdout[:2000]}\nSTDERR:\n{result.stderr[:2000]}\n"
-                                    log_message(f"[Worker {worker_id} Tool] Executed: {command}")
-                                    agent_steps.append({"step": w_step, "tool": f"run_command: {command}", "status": "success" if result.returncode == 0 else "error", "details": f"Exit {result.returncode}"})
-                            else:
-                                w_tool_result = "\n\n[System Tool Error: No command provided]\n"
-                        except subprocess.TimeoutExpired:
-                            w_tool_result = "\n\n[System Tool Error: Command timed out]\n"
-                        except Exception as e:
-                            w_tool_result = f"\n\n[System Tool Error: {e}]\n"
-
-                    elif w_target == "mcp:filesystem:read_file":
-                        try:
-                            file_path, start_line, end_line = parse_read_file_args(w_payload)
-                            if not file_path or not is_path_allowed(file_path):
-                                w_tool_result = f"\n\n[System Tool Error: Access restricted: '{file_path}']\n"
-                            elif os.path.exists(file_path):
-                                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                    lines = f.readlines()
-                                if start_line and end_line:
-                                    s, e = max(1, int(start_line)), min(len(lines), int(end_line))
-                                    w_tool_result = f"\n\n[System Tool Response: '{file_path}' L{s}-{e}]\n{''.join(lines[s-1:e])}\n"
-                                else:
-                                    w_tool_result = f"\n\n[System Tool Response: '{file_path}']\n{''.join(lines[:150])}\n"
-                                agent_steps.append({"step": w_step, "tool": f"read_file: {file_path}", "status": "success", "details": "Read by worker"})
-                            else:
-                                w_tool_result = f"\n\n[System Tool Error: File '{file_path}' not found]\n"
-                        except Exception as e:
-                            w_tool_result = f"\n\n[System Tool Error: read_file: {e}]\n"
-
-                    elif w_target == "mcp:filesystem:write_file":
-                        try:
-                            args = safe_parse_tool_args(w_payload, "path")
-                            file_path = (args.get("path") or args.get("file") or args.get("target_file")) if isinstance(args, dict) else None
-                            content = (args.get("content") or args.get("code") or args.get("text") or "") if isinstance(args, dict) else ""
-                            if not isinstance(content, str):
-                                content = str(content)
-                            if not file_path or not is_path_allowed(file_path):
-                                w_tool_result = "\n\n[System Tool Error: No path or restricted]\n"
-                            else:
-                                os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
-                                with open(file_path, "w", encoding="utf-8") as f:
-                                    f.write(content)
-                                w_tool_result = f"\n\n[System Tool Response: Wrote {len(content)} chars to '{file_path}']\n"
-                                agent_steps.append({"step": w_step, "tool": f"write_file: {file_path}", "status": "success", "details": "Written by worker"})
-                        except Exception as e:
-                            w_tool_result = f"\n\n[System Tool Error: write_file: {e}]\n"
-
-                    elif w_target in ["mcp:filesystem:replace_string_in_file", "mcp:filesystem:insert_edit_into_file"]:
-                        try:
-                            args = safe_parse_tool_args(w_payload, "path")
-                            file_path = (args.get("path") or args.get("file")) if isinstance(args, dict) else None
-                            target_content = (args.get("target_content") or args.get("target") or "") if isinstance(args, dict) else ""
-                            new_content = (args.get("new_content") or args.get("replacement") or args.get("code_to_insert") or "") if isinstance(args, dict) else ""
-                            if not file_path or not is_path_allowed(file_path) or not os.path.exists(file_path):
-                                w_tool_result = f"\n\n[System Tool Error: File not found or restricted]\n"
-                            elif target_content not in open(file_path, encoding="utf-8", errors="ignore").read():
-                                w_tool_result = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
-                            else:
-                                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                    fc = f.read()
-                                if w_target.endswith("insert_edit_into_file"):
-                                    fc = fc.replace(target_content, target_content + "\n" + new_content, 1)
-                                else:
-                                    fc = fc.replace(target_content, new_content, 1)
-                                with open(file_path, "w", encoding="utf-8") as f:
-                                    f.write(fc)
-                                w_tool_result = f"\n\n[System Tool Response: Updated '{file_path}']\n"
-                                agent_steps.append({"step": w_step, "tool": f"edit: {file_path}", "status": "success", "details": "Edited by worker"})
-                        except Exception as e:
-                            w_tool_result = f"\n\n[System Tool Error: edit: {e}]\n"
-
-                    elif w_target == "mcp:filesystem:grep_search":
-                        try:
-                            args = safe_parse_tool_args(w_payload, "query")
-                            query = (args.get("query") or args.get("pattern") or "") if isinstance(args, dict) else (args.strip() if isinstance(args, str) else "")
-                            search_dir = (args.get("path") or ".") if isinstance(args, dict) else "."
-                            matches = []
-                            ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
-                            if query and os.path.exists(search_dir):
-                                for root, dirs, files in os.walk(search_dir):
-                                    dirs[:] = [d for d in dirs if d not in ignore_dirs]
-                                    for file in files:
-                                        if file.endswith((".py", ".ts", ".js", ".txt", ".json", ".md")):
-                                            fp = os.path.join(root, file)
-                                            try:
-                                                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                                                    for lnum, line in enumerate(f, 1):
-                                                        if query.lower() in line.lower():
-                                                            matches.append(f"{fp}:{lnum}: {line.strip()}")
-                                            except Exception:
-                                                pass
-                            w_tool_result = f"\n\n[System Tool Response: {len(matches)} matches for '{query}']\n" + "\n".join(matches[:20]) + "\n"
-                        except Exception as e:
-                            w_tool_result = f"\n\n[System Tool Error: grep: {e}]\n"
-
-                    else:
-                        w_tool_result = f"\n\n[System Tool Error: Unknown tool '{w_target}']\n"
+                    agent_steps.append({
+                        "step": w_step,
+                        "tool": f"{w_target.split(':')[-1]}: {res['file_path'] or ''}".strip(": "),
+                        "status": res["status"],
+                        "details": res["details"]
+                    })
 
                     if not is_programmatic and w_tool_result:
-                        is_err = "error" in w_tool_result.lower()
+                        is_err = res["is_error"]
                         open_attr = " open" if is_err else ""
                         details_md = f"<details{open_attr}>\n<summary><strong>Worker Tool (Step {w_step}):</strong> <code>{w_target}</code></summary>\n\n```text\n{w_tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
                         yield {"type": "content", "content": details_md}
@@ -4365,9 +4284,26 @@ async def ask_serenity(request: QueryRequest, http_request: Request):
     if error_detail:
         raise HTTPException(status_code=500, detail=error_detail)
 
-    full_answer = "".join(answer_parts)
+    full_answer = "".join(answer_parts).strip()
+    if not full_answer:
+        if isinstance(routing_info, dict):
+            steps = routing_info.get("steps", [])
+            if steps and isinstance(steps, list):
+                step_summary_lines = []
+                for s in steps:
+                    if isinstance(s, dict):
+                        tool_name = s.get("tool", "tool")
+                        details = s.get("details", "")
+                        step_summary_lines.append(f"- `[{tool_name}]`: {details}")
+                full_answer = f"### Execution Summary\n" + "\n".join(step_summary_lines)
+            else:
+                worker_name = routing_info.get("worker_model") or routing_info.get("worker") or "SerenityDev"
+                full_answer = f"Task completed by {worker_name}."
+        else:
+            full_answer = "Task completed by SerenityDev."
 
     # Max response length truncation logic for Copilot Chat compatibility
+
     if len(full_answer) > MAX_RESPONSE_LENGTH:
         # If too long, try stripping the report header and keeping just the answer
         # Locate the divider block
@@ -4517,7 +4453,38 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
         "cache_type_v": cache_type_v
     }
 
+class RevertEditRequest(BaseModel):
+    backup_id: str
+
+@app.post("/api/edit/revert")
+async def revert_file_edit(req: RevertEditRequest):
+    b_id = req.backup_id
+    if b_id not in file_edit_backups:
+        raise HTTPException(status_code=404, detail="Backup ID not found or edit already processed.")
+    backup = file_edit_backups.pop(b_id)
+    file_path = backup["file_path"]
+    old_content = backup["content"]
+    try:
+        if old_content == "" and os.path.exists(file_path):
+            os.remove(file_path)
+        else:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(old_content)
+        log_message(f"[Edit Revert] Reverted '{file_path}' to pre-edit state.")
+        return {"status": "reverted", "file": file_path, "backup_id": b_id}
+    except Exception as e:
+        log_message(f"[Edit Revert Error] Failed to revert '{file_path}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to revert file: {e}")
+
+@app.post("/api/edit/keep")
+async def keep_file_edit(req: RevertEditRequest):
+    b_id = req.backup_id
+    if b_id in file_edit_backups:
+        file_edit_backups.pop(b_id)
+    return {"status": "kept", "backup_id": b_id}
+
 # --- Web UI & Dashboard Endpoints ---
+
 
 cached_gpu_memory = None
 
