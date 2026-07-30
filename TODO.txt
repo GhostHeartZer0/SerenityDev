@@ -6,12 +6,20 @@ File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
-ONGOING - resolve tool call failures: when a tool is called, it goes to the chat as a response. possible regex mismatch or aggressive cleaning.
-Add debugging to see why. for testing, add extra info to prompt for tool calls.
+[2026-07-30] Done: Comprehensive Security Hardening — HTML entity escaping for webview chat & proof badges, createSafeMarkdown helper (isTrusted=false, supportHtml=false), shell=False subprocess execution, validate_path_containment with symlink resolution, robust extract_json parser, and concurrency lock synchronization.
+[2026-07-30] Done: Resolved tool call response leak — tool execution events now route to progress updates instead of polluting the chat answer stream.
+[2026-07-30] Done: Complete Android Studio (IntelliJ.kt) integration with user input dialog, thread-safe WriteCommandAction editor replacement, and error alerts.
+[2026-07-29] Done: Tool edit proof badges (`edited:this.py-1+2`) & inline Keep/Reject UI in VSCode chat.
+[2026-07-29] Done: Plan generation pipeline & task list execution engine (`/plan`).
+[2026-07-29] Done: Android Studio plugin response fix (`IntelliJ.kt` and `/ask` response fallback).
+
+tool calls stop inference. appear working, but its appearing plaintext in response like so: <tool_call> read_file(path="c:\\Users\\ccrg6\\SerenityDev\\serenitydevserver.py") </tool_call>
 
 [2026-07-27] DEFERRED: Focused subagent spawning architecture — Supervisor/Orchestrator should be able to spawn worker subagents with only the specific tools and instructions they need (tool allowlist scoped per delegation). Workers currently receive all tools from the global list. Implement per-delegation tool scoping in Path B `delegate_worker` branch: pass a `tool_subset` list alongside `instructions` so the spawned worker prompt only advertises the relevant tools. Cap: worker inner loop already at 8; supervisor delegation already capped (Low=3, High=5, Turbo=unlimited).
 
 New models and ones displayed should be given Agent role, reserving the Worker role purely for delegation by a Supervisor or Orchestrator.
+
+Build a new Orchestrator, MiniBoss, powered by 
 
 1. resolve llm output is massdumping instead of streaming response.
    [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Verify] 

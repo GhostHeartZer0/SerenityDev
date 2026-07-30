@@ -11,6 +11,13 @@ let serverOutputChannel: vscode.OutputChannel;
 const API_BASE = 'http://localhost:8002/api';
 const ASK_URL = 'http://localhost:8002/ask';
 
+function createSafeMarkdown(content: string): vscode.MarkdownString {
+    const md = new vscode.MarkdownString(content);
+    md.isTrusted = false;
+    md.supportHtml = false;
+    return md;
+}
+
 export function activate(context: vscode.ExtensionContext) {
     serverOutputChannel = vscode.window.createOutputChannel("Serenity Server");
     context.subscriptions.push(serverOutputChannel);
@@ -87,9 +94,9 @@ export function activate(context: vscode.ExtensionContext) {
                                 if (data.type === 'progress' && data.text) {
                                     response.progress(data.text);
                                 } else if (data.type === 'content' && data.content) {
-                                    response.markdown(new vscode.MarkdownString(data.content));
+                                    response.markdown(createSafeMarkdown(data.content));
                                 } else if (data.type === 'error' && data.detail) {
-                                    response.markdown(new vscode.MarkdownString(`❌ **Error:** ${data.detail}`));
+                                    response.markdown(createSafeMarkdown(`❌ **Error:** ${data.detail}`));
                                 } else if (data.type === 'done' && data.routing) {
                                     const routing = data.routing;
                                     let routingInfo = `\n\n---\n\n> 🗺️ **Routing:** \`Supervisor\` ➡️ \`Worker: ${routing.worker}\`\n> 🔍 **Review:** \`${routing.review_badge}\``;
@@ -100,7 +107,7 @@ export function activate(context: vscode.ExtensionContext) {
                                             routingInfo += `> - ${icon} \`${s.tool}\` ➡️ *${s.details}*\n`;
                                         });
                                     }
-                                    response.markdown(new vscode.MarkdownString(routingInfo));
+                                    response.markdown(createSafeMarkdown(routingInfo));
                                 }
                             } catch (e) {
                                 // ignore
@@ -115,7 +122,7 @@ export function activate(context: vscode.ExtensionContext) {
                             const jsonStr = buffer.trim().substring(5).trim();
                             const data = JSON.parse(jsonStr);
                             if (data.type === 'content' && data.content) {
-                                response.markdown(new vscode.MarkdownString(data.content));
+                                response.markdown(createSafeMarkdown(data.content));
                             }
                         } catch (e) { }
                     }
@@ -124,7 +131,7 @@ export function activate(context: vscode.ExtensionContext) {
             });
 
             req.on('error', (err: any) => {
-                response.markdown(new vscode.MarkdownString(`❌ **Error calling SerenityDev server:** ${err.message}`));
+                response.markdown(createSafeMarkdown(`❌ **Error calling SerenityDev server:** ${err.message}`));
                 resolve();
             });
 
@@ -417,9 +424,21 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
                     await axios.delete(`${API_BASE}/session/${this._sessionId}`);
                 } catch (e) { }
                 this._sessionId = this._generateSessionId();
+            } else if (data.type === 'revertEdit') {
+                try {
+                    await axios.post(`${API_BASE}/edit/revert`, { backup_id: data.backupId });
+                    vscode.window.showInformationMessage(`Reverted file edit (${data.backupId})`);
+                } catch (e: any) {
+                    vscode.window.showErrorMessage(`Failed to revert edit: ${e.message}`);
+                }
+            } else if (data.type === 'keepEdit') {
+                try {
+                    await axios.post(`${API_BASE}/edit/keep`, { backup_id: data.backupId });
+                } catch (e) { }
             }
         });
     }
+
 
     private _getHtmlForWebview(webview: vscode.Webview) {
         return `<!DOCTYPE html>
@@ -454,15 +473,25 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
 
             <script>
                 const vscode = acquireVsCodeApi();
+
+                function escapeHtml(str) {
+                    if (!str) return '';
+                    return String(str)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#039;');
+                }
                 
                 function submitQuery() {
                     const input = document.getElementById('promptInput');
                     const text = input.value.trim();
                     if(!text) return;
 
-                    // Append user text
+                    // Append user text safely escaped
                     const out = document.getElementById('output');
-                    out.innerHTML += '<div class="msg user"><strong>You:</strong> ' + text + '</div>';
+                    out.innerHTML += '<div class="msg user"><strong>You:</strong> ' + escapeHtml(text) + '</div>';
                     
                     // Add status indicator
                     out.innerHTML += '<div id="statusBox" class="routing-box">⚙️ Initializing Routing Pipeline...</div>';
@@ -478,6 +507,37 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
                     vscode.postMessage({ type: 'clearSession' });
                 }
 
+                function keepEdit(backupId, btnEl) {
+                    const safeId = escapeHtml(backupId);
+                    vscode.postMessage({ type: 'keepEdit', backupId: backupId });
+                    if (btnEl && btnEl.parentElement) {
+                        btnEl.parentElement.innerHTML = '<span style="color: #4ec9b0; font-weight: bold;">✓ Kept</span>';
+                    }
+                }
+                function rejectEdit(backupId, btnEl) {
+                    const safeId = escapeHtml(backupId);
+                    vscode.postMessage({ type: 'revertEdit', backupId: backupId });
+                    if (btnEl && btnEl.parentElement) {
+                        btnEl.parentElement.innerHTML = '<span style="color: #f14c4c; font-weight: bold;">❌ Reverted</span>';
+                    }
+                }
+                function parseProofBadges(rawText) {
+                    if (!rawText) return '';
+                    return rawText.replace(/(?:PROOF:\s*)?(edited:[^\s\n\(\)]+)-(\d+)\+(\d+)(?:\s*\(backup:([^\)]+)\))?/g, function(match, proof, dels, adds, bakId) {
+                        const bId = bakId ? bakId.trim() : '';
+                        const safeBId = escapeHtml(bId);
+                        const safeProof = escapeHtml(proof);
+                        const safeDels = escapeHtml(dels);
+                        const safeAdds = escapeHtml(adds);
+                        const btnHtml = safeBId ? `<span style="margin-left: 8px;">` +
+                            `<button onclick="keepEdit('${safeBId}', this)" style="background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin-right: 4px; font-weight: bold; font-size: 10px;">Keep</button>` +
+                            `<button onclick="rejectEdit('${safeBId}', this)" style="background: var(--vscode-errorForeground); color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-weight: bold; font-size: 10px;">Reject</button>` +
+                            `</span>` : '';
+                        return `<div style="background: rgba(0,0,0,0.3); border: 1px solid var(--vscode-widget-border); padding: 6px 10px; border-radius: 6px; margin: 4px 0; font-family: var(--vscode-editor-font-family); font-size: 11px; display: flex; justify-content: space-between; align-items: center;">` +
+                               `<span>📝 <code>${safeProof}-${safeDels}+${safeAdds}</code></span>` + btnHtml + `</div>`;
+                    });
+                }
+
                 window.addEventListener('message', event => {
                     const message = event.data;
                     const out = document.getElementById('output');
@@ -486,7 +546,7 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
                         const statusBox = document.getElementById('statusBox');
                         if (statusBox) {
                             let logHtml = '';
-                            message.logs.forEach(l => { logHtml += '<div>⚙️ ' + l + '</div>'; });
+                            message.logs.forEach(l => { logHtml += '<div>⚙️ ' + escapeHtml(l) + '</div>'; });
                             statusBox.innerHTML = logHtml;
                         }
                         out.scrollTop = out.scrollHeight;
@@ -500,14 +560,22 @@ class SerenityChatProvider implements vscode.WebviewViewProvider {
                     } else if (message.type === 'addResponse') {
                         let routingHtml = '';
                         if (message.routing) {
-                            routingHtml = '<div class="routing-box">🗺️ Plan Step Count: ' + (message.routing.steps ? message.routing.steps.length : 0) + '<br/>Worker: ' + message.routing.worker + '</div>';
+                            let stepList = '';
+                            if (message.routing.steps && message.routing.steps.length > 0) {
+                                message.routing.steps.forEach(s => {
+                                    stepList += '<div style="margin-top: 2px;">🛠️ Step ' + escapeHtml(String(s.step)) + ': <code>' + escapeHtml(String(s.tool)) + '</code> ➡️ ' + parseProofBadges(s.details) + '</div>';
+                                });
+                            }
+                            routingHtml = '<div class="routing-box">🗺️ Plan Step Count: ' + (message.routing.steps ? message.routing.steps.length : 0) + '<br/>Worker: ' + escapeHtml(String(message.routing.worker)) + stepList + '</div>';
                         }
-                        out.innerHTML += '<div class="msg agent"><strong>SerenityDev:</strong> ' + message.value + routingHtml + '</div>';
+                        const formattedVal = parseProofBadges(message.value);
+                        out.innerHTML += '<div class="msg agent"><strong>SerenityDev:</strong> ' + formattedVal + routingHtml + '</div>';
                     } else if (message.type === 'addError') {
-                        out.innerHTML += '<div class="msg" style="color: var(--vscode-errorForeground)">❌ Error: ' + message.value + '</div>';
+                        out.innerHTML += '<div class="msg" style="color: var(--vscode-errorForeground)">❌ Error: ' + escapeHtml(String(message.value)) + '</div>';
                     }
                     out.scrollTop = out.scrollHeight;
                 });
+
             </script>
         </body>
         </html>`;
