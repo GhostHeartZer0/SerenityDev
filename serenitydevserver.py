@@ -201,31 +201,6 @@ def validate_path_containment(target_path: str, base_workspace: str, allowed_dir
     except Exception:
         return False
 
-def extract_json(raw_text: str) -> Optional[Dict[str, Any]]:
-    """Safely parses JSON output from LLM responses, stripping code fences and validating structure."""
-    if not raw_text:
-        return None
-    cleaned = raw_text.strip()
-    if "```json" in cleaned:
-        cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-    elif "```" in cleaned:
-        cleaned = cleaned.split("```")[1].split("```")[0].strip()
-    try:
-        data = json.loads(cleaned)
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-    return None
-
 # Global State Management
 inference_lock = asyncio.Lock()
 autoswap_timer_task: Optional[asyncio.Task] = None
