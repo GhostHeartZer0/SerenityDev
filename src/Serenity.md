@@ -62,11 +62,11 @@ Prevents context drift and context bloat during long multi-turn interactions.
 
 ---
 
-## 4. Autonomous Tool Call Specifications & Target Mapping
+## 4. Autonomous Tool Call Specifications, PTC & Target Mapping
 
-SerenityDev supports native `<|tool_call>` syntax, short aliases, and namespace prefix stripping (`google:mcp:code_interpreter:*`, `mcp:filesystem:*`).
+SerenityDev supports **Programmatic Tool Calling (PTC & Clean Stubs, arXiv:2608.06370v1)** with typed Python stubs, standard Python function invocations (`read_file(path="...")`), native `<|tool_call>` syntax, short aliases, and namespace prefix stripping (`google:mcp:code_interpreter:*`, `mcp:filesystem:*`).
 
-### Tool Target Router & Specifications
+### Tool Target Router & Specifications (PTC Typed Python Stubs)
 
 | Tool Target | Normalization Aliases | Parameters & Format | Purpose |
 | :--- | :--- | :--- | :--- |

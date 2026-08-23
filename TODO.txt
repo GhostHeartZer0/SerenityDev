@@ -1,10 +1,29 @@
 Created At: 2026-07-17T20:37:54Z
-Last Updated: 2026-07-17T20:39:00Z
+Last Updated: 2026-08-07T09:51:00Z
 File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
 
 =========================================
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
+
+Overhaul repeat handling / detection, make it a toggle [hyper, lazy, off] so that coding and repeat tool calling [eg. search hi, search low, search windows] can go forward.
+
+[2026-08-22] Done: Multi-Line PTC Parsing Fix — Fixed `extract_json` to parse full Python code blocks via `ast.parse(mode='exec')` + `ast.walk()` for multi-line triple-quoted args. Falls back to line-by-line for simple calls.
+[2026-08-22] Done: Config Persistence (`serenity_config.json`) — All server engine settings (KV cache, context window, GPU layers, auto-continue, model, roles) persisted to disk on every `/api/config` POST and loaded on startup.
+[2026-08-22] Done: Added 96k (98304 tokens) context window option to `serenity.setContextSize` QuickPick.
+[2026-08-22] Done: Eliminated Windows Terminal Window Flashing — Switched `/api/status` GPU telemetry to in-process `pynvml` (zero subprocesses), cached machine entropy in `SerenityKeyVault`, added `subprocess.CREATE_NO_WINDOW` across all Python subprocess calls (`wmic`, `powershell`, `nvidia-smi`, `mcp:terminal`), and added `windowsHide: true` on Node.js `cp.spawn` in `src/extension.ts`.
+[2026-08-22] Done: Server Auto-Start, Model Selection Dropdown & Detection Scanner — Implemented `ensureServerStarted()` with multi-path virtualenv detection, health polling loop, and auto-sealing hardware key fallback in `startup.py`. Added active Model Selector dropdown directly inside the Planning & Orchestration sidebar webview, plus `serenity.startServer`, `serenity.selectModel` (one-click model switching across all detected GGUFs), and `serenity.scanModels` (dynamic directory rescan and detection reporting).
+[2026-08-22] Done: Role-Based Effort Levels, Model Mapping & Auto-Continue Toggle — Configured Supervisor effort tiers as first-class roles (`supervisor_low`, `supervisor_high`, `orchestrator_turbo`, `w1_reasoning`, `w2_code`, `w3_fast`, `w4_specialized`, `fim`), enabled dynamic model assignment per role in Planning & Orchestration Library webview and via `serenity.setRoleModel`, and added `auto_continue` toggle (500 max loops) in server and via `serenity.toggleAutoContinue`.
+[2026-08-22] Done: VSIX Model Reporting, Planning Explainer Dialog & Server Control Commands — Implemented dynamic `/api/models` rescanning with accurate `maxInputTokens` from `CONTEXT_WINDOW` and tool calling capabilities, updated `provideLanguageModelChatInformation` in `src/extension.ts`, added Planning & Orchestration Library architecture explainer modal and standalone view (`serenity.explainPlanning`), and implemented VS Code commands + Webview toolbar buttons for `serenity.restartServer`, `serenity.unloadModel` (free VRAM), `serenity.setKVCache` (quantization settings), `serenity.setContextSize` (token context window), and `serenity.setGpuLayers` (layer offload count).
+[2026-08-22] Done: Implemented Shared VRAM Guard & Synced Updated .venv llama_cpp — Added context-scaled guard headroom in `get_vram_info()`, auto-pinned KV cache to system RAM during partial layer offloading / SWA / high context to eliminate `GGML_SCHED_MAX_SPLIT_INPUTS` assertion crashes and Windows Shared GPU Memory paging stalls, added resilient multi-tier recovery fallbacks in `get_llama_model()`, and synced updated CUDA 13.3 `llama_cpp` binaries (258 MB `ggml-cuda.dll`) from `SerenityPC`.
+[2026-08-18] Done: Fixed `grep_search` single-file routing & regex evaluation in `serenitydevserver.py` — added `os.path.isfile` single-file handling alongside workspace recursive scans, compiled regex search queries with case-insensitivity and literal substring fallback, and filtered `pynvml` `FutureWarning` during `nvidia-ml-py` metrics discovery.
+[2026-08-17] Done: Resolved VRAM Offloading & CUDA Acceleration — Replaced CPU-only `llama_cpp_python` binaries in `.venv` with CUDA 12.6 accelerated build (`ggml-cuda.dll`), verified `llama_supports_gpu_offload() == True`, confirmed active dynamic layer offloading into NVIDIA GeForce RTX 3050 VRAM, and integrated `nvidia-ml-py` for hardware metrics.
+[2026-08-17] Done: Fixed PQC Hardware-Bound Key Vault & Sealer — Added Windows 11 CIM/PowerShell fallback to `SerenityKeyVault.get_machine_entropy()` when `wmic` is deprecated, added multi-entropy candidate fallback list to `SerenityKeyVault.unlock()`, decoupled `seal_secrets.py` to prevent circular import crashes, and re-sealed valid hardware key into `.env`.
+[2026-08-17] Done: Virtual environment (.venv) activation across all startup scripts — added `activate_virtualenv()` in `startup.py` to auto-detect and inject `.venv`/`venv` site-packages and PATH, updated `start_native_mcp.py` to initialize environment on boot, updated VSCode extension (`src/extension.ts`) to prioritize `.venv` python interpreters and propagate `VIRTUAL_ENV`/`PATH`, and added cross-platform launch scripts (`start_server.bat`, `start_server.ps1`, `start_server.sh`, `start_mcp.bat`, `start_mcp.ps1`, `start_mcp.sh`).
+[2026-08-17] Done: Implemented Programmatic Tool Calling (PTC) & Clean Stubs (arXiv:2608.06370v1) — transitioned tool declarations from verbose Gemma pseudo-JSON schema tags to typed Python stubs (`def tool_name(...) -> dict: ...`). Enhanced AST-based Python function call parsing in extract_json and dual-mode dispatch.
+[2026-08-17] Done: Ensured tool calling is properly shown in VSCode chat — enabled supportHtml: true and isTrusted: true on MarkdownString in `src/extension.ts`, yielding collapsible `<details>` execution summary cards for all standalone (Path A) and supervisor (Path B) tool executions.
+[2026-08-11] Done: Fixed infinite hang during llama-server process startup in serenitydevserver.py (PIPE stderr/stdout capture, poll() health checks, async httpx health polling).
+[2026-08-07] Done: Fixed TypeScript compilation & parsing errors in extension webview template literal string (`src/extension.ts`).
 
 [2026-07-30] Done: Comprehensive Security Hardening — HTML entity escaping for webview chat & proof badges, createSafeMarkdown helper (isTrusted=false, supportHtml=false), shell=False subprocess execution, validate_path_containment with symlink resolution, robust extract_json parser, and concurrency lock synchronization.
 [2026-07-30] Done: Resolved tool call response leak — tool execution events now route to progress updates instead of polluting the chat answer stream.
@@ -13,7 +32,7 @@ ACTIVE TODO ITEMS & PRIORITIES
 [2026-07-29] Done: Plan generation pipeline & task list execution engine (`/plan`).
 [2026-07-29] Done: Android Studio plugin response fix (`IntelliJ.kt` and `/ask` response fallback).
 
-tool calls stop inference. appear working, but its appearing plaintext in response like so: <tool_call> read_file(path="c:\\Users\\ccrg6\\SerenityDev\\serenitydevserver.py") </tool_call>
+[2026-08-22] Done: Fixed tool call stripping before execution — Separated thought stripping (`strip_thought_blocks`) from tool tag stripping (`clean_thought_and_whitespace`), updated `extract_json` in `serenitydevserver.py` to parse tool calls without premature tag deletion, added support for XML `<tool_call>` wrappers (PTC & JSON), and updated `StreamingThoughtFilter` lookahead & closing tag buffering.
 
 [2026-07-27] DEFERRED: Focused subagent spawning architecture — Supervisor/Orchestrator should be able to spawn worker subagents with only the specific tools and instructions they need (tool allowlist scoped per delegation). Workers currently receive all tools from the global list. Implement per-delegation tool scoping in Path B `delegate_worker` branch: pass a `tool_subset` list alongside `instructions` so the spawned worker prompt only advertises the relevant tools. Cap: worker inner loop already at 8; supervisor delegation already capped (Low=3, High=5, Turbo=unlimited).
 
@@ -24,7 +43,7 @@ Build a new Orchestrator, MiniBoss, powered by
 1. resolve llm output is massdumping instead of streaming response.
    [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Verify] 
 
-2. kv cache compression settings (add to UI and verify it works / changes) [Verify] 
+2. kv cache compression settings (add to UI and verify it works / changes) [Done] 
 
 3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq [Done] 
 
@@ -38,7 +57,7 @@ add git commands to harness
 
 7. review FIM handling and VRAM usage; let it be on unless VRAM is to be saturated especially by a large LLM being loaded. load FIM if there is space, auto-offload for Orchestrator / Supervisor and secondary routing phases.
 
-8. It seems to be working, but i'm not seeing anything [see below #87]
+8. [2026-08-18] Done: Fixed blank window & thought swallowing in VSCode AI window — Refactored `StreamingThoughtFilter` in `serenitydevserver.py` to demux internal reasoning without dropping direct responses or error text, added lookahead tag buffering, implemented dynamic model folder discovery & setting (`serenitydev.modelsPath` and UI folder picker `serenity.addModelFolder`), guarded direct llama_cpp C++ engine with inference lock & cancellation event to prevent Access Violation 0xC0000005 crashes, and fixed fenced JSON tool parsing in `extract_json`.
 
 9. Implement HTTPS-enforced StreamableHTTP MCP server endpoint (`/mcp`) in `serenitydevserver.py` for Google AI Edge Gallery integration. [Done]
 

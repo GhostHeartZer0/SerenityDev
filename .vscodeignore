@@ -21,3 +21,6 @@ scratch/**
 .git/**
 .agents/**
 .serenity_cache/**
+*.key
+*.pem
+*.crt

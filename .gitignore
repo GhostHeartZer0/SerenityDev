@@ -30,6 +30,13 @@ rootCA.key
 cert.pem
 cert.key
 
+# Build Artifacts
+*.vsix
+
+# Local Config
+models_dirs.json
+serenity_config.json
+
 # OS
 .DS_Store
 Thumbs.db

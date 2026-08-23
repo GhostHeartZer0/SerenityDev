@@ -9,7 +9,10 @@ except RuntimeError as e:
     print(f"\n{e}")
     sys.exit(1)
 
+import sys
 import asyncio
+import threading
+import ast
 import json
 import os
 import re
@@ -32,13 +35,20 @@ import uvicorn
 import signal
 import cryptography
 import difflib
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
 
 class SerenityKeyVault:
     """Hardware-bound Key Vault using SHA3-512 & SHAKE-256 (Keccak XOF) multi-factor entropy binding."""
 
-    @staticmethod
-    def get_machine_entropy() -> bytes:
+    _cached_entropy: Optional[bytes] = None
+
+    @classmethod
+    def get_machine_entropy(cls) -> bytes:
         """Reads composite multi-factor hardware attributes (OS MAC, Windows MachineGuid, BIOS UUID) to prevent user-space MAC spoofing."""
+        if cls._cached_entropy is not None:
+            return cls._cached_entropy
+
         components = [str(uuid.getnode()).encode("utf-8")]
         # 1. Windows Registry MachineGuid
         try:
@@ -50,23 +60,59 @@ class SerenityKeyVault:
         except Exception:
             pass
         # 2. BIOS / Motherboard UUID
-        # NOTE: Security hardened - shell=False subprocess execution to prevent string interpolation exploits
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        uuid_found = False
         try:
-            res = subprocess.run(["wmic", "csproduct", "get", "UUID"], shell=False, capture_output=True, text=True, timeout=2)
+            res = subprocess.run(["wmic", "csproduct", "get", "UUID"], shell=False, capture_output=True, text=True, timeout=2, creationflags=flags)
             if res.returncode == 0 and res.stdout:
                 lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip() and "UUID" not in l]
                 if lines:
                     components.append(lines[0].encode("utf-8"))
+                    uuid_found = True
         except Exception:
             pass
 
+        # Windows 11+ fallback when wmic is deprecated/absent
+        if not uuid_found and sys.platform == "win32":
+            try:
+                ps_res = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID"],
+                    shell=False, capture_output=True, text=True, timeout=3, creationflags=flags
+                )
+                if ps_res.returncode == 0 and ps_res.stdout.strip():
+                    components.append(ps_res.stdout.strip().encode("utf-8"))
+            except Exception:
+                pass
+
         combined = b"|".join(components)
-        return hashlib.sha3_512(combined).digest()
+        cls._cached_entropy = hashlib.sha3_512(combined).digest()
+        return cls._cached_entropy
 
     @staticmethod
     def get_legacy_entropy() -> bytes:
         mac = str(uuid.getnode()).encode("utf-8")
         return hashlib.sha3_512(mac).digest()
+
+    @classmethod
+    def get_entropy_candidates(cls) -> List[bytes]:
+        """Returns ordered list of candidate hardware entropy signatures for unlock fallback."""
+        candidates = [cls.get_machine_entropy()]
+        legacy = cls.get_legacy_entropy()
+        if legacy not in candidates:
+            candidates.append(legacy)
+
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
+                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
+                if guid:
+                    mac_guid = hashlib.sha3_512(f"{uuid.getnode()}|{guid}".encode("utf-8")).digest()
+                    if mac_guid not in candidates:
+                        candidates.append(mac_guid)
+        except Exception:
+            pass
+
+        return candidates
 
     @classmethod
     def generate_nonce(cls, entropy: bytes, extra: bytes = b"") -> bytes:
@@ -88,9 +134,7 @@ class SerenityKeyVault:
         nonce = raw_payload[:12]
         ciphertext = raw_payload[12:]
 
-        # Try multi-factor machine entropy first, fallback to legacy OS MAC entropy for backward compatibility
-        for entropy_fn in [cls.get_machine_entropy, cls.get_legacy_entropy]:
-            entropy = entropy_fn()
+        for entropy in cls.get_entropy_candidates():
             try:
                 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
                 derived_key = hashlib.shake_256(entropy).digest(32)
@@ -165,13 +209,18 @@ LLAMA_SERVER_URL = f"{LLAMA_SERVER_BASE}/v1/completions"
 LLAMA_SERVER_CHAT_URL = f"{LLAMA_SERVER_BASE}/v1/chat/completions"
 llama_server_process = None
 
-# Model Mapping Config
+# Model Mapping Config & Role-Based Effort Levels
+SUPERVISOR_LOW_MODEL = "gemma-4-26B-A4B"
+SUPERVISOR_HIGH_MODEL = "gemma-4-26B-A4B"
+ORCHESTRATOR_TURBO_MODEL = "gemma-4-26B-A4B"
 SUPERVISOR_MODEL = "gemma-4-26B-A4B"
 W1_MODEL = "gemma-4-26B-A4B"       # Reasoning & Architecture
 W2_MODEL = "codegemma-7b-it"         # Heavy Code Synthesis
 W3_MODEL = "qwen3.6-35B-A3B"           # Fast Utilities / Scripting / Explanations
 W4_MODEL = "qwen3.6-27B"           # Additional specialized worker
 FIM_MODEL = "codegemma-2b"         # Inline Autocomplete
+
+auto_continue_enabled: bool = False  # Unlimited auto-continue iteration toggle
 
 AUTOSWAP_TIMEOUT = 240.0            # Seconds before swapping back to Supervisor VRAM
 CONTEXT_WINDOW = int(os.environ.get("SERENITY_CONTEXT_WINDOW", "16384")) # Configurable context window (default 16k)
@@ -180,6 +229,85 @@ MAX_RESPONSE_LENGTH = 1200          # Character limit for responses to Copilot C
 # KV Cache Compression Settings
 cache_type_k = "f16"
 cache_type_v = "f16"
+gpu_layers_override: Optional[int] = None
+
+# --- Config Persistence ---
+
+SERENITY_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serenity_config.json")
+
+def load_server_config():
+    """Loads saved server configuration from serenity_config.json on startup."""
+    global cache_type_k, cache_type_v, gpu_layers_override, CONTEXT_WINDOW, auto_continue_enabled
+    global CURRENT_MODEL, SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL
+    global SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL, model_consolidation
+    if not os.path.exists(SERENITY_CONFIG_PATH):
+        return
+    try:
+        with open(SERENITY_CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if cfg.get("cache_type_k"):
+            cache_type_k = cfg["cache_type_k"]
+        if cfg.get("cache_type_v"):
+            cache_type_v = cfg["cache_type_v"]
+        if cfg.get("gpu_layers") is not None:
+            gpu_layers_override = cfg["gpu_layers"]
+        if cfg.get("context_window") and cfg["context_window"] > 0:
+            CONTEXT_WINDOW = cfg["context_window"]
+        if cfg.get("auto_continue") is not None:
+            auto_continue_enabled = cfg["auto_continue"]
+        if cfg.get("current_model"):
+            CURRENT_MODEL = cfg["current_model"]
+        if cfg.get("model_consolidation") is not None:
+            model_consolidation = cfg["model_consolidation"]
+        # Role model assignments
+        roles = cfg.get("roles", {})
+        if roles.get("supervisor_low"):
+            SUPERVISOR_LOW_MODEL = roles["supervisor_low"]
+        if roles.get("supervisor_high"):
+            SUPERVISOR_HIGH_MODEL = roles["supervisor_high"]
+        if roles.get("orchestrator_turbo"):
+            ORCHESTRATOR_TURBO_MODEL = roles["orchestrator_turbo"]
+            SUPERVISOR_MODEL = roles["orchestrator_turbo"]
+        if roles.get("w1_reasoning"):
+            W1_MODEL = roles["w1_reasoning"]
+        if roles.get("w2_code"):
+            W2_MODEL = roles["w2_code"]
+        if roles.get("w3_fast"):
+            W3_MODEL = roles["w3_fast"]
+        if roles.get("w4_specialized"):
+            W4_MODEL = roles["w4_specialized"]
+        if roles.get("fim"):
+            FIM_MODEL = roles["fim"]
+        print(f"[+] Loaded saved config from {SERENITY_CONFIG_PATH} (ctx={CONTEXT_WINDOW}, K={cache_type_k}, V={cache_type_v}, gpu={gpu_layers_override})")
+    except Exception as e:
+        print(f"[!] Failed to load serenity_config.json: {e}")
+
+def save_server_config():
+    """Persists current server configuration to serenity_config.json."""
+    cfg = {
+        "cache_type_k": cache_type_k,
+        "cache_type_v": cache_type_v,
+        "gpu_layers": gpu_layers_override,
+        "context_window": CONTEXT_WINDOW,
+        "auto_continue": auto_continue_enabled,
+        "current_model": CURRENT_MODEL,
+        "model_consolidation": model_consolidation,
+        "roles": {
+            "supervisor_low": SUPERVISOR_LOW_MODEL,
+            "supervisor_high": SUPERVISOR_HIGH_MODEL,
+            "orchestrator_turbo": ORCHESTRATOR_TURBO_MODEL,
+            "w1_reasoning": W1_MODEL,
+            "w2_code": W2_MODEL,
+            "w3_fast": W3_MODEL,
+            "w4_specialized": W4_MODEL,
+            "fim": FIM_MODEL
+        }
+    }
+    try:
+        with open(SERENITY_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"[!] Failed to save serenity_config.json: {e}")
 
 # --- Security & Validation Helpers ---
 # NOTE: Security hardened - Subprocess command execution & path containment module
@@ -409,6 +537,61 @@ if importlib.util.find_spec("llama_cpp") is not None:
     except Exception:
         pass
 
+custom_models_dirs: List[str] = []
+
+def get_candidate_model_dirs() -> List[str]:
+    """Returns candidate directories to search for GGUF model files."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    dirs = [os.path.join(base_dir, "models")]
+    
+    # 1. Environment variables (SERENITY_MODELS_PATH, MODELS_DIR, MODELS_PATH)
+    env_paths = os.environ.get("SERENITY_MODELS_PATH") or os.environ.get("MODELS_DIR") or os.environ.get("MODELS_PATH")
+    if env_paths:
+        for p in env_paths.replace(";", os.pathsep).split(os.pathsep):
+            p = p.strip()
+            if p and os.path.exists(p) and p not in dirs:
+                dirs.append(p)
+                
+    # 2. Configured custom model directories in memory
+    for p in custom_models_dirs:
+        p = p.strip()
+        if p and os.path.exists(p) and p not in dirs:
+            dirs.append(p)
+            
+    # 3. Saved custom dirs in models_dirs.json
+    dirs_file = os.path.join(base_dir, "models_dirs.json")
+    if os.path.exists(dirs_file):
+        try:
+            with open(dirs_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, list):
+                    for p in saved:
+                        p = str(p).strip()
+                        if p and os.path.exists(p) and p not in dirs:
+                            dirs.append(p)
+        except Exception:
+            pass
+            
+    return dirs
+
+def add_custom_model_dir(dir_path: str) -> bool:
+    """Adds a custom folder path to search for GGUF models and updates models_dirs.json."""
+    if not dir_path or not os.path.exists(dir_path):
+        return False
+    norm_path = os.path.abspath(dir_path)
+    if norm_path not in custom_models_dirs:
+        custom_models_dirs.append(norm_path)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    dirs_file = os.path.join(base_dir, "models_dirs.json")
+    try:
+        with open(dirs_file, "w", encoding="utf-8") as f:
+            json.dump(custom_models_dirs, f, indent=4)
+    except Exception as e:
+        log_message(f"[Models] Error saving models_dirs.json: {e}")
+    # Refresh installed models
+    get_installed_models()
+    return True
+
 def resolve_gguf_path(model_name: str) -> Optional[str]:
     if not model_name:
         return None
@@ -432,16 +615,20 @@ def resolve_gguf_path(model_name: str) -> Optional[str]:
     if os.path.exists(model_name):
         return model_name
         
-    # 3. Check local models directory
-    models_dir = os.path.join(base_dir, "models")
+    # 3. Check candidate model directories (local models dir and custom folders)
     target_file = f"{model_name}.gguf" if not model_name.endswith('.gguf') else model_name
+    candidate_dirs = get_candidate_model_dirs()
     
-    if os.path.exists(os.path.join(models_dir, target_file)):
-        return os.path.join(models_dir, target_file)
-        
-    for root, _, files in os.walk(models_dir):
-        if target_file in files:
-            return os.path.join(root, target_file)
+    for models_dir in candidate_dirs:
+        if not os.path.exists(models_dir):
+            continue
+        direct_match = os.path.join(models_dir, target_file)
+        if os.path.exists(direct_match):
+            return direct_match
+            
+        for root, _, files in os.walk(models_dir):
+            if target_file in files:
+                return os.path.join(root, target_file)
             
     return None
 
@@ -523,6 +710,14 @@ async def start_llama_server(model_name: str, n_ctx: int):
     import shutil
     llama_bin = os.environ.get("LLAMA_SERVER_BIN") or shutil.which("llama-server") or shutil.which("llama-server.exe")
     if not llama_bin:
+        for p in [
+            r"C:\Program Files\Android\Android Studio\plugins\gemini\resources\llamacpp\llama-server.exe",
+            r"C:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC\temp_zip\llama-server.exe"
+        ]:
+            if os.path.exists(p):
+                llama_bin = p
+                break
+    if not llama_bin:
         log_message("[Llama-Server] llama-server executable not found in PATH or LLAMA_SERVER_BIN.")
         raise FileNotFoundError("llama-server executable not found in PATH. Set LLAMA_SERVER_BIN or install llama-server.")
 
@@ -533,8 +728,16 @@ async def start_llama_server(model_name: str, n_ctx: int):
         "-ngl", str(gpu_layers),
         "--port", "8080",
         "--host", "127.0.0.1",
-        "-fa" # flash attention
+        "-fa", "on" # flash attention
     ]
+    if "glimmer" in model_name.lower():
+        base_model_dir = os.path.dirname(gguf_path)
+        chat_template_path = os.path.join(base_model_dir, "chat template.txt")
+        if not os.path.exists(chat_template_path) and os.path.exists(r"S:\LLM\META ASI (Muse Glimmer)\chat template.txt"):
+            chat_template_path = r"S:\LLM\META ASI (Muse Glimmer)\chat template.txt"
+            
+        if os.path.exists(chat_template_path):
+            cmd.extend(["--chat-template-file", chat_template_path])
     if cache_type_k and cache_type_k != "f16":
         cmd.extend(["--cache-type-k", cache_type_k])
     if cache_type_v and cache_type_v != "f16":
@@ -546,48 +749,62 @@ async def start_llama_server(model_name: str, n_ctx: int):
     
     import subprocess
     try:
-        # Popen to run in background
+        # Popen capturing stdout and stderr to inspect process health and log errors
         llama_server_process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
         )
         
         # Poll health status to ensure it's ready
         log_message("[Llama-Server] Server process spawned. Polling health check...")
-        import urllib.request
-        import urllib.error
         
         healthy = False
-        for i in range(45):
-            await asyncio.sleep(1.0)
+        err_msg = ""
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            for i in range(45):
+                await asyncio.sleep(1.0)
 
-            try:
-                req = urllib.request.Request(f"{LLAMA_SERVER_BASE}/health")
-                with urllib.request.urlopen(req, timeout=1.0) as response:
-                    if response.status == 200:
+                # Instant check: if process died, break immediately and capture stderr
+                if llama_server_process.poll() is not None:
+                    _, stderr_out = llama_server_process.communicate()
+                    err_msg = stderr_out.strip() or f"Exited with code {llama_server_process.returncode}"
+                    log_message(f"[Llama-Server Error] Process exited prematurely: {err_msg}")
+                    break
+
+                try:
+                    res = await client.get(f"{LLAMA_SERVER_BASE}/health")
+                    if res.status_code == 200:
                         healthy = True
                         break
-            except Exception:
-                try:
-                    req = urllib.request.Request(f"{LLAMA_SERVER_BASE}/v1/models")
-                    with urllib.request.urlopen(req, timeout=1.0) as response:
-                        if response.status == 200:
+                except Exception:
+                    try:
+                        res = await client.get(f"{LLAMA_SERVER_BASE}/v1/models")
+                        if res.status_code == 200:
                             healthy = True
                             break
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
         
         if healthy:
             log_message("[Llama-Server] Server is healthy and responding.")
             active_llama_server_model_name = model_name
         else:
-            log_message("[Llama-Server] Warning: Server failed health check after 45 seconds, proceeding anyway.")
-            active_llama_server_model_name = model_name
+            if not err_msg:
+                if llama_server_process.poll() is not None:
+                    _, stderr_out = llama_server_process.communicate()
+                    err_msg = stderr_out.strip() or f"Exited with code {llama_server_process.returncode}"
+                else:
+                    err_msg = "Health check timed out after 45 seconds"
+            log_message(f"[Llama-Server Error] Startup failed: {err_msg}")
+            unload_llama_server()
+            raise RuntimeError(f"llama-server failed to start: {err_msg}")
     except Exception as e:
         log_message(f"[Llama-Server] Failed to spawn server: {e}")
-        llama_server_process = None
-        active_llama_server_model_name = None
+        unload_llama_server()
         raise RuntimeError(f"Failed to spawn llama-server: {e}")
 
 
@@ -652,74 +869,117 @@ def get_llama_model(model_name: str, n_ctx: int = 16384, cache_type_k: str = "f1
             
         log_message(f"[Llama-CPP] Loading {model_name} from {gguf_path} (n_ctx={n_ctx}, gpu_layers={gpu_layers}) with KV cache compression K={cache_type_k}, V={cache_type_v}...")
         from llama_cpp import Llama
-        active_llama_model = Llama(
-            model_path=gguf_path,
-            n_ctx=n_ctx,
-            n_gpu_layers=gpu_layers,
-            flash_attn=True,
-            offload_kqv=offload_kqv,
-            n_threads=8,
-            verbose=False,
-            type_k=get_ggml_type(cache_type_k),
-            type_v=get_ggml_type(cache_type_v)
-        )
+        try:
+            active_llama_model = Llama(
+                model_path=gguf_path,
+                n_ctx=n_ctx,
+                n_gpu_layers=gpu_layers,
+                flash_attn=True,
+                offload_kqv=offload_kqv,
+                n_threads=8,
+                verbose=False,
+                type_k=get_ggml_type(cache_type_k),
+                type_v=get_ggml_type(cache_type_v)
+            )
+        except Exception as load_err:
+            log_message(f"[VRAM-GUARD] Initial model instantiation failed: {load_err}. Engaging Safe Recovery Fallback...")
+            try:
+                fallback_layers = max(1, gpu_layers // 2) if gpu_layers > 1 else 0
+                log_message(f"[VRAM-GUARD] Retrying with safe layers={fallback_layers}, offload_kqv=False, flash_attn=False...")
+                active_llama_model = Llama(
+                    model_path=gguf_path,
+                    n_ctx=n_ctx,
+                    n_gpu_layers=fallback_layers,
+                    flash_attn=False,
+                    offload_kqv=False,
+                    n_threads=8,
+                    verbose=False,
+                    type_k=get_ggml_type(cache_type_k),
+                    type_v=get_ggml_type(cache_type_v)
+                )
+            except Exception as load_err2:
+                log_message(f"[VRAM-GUARD] Safe layer fallback failed: {load_err2}. Retrying on CPU (n_gpu_layers=0)...")
+                active_llama_model = Llama(
+                    model_path=gguf_path,
+                    n_ctx=n_ctx,
+                    n_gpu_layers=0,
+                    flash_attn=False,
+                    offload_kqv=False,
+                    n_threads=8,
+                    verbose=False,
+                    type_k=get_ggml_type(cache_type_k),
+                    type_v=get_ggml_type(cache_type_v)
+                )
 
         active_llama_model_name = model_name
     return active_llama_model
 
+direct_llama_lock = threading.Lock()
+
 async def generate_completion_stream(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None, min_p: float = 0.05, repeat_penalty: float = 1.05):
     if stop is None:
         stop = ["<turn|>", "<|turn|>", "<bos>", "<eos>"]
-    if llama_cpp_available:
+    if llama_cpp_available and "glimmer" not in model_name.lower():
         try:
             gguf_path = resolve_gguf_path(model_name)
             if gguf_path:
                 queue = asyncio.Queue()
-                loop = asyncio.get_event_loop()
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.get_event_loop()
+                cancel_event = threading.Event()
+
                 def producer():
                     try:
-                        llm = get_llama_model(model_name, num_ctx)
-                        # Dynamically check if prompt length exceeds current context window
-                        try:
-                            import math
-                            prompt_tokens = llm.tokenize(prompt.encode('utf-8'))
-                            token_count = len(prompt_tokens)
-                            # Give a safety buffer (default to 8192 if max_tokens is -1 or None)
-                            headroom = max_tokens if max_tokens > 0 else 8192
-                            needed_ctx = token_count + headroom
-                            if needed_ctx > llm.n_ctx():
-                                required_ctx = math.ceil(needed_ctx / 8192) * 8192
-                                log_message(f"[Llama-CPP] Prompt tokens ({token_count}) + headroom ({headroom}) exceeds loaded context limit ({llm.n_ctx()}). Dynamic reloading to n_ctx={required_ctx}...")
-                                llm = get_llama_model(model_name, required_ctx)
-                        except Exception as token_ex:
-                            log_message(f"[Llama-CPP] Error during token count pre-check: {token_ex}")
+                        with direct_llama_lock:
+                            if cancel_event.is_set():
+                                return
+                            llm = get_llama_model(model_name, num_ctx)
+                            # Dynamically check if prompt length exceeds current context window
+                            try:
+                                import math
+                                prompt_tokens = llm.tokenize(prompt.encode('utf-8'))
+                                token_count = len(prompt_tokens)
+                                # Give a safety buffer (default to 8192 if max_tokens is -1 or None)
+                                headroom = max_tokens if max_tokens > 0 else 8192
+                                needed_ctx = token_count + headroom
+                                if needed_ctx > llm.n_ctx():
+                                    required_ctx = math.ceil(needed_ctx / 8192) * 8192
+                                    log_message(f"[Llama-CPP] Prompt tokens ({token_count}) + headroom ({headroom}) exceeds loaded context limit ({llm.n_ctx()}). Dynamic reloading to n_ctx={required_ctx}...")
+                                    llm = get_llama_model(model_name, required_ctx)
+                            except Exception as token_ex:
+                                log_message(f"[Llama-CPP] Error during token count pre-check: {token_ex}")
 
-                        limit_tokens = max_tokens if max_tokens > 0 else None
-                        chunks = llm(
-                            prompt=prompt,
-                            max_tokens=limit_tokens,
-                            temperature=temperature,
-                            stop=stop,
-                            stream=True,
-                            min_p=min_p,
-                            repeat_penalty=repeat_penalty
-                        )
-                        for chunk in chunks:
-                            if not isinstance(chunk, dict):
-                                continue
-                            choices = chunk.get("choices")
-                            if not isinstance(choices, list) or len(choices) == 0:
-                                continue
-                            first_choice = choices[0]
-                            if not isinstance(first_choice, dict):
-                                continue
-                            text = first_choice.get("text", "")
-                            if text:
-                                loop.call_soon_threadsafe(queue.put_nowait, text)
+                            limit_tokens = max_tokens if max_tokens > 0 else None
+                            chunks = llm(
+                                prompt=prompt,
+                                max_tokens=limit_tokens,
+                                temperature=temperature,
+                                stop=stop,
+                                stream=True,
+                                min_p=min_p,
+                                repeat_penalty=repeat_penalty
+                            )
+                            for chunk in chunks:
+                                if cancel_event.is_set():
+                                    break
+                                if not isinstance(chunk, dict):
+                                    continue
+                                choices = chunk.get("choices")
+                                if not isinstance(choices, list) or len(choices) == 0:
+                                    continue
+                                first_choice = choices[0]
+                                if not isinstance(first_choice, dict):
+                                    continue
+                                text = first_choice.get("text", "")
+                                if text:
+                                    loop.call_soon_threadsafe(queue.put_nowait, text)
                     except Exception as ex:
                         loop.call_soon_threadsafe(queue.put_nowait, ex)
                     finally:
                         loop.call_soon_threadsafe(queue.put_nowait, None)
+
                 loop.run_in_executor(None, producer)
                 try:
                     while True:
@@ -730,6 +990,7 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                             raise val
                         yield val
                 except asyncio.CancelledError:
+                    cancel_event.set()
                     log_message("[Llama-CPP Stream] Stream cancelled by client connection drop.")
                     raise
                 return
@@ -740,8 +1001,37 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
             log_message(f"[Llama-CPP Stream Error] Direct streaming failed, falling back to Llama-Server API: {e}")
 
     # Start or ensure llama-server is running for this model
-    if llama_server_process is None or active_llama_server_model_name != model_name:
-        await start_llama_server(model_name, num_ctx)
+    try:
+        if llama_server_process is None or active_llama_server_model_name != model_name:
+            await start_llama_server(model_name, num_ctx)
+    except Exception as server_err:
+        log_message(f"[Llama-Server Startup Error] {server_err}")
+        if llama_cpp_available and resolve_gguf_path(model_name):
+            log_message(f"[Fallback] Attempting direct llama_cpp load for '{model_name}'...")
+            try:
+                llm = get_llama_model(model_name, num_ctx)
+                chunks = llm(
+                    prompt=prompt,
+                    max_tokens=max_tokens if max_tokens > 0 else None,
+                    temperature=temperature,
+                    stop=stop,
+                    stream=True,
+                    min_p=min_p,
+                    repeat_penalty=repeat_penalty
+                )
+                for chunk in chunks:
+                    if isinstance(chunk, dict) and "choices" in chunk and len(chunk["choices"]) > 0:
+                        text = chunk["choices"][0].get("text", "")
+                        if text:
+                            yield text
+                return
+            except Exception as direct_err:
+                log_message(f"[Fallback Error] Direct llama_cpp load also failed for '{model_name}': {direct_err}")
+                yield f"\n\n❌ **Model Error:** Failed to load model '{model_name}' (unsupported GGUF architecture). Please switch to a supported model like `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` or `gemma-4-E4B-it-Coder.Q4_K_M`."
+                return
+        else:
+            yield f"\n\n❌ **Model Error:** Failed to load model '{model_name}' (unsupported GGUF architecture). Please switch to a supported model like `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` or `gemma-4-E4B-it-Coder.Q4_K_M`."
+            return
 
     payload = {
         "model": model_name,
@@ -784,7 +1074,50 @@ async def generate_completion(model_name: str, prompt: str, temperature: float, 
         raise
     return {"response": "".join(result)}
 
-SUPERVISOR_PROMPT = """
+PYTHON_TOOL_STUBS = """AVAILABLE TOOLS (Programmatic Tool Calling - Typed Python Stubs):
+```python
+def create_or_update_plan(steps: list[str], current_focus: str) -> dict:
+    \"\"\"Validates or updates the multi-step execution plan.\"\"\"
+    ...
+
+def list_directory(path: str = ".") -> list[str]:
+    \"\"\"Lists all files and directories in the target workspace path.\"\"\"
+    ...
+
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+    \"\"\"Reads code from a file. If the file is large, start_line and end_line (1-indexed, inclusive) must be specified to read target regions and prevent context bloat.\"\"\"
+    ...
+
+def write_file(path: str, content: str) -> str:
+    \"\"\"Writes or overwrites code at path.\"\"\"
+    ...
+
+def insert_edit_into_file(path: str, target_content: str, new_content: str) -> str:
+    \"\"\"Inserts new content in place of target content in a file.\"\"\"
+    ...
+
+def replace_string_in_file(path: str, target_content: str, new_content: str) -> str:
+    \"\"\"Replaces target content with new content in a file.\"\"\"
+    ...
+
+def multi_replace_string_in_file(path: str, replacements: list[dict[str, str]]) -> str:
+    \"\"\"Replaces multiple specific non-adjacent or adjacent text blocks in a file by locating the exact 'target' string and replacing it with the 'replacement' string. Use this instead of write_file to avoid context limits.\"\"\"
+    ...
+
+def grep_search(query: str, path: str = ".") -> list[str]:
+    \"\"\"Searches for text patterns across project files.\"\"\"
+    ...
+
+def run_command(command: str) -> str:
+    \"\"\"Runs a shell command in the workspace and returns stdout/stderr. Use this to run tests, linters, or build scripts.\"\"\"
+    ...
+```
+HOW TO CALL TOOLS:
+When you need to inspect files, execute code, run tests, or modify files, you MUST invoke tools as Python function calls directly (e.g. `read_file(path="main.py")` or `run_command(command="...")`) or wrapped in ```python ... ``` blocks.
+Do NOT talk about calling tools or state that you will call tools in plain natural language without executing the function call. Call the function directly."""
+
+SUPERVISOR_PROMPT = f"""
+Reasoning strength: xhigh.
 You are the Orchestrator of a multi-agent system. Your goal is to manage tasks by delegating to specialized workers or using available tools.
 
 AVAILABLE WORKERS:
@@ -795,8 +1128,7 @@ AVAILABLE WORKERS:
 - codegemma-7b-it-f16(Agent): Specializes in heavy code synthesis and complex programming tasks
 - gemma-4-v2-Q4_K_M(Agent): Built on the 12B architecture for coding + agentic work — writing code, running commands, using tools, debugging, multi-step technical tasks.
 
-AVAILABLE TOOLS:
-- [Tool Name]: [Tool Description]
+{PYTHON_TOOL_STUBS}
 
 DECISION PROCESS:
 1. Analyze the current state and user request.
@@ -805,36 +1137,16 @@ DECISION PROCESS:
 4. Formulate a precise instruction or tool call.
 
 OUTPUT FORMAT:
-You MUST respond with a single JSON object. Do not include any text before or after the JSON.
+You MUST respond with a single JSON object or Programmatic Tool Call. Do not include extraneous text.
 
 SCHEMA:
-{
+{{
   "action": "call_tool" | "delegate_worker",
   "target": "name_of_tool_or_worker",
-  "tool_arguments": { "key": "value" }, // Only if action is 'call_tool'. Otherwise null.
-  "instructions": "Detailed instructions for the worker", // Only if action is 'delegate_worker'. Otherwise null.
-  "reasoning": "Brief explanation of why this action was chosen"
-}
-
-EXAMPLES:
-
-Example 1: Calling a tool
-{
-  "action": "call_tool",
-  "target": "read_file",
-  "tool_arguments": { "path": "config.json" },
-  "instructions": null,
-  "reasoning": "I need to check the configuration file to proceed."
-}
-
-Example 2: Delegating to a worker
-{
-  "action": "delegate_worker",
-  "target": "Worker 1",
-  "tool_arguments": null,
-  "instructions": "Analyze the logs in /var/log/syslog and summarize errors.",
-  "reasoning": "Worker 1 is the expert in log analysis."
-}
+  "arguments_or_instructions": {{ "key": "value" }} or "string_instructions",
+  "step_summary": "Short summary of the step",
+  "reason": "Brief explanation of why this action was chosen"
+}}
 """
 class QueryRequest(BaseModel):
     prompt: str
@@ -843,6 +1155,7 @@ class QueryRequest(BaseModel):
     session_id: Optional[str] = None
     workspace_dir: Optional[str] = None
     max_steps: Optional[int] = None
+    auto_continue: Optional[bool] = None
 
 class FimRequest(BaseModel):
     prefix: str
@@ -888,30 +1201,33 @@ def get_installed_models() -> List[str]:
         except Exception as e:
             log_message(f"[Models] Error reading models.json: {e}")
 
-    # 2. Scan local models directory and update map
-    models_dir = os.path.join(base_dir, "models")
-    try:
-        if not os.path.exists(models_dir):
-            os.makedirs(models_dir, exist_ok=True)
-            
-        for root, _, files in os.walk(models_dir):
-            for f in files:
-                if f.endswith('.gguf'):
-                    name = f[:-5]
-                    name_lower = name.lower()
-                    # Filter out MTP, assistant, and mmproj files
-                    if any(tag in name_lower for tag in ['mmproj', 'assistant', 'mtp']):
-                        continue
-                    if name not in models:
-                        models.append(name) # remove .gguf extension
-                    
-                    # Ensure absolute path is in the map
-                    abs_path = os.path.abspath(os.path.join(root, f))
-                    if name not in model_map or model_map[name] != abs_path:
-                        model_map[name] = abs_path
-                        map_updated = True
-    except Exception as e:
-        log_message(f"[Startup Error] Failed to list models: {e}")
+    # 2. Scan candidate model directories and update map
+    candidate_dirs = get_candidate_model_dirs()
+    for models_dir in candidate_dirs:
+        try:
+            if not os.path.exists(models_dir):
+                if models_dir == os.path.join(base_dir, "models"):
+                    os.makedirs(models_dir, exist_ok=True)
+                continue
+                
+            for root, _, files in os.walk(models_dir):
+                for f in files:
+                    if f.endswith('.gguf'):
+                        name = f[:-5]
+                        name_lower = name.lower()
+                        # Filter out MTP, assistant, and mmproj files
+                        if any(tag in name_lower for tag in ['mmproj', 'assistant', 'mtp']):
+                            continue
+                        if name not in models:
+                            models.append(name) # remove .gguf extension
+                        
+                        # Ensure absolute path is in the map
+                        abs_path = os.path.abspath(os.path.join(root, f))
+                        if name not in model_map or model_map[name] != abs_path:
+                            model_map[name] = abs_path
+                            map_updated = True
+        except Exception as e:
+            log_message(f"[Startup Error] Failed to scan models in {models_dir}: {e}")
         
     # 3. Save updated map back to models.json if changes occurred
     if map_updated or not os.path.exists(json_path):
@@ -925,7 +1241,7 @@ def get_installed_models() -> List[str]:
 
 def check_and_register_models():
     """Initializes active model targets by auto-discovering GGUFs."""
-    global active_models_list, SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
+    global active_models_list, SUPERVISOR_MODEL, SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
     log_message("[Startup] Scanning for local model files...")
     active_models_list = get_installed_models()
     log_message(f"[Startup] Found models: {active_models_list}")
@@ -945,11 +1261,14 @@ def check_and_register_models():
         
         super_candidates = [m for m in main_models if 'a4b' in m.lower() or '35b' in m.lower() or '26b' in m.lower()]
         SUPERVISOR_MODEL = super_candidates[0] if super_candidates else main_models[0]
+        SUPERVISOR_LOW_MODEL = SUPERVISOR_MODEL
+        SUPERVISOR_HIGH_MODEL = SUPERVISOR_MODEL
+        ORCHESTRATOR_TURBO_MODEL = SUPERVISOR_MODEL
         W1_MODEL = SUPERVISOR_MODEL
         W3_MODEL = super_candidates[1] if len(super_candidates) > 1 else SUPERVISOR_MODEL
         W4_MODEL = super_candidates[2] if len(super_candidates) > 2 else SUPERVISOR_MODEL
         
-        log_message(f"[Startup] Auto-Assigned Supervisor: {SUPERVISOR_MODEL}")
+        log_message(f"[Startup] Auto-Assigned Supervisor (Low/High/Turbo): {SUPERVISOR_MODEL}")
         log_message(f"[Startup] Auto-Assigned Agent (Code): {W2_MODEL}")
         log_message(f"[Startup] Auto-Assigned Agent (FIM): {FIM_MODEL}")
 
@@ -1015,22 +1334,25 @@ app.add_middleware(PQCEnforcementMiddleware, secret_key=LOCAL_API_KEY)
 
 # --- GPU Layer Offloading Helpers ---
 
-def get_vram_info() -> dict:
-    """Queries GPU VRAM metrics: Total, Free, Used, Self (devserver/llama-server), and Target Usable VRAM."""
+def get_vram_info(ctx_size: int = 16384) -> dict:
+    """Queries GPU VRAM metrics: Total, Free, Used, Self (devserver/llama-server), and Target Usable VRAM with Shared VRAM Guard."""
     total_mb = 0.0
     free_mb = 0.0
     used_mb = 0.0
     self_used_mb = 0.0
 
-    # 1. High precision query via pynvml
+    # 1. High precision query via pynvml / nvidia-ml-py
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        total_mb = mem_info.total / (1024 * 1024)
-        free_mb = mem_info.free / (1024 * 1024)
-        used_mb = mem_info.used / (1024 * 1024)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_mb = mem_info.total / (1024 * 1024)
+            free_mb = mem_info.free / (1024 * 1024)
+            used_mb = mem_info.used / (1024 * 1024)
 
         target_pids = {os.getpid()}
         if 'llama_server_process' in globals() and llama_server_process and llama_server_process.poll() is None:
@@ -1046,9 +1368,10 @@ def get_vram_info() -> dict:
     # 2. Fallback query via nvidia-smi
     if total_mb <= 0:
         try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             res = subprocess.run(
                 ["nvidia-smi", "--query-gpu=memory.total,memory.free,memory.used", "--format=csv,nounits,noheader"],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, creationflags=flags
             )
             lines = res.stdout.strip().split("\n")
             if lines:
@@ -1064,14 +1387,22 @@ def get_vram_info() -> dict:
         used_mb = 2144.0
 
     usable_mb = free_mb + self_used_mb
-    target_vram = max(500.0, usable_mb - 300.0)
-    target_vram = min(target_vram, total_mb - 300.0)
+    
+    # Shared VRAM Guard:
+    # Scale safety headroom by context size to protect against compute graph & CUDA runtime overhead
+    # Base CUDA driver buffer (600 MB) + context-scaled graph scratch memory
+    graph_scratch_mb = max(256.0, (ctx_size / 49152.0) * 800.0)
+    safety_headroom_mb = min(1800.0, 600.0 + graph_scratch_mb)
+    
+    target_vram = max(200.0, usable_mb - safety_headroom_mb)
+    target_vram = min(target_vram, total_mb - safety_headroom_mb)
 
     return {
         "total": total_mb,
         "free": free_mb,
         "used": used_mb,
         "self_used": self_used_mb,
+        "headroom": safety_headroom_mb,
         "available_target": target_vram
     }
 
@@ -1080,68 +1411,119 @@ def get_target_vram_mb() -> float:
 
 
 def get_model_info(model_name: str):
-    """Estimate model info from local GGUF or fallback to defaults."""
+    """Estimate model info (layers, size, native context length) from local GGUF or fallback to defaults."""
     gguf_path = resolve_gguf_path(model_name)
     if gguf_path and os.path.exists(gguf_path):
         size = os.path.getsize(gguf_path)
-        # Parse block count from GGUF metadata
+        layers = None
+        ctx_len = None
+        # Parse block count and context length from GGUF metadata
         try:
             import struct
             with open(gguf_path, "rb") as f:
-                header = f.read(64 * 1024)
+                header = f.read(128 * 1024)
                 if header[:4] == b'GGUF':
-                    idx = header.find(b"block_count")
-                    if idx != -1:
-                        type_offset = idx + len("block_count")
+                    idx_bc = header.find(b"block_count")
+                    if idx_bc != -1:
+                        type_offset = idx_bc + len("block_count")
                         val_type = struct.unpack("<I", header[type_offset:type_offset+4])[0]
                         if val_type in (4, 5):  # UINT32 or INT32
-                            layers = struct.unpack("<I" if val_type == 4 else "<i", header[type_offset+4:type_offset+8])[0]
-                            if 0 < layers < 150:
-                                return layers, size
+                            l_val = struct.unpack("<I" if val_type == 4 else "<i", header[type_offset+4:type_offset+8])[0]
+                            if 0 < l_val < 150:
+                                layers = l_val
+
+                    idx_ctx = header.find(b"context_length")
+                    if idx_ctx != -1:
+                        type_offset = idx_ctx + len("context_length")
+                        val_type = struct.unpack("<I", header[type_offset:type_offset+4])[0]
+                        if val_type in (4, 5):
+                            c_val = struct.unpack("<I" if val_type == 4 else "<i", header[type_offset+4:type_offset+8])[0]
+                            if c_val >= 512:
+                                ctx_len = c_val
+                        elif val_type in (8, 10):
+                            c_val = struct.unpack("<Q" if val_type == 8 else "<q", header[type_offset+4:type_offset+12])[0]
+                            if c_val >= 512:
+                                ctx_len = c_val
         except Exception:
             pass
-        # Fallbacks based on size
-        if size > 20 * 1024 * 1024 * 1024:
-            return 60, size
-        elif size > 10 * 1024 * 1024 * 1024:
-            return 40, size
-        return 32, size
-    return 32, int(7e9 * 0.55)
+
+        if layers is None:
+            # Fallbacks based on size
+            if size > 20 * 1024 * 1024 * 1024:
+                layers = 60
+            elif size > 10 * 1024 * 1024 * 1024:
+                layers = 40
+            else:
+                layers = 32
+        return layers, size, ctx_len
+    return 32, int(7e9 * 0.55), None
 
 def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, bool]:
-    vram_info = get_vram_info()
+    """
+    Calculates safe GPU layer offload and KV cache offloading strategy with Shared VRAM Guard.
+    Guards against GGML_SCHED_MAX_SPLIT_INPUTS graph assertion failures and Windows Shared VRAM thrashing.
+    """
+    global gpu_layers_override
+    if gpu_layers_override is not None:
+        total_layers, _, _ = get_model_info(model_name)
+        if total_layers == 0:
+            total_layers = 32
+        final_layers = max(0, min(total_layers, gpu_layers_override)) if gpu_layers_override >= 0 else total_layers
+        log_message(f"[VRAM-CONFIG] Using explicit GPU layer offload: {final_layers}/{total_layers} layers.")
+        return final_layers, True
+
+    vram_info = get_vram_info(ctx_size=ctx_size)
     targeted_reserve_vram_mb = vram_info["available_target"]
-    total_layers, model_base_vram_bytes = get_model_info(model_name)
+    total_layers, model_base_vram_bytes, _ = get_model_info(model_name)
     if total_layers == 0:
         total_layers = 32
     
     model_base_vram_mb = model_base_vram_bytes / (1024 * 1024)
     vram_per_layer = model_base_vram_mb / total_layers
     
+    # Estimate KV cache requirement
     kv_cache_vram_mb = max(256.0, (ctx_size / 49152.0) * 3150.0)
-        
-    available_weight_vram = targeted_reserve_vram_mb - kv_cache_vram_mb
-    offload_kqv = True
     
-    if available_weight_vram <= 0:
-        log_message(f"[DYNAMIC AUTO-OFFLOAD] Cache footprint ({kv_cache_vram_mb:.1f}MB) saturates VRAM. Moving KV Cache to RAM to preserve GPU layers.")
-        available_weight_vram = targeted_reserve_vram_mb
+    # Shared VRAM & Graph-Split Guard Strategy:
+    # 1. If context is high (>= 16384) or model has SWA (e.g. gemma, gemma-4) or model cannot fit 100% on GPU,
+    #    offloading KV cache to GPU while splitting layers causes GGML_SCHED_MAX_SPLIT_INPUTS assertion crashes.
+    # 2. Moving KV cache to system RAM preserves GPU memory strictly for layer weights and avoids split input graph explosion.
+    if (model_base_vram_mb + kv_cache_vram_mb) <= targeted_reserve_vram_mb:
+        # Full model and KV cache fit cleanly within dedicated VRAM
+        safe_layers = total_layers
+        offload_kqv = True
+    elif model_base_vram_mb <= targeted_reserve_vram_mb:
+        # Weights fit in VRAM, but KV cache would risk spilling into shared memory / graph pressure
+        safe_layers = total_layers
         offload_kqv = False
+        log_message(f"[VRAM-GUARD] Model weights fit entirely in VRAM ({model_base_vram_mb:.1f}MB). Retaining KV Cache in RAM to guard against Shared VRAM paging.")
+    else:
+        # Partial layer offload required
+        # For partial offload, ALWAYS keep KV cache in RAM to prevent GGML split graph overflows & VRAM thrash
+        offload_kqv = False
+        available_weight_vram = targeted_reserve_vram_mb
+        safe_layers = int(available_weight_vram // vram_per_layer)
         
-    safe_layers = int(available_weight_vram // vram_per_layer)
+        # Guard against micro-splits
+        if safe_layers < 2:
+            safe_layers = 1
+        safe_layers = max(1, min(total_layers, safe_layers))
+        log_message(f"[VRAM-GUARD] Partial layer offload mode ({safe_layers}/{total_layers} layers). KV Cache pinned to RAM (offload_kqv=False) to prevent GGML_SCHED_MAX_SPLIT_INPUTS graph assertion crashes.")
+
     final_layers = max(1, min(total_layers, safe_layers))
     
-    log_message("--- DYNAMIC VRAM REPORT ---")
+    log_message("--- SHARED VRAM GUARD REPORT ---")
     log_message(f"Model:            {model_name}")
     log_message(f"Total GPU VRAM:   {vram_info['total']:.1f} MiB")
     log_message(f"Free VRAM:        {vram_info['free']:.1f} MiB")
     log_message(f"Self VRAM:        {vram_info['self_used']:.1f} MiB")
+    log_message(f"Guard Headroom:   {vram_info['headroom']:.1f} MiB")
     log_message(f"Total Layers:     {total_layers}")
     log_message(f"File Size:        {model_base_vram_mb:.1f} MiB (~{vram_per_layer:.1f} MiB/layer)")
     log_message(f"Est. KV Cache:    {kv_cache_vram_mb:.1f} MiB (Offloaded: {offload_kqv})")
     log_message(f"Target VRAM:      {targeted_reserve_vram_mb:.1f} MiB")
     log_message(f"Action:           Offloading {final_layers}/{total_layers} layers to GPU")
-    log_message("----------------------------")
+    log_message("--------------------------------")
     return final_layers, offload_kqv
 
 # --- Graceful Fallbacks ---
@@ -1171,15 +1553,14 @@ async def resolve_model(target: str) -> str:
     log_message(f"[Fallback] Model '{target}' not found. Falling back to '{SUPERVISOR_MODEL}'.")
     return SUPERVISOR_MODEL
 
-def clean_thought_and_whitespace(text: str) -> str:
-    """Removes thinking blocks, tool call tags, and leading/trailing blank lines/whitespace."""
+def strip_thought_blocks(text: str) -> str:
+    """Removes thinking/reasoning blocks only, preserving all tool calls and response content."""
     if not text:
         return ""
     orig_text = text
     text = re.sub(r'ễ.*?ễ', '', text, flags=re.DOTALL)
     text = re.sub(r'<\|?(?:thought|think)\|?>.*?(?:</\|?(?:thought|think)\|?>)', '', text, flags=re.DOTALL)
     text = re.sub(r'<\|?channel\|?>?thought.*?(?:<channel\|?>?)', '', text, flags=re.DOTALL)
-    text = _strip_tool_call_tags(text)
     
     cleaned = text.strip()
     if not cleaned:
@@ -1187,12 +1568,19 @@ def clean_thought_and_whitespace(text: str) -> str:
         unclosed_stripped = orig_text
         unclosed_stripped = re.sub(r'<\|?(?:thought|think)\|?>.*$', '', unclosed_stripped, flags=re.DOTALL)
         unclosed_stripped = re.sub(r'<\|?channel\|?>?thought.*$', '', unclosed_stripped, flags=re.DOTALL)
-        unclosed_stripped = _strip_tool_call_tags(unclosed_stripped)
         cleaned_unclosed = unclosed_stripped.strip()
         if cleaned_unclosed:
             return cleaned_unclosed
         return orig_text.strip()
     return cleaned
+
+def clean_thought_and_whitespace(text: str) -> str:
+    """Removes thinking blocks, tool call tags, and leading/trailing blank lines/whitespace for final display."""
+    if not text:
+        return ""
+    text = strip_thought_blocks(text)
+    text = _strip_tool_call_tags(text)
+    return text.strip()
 
 def normalize_tool_action(obj: Any) -> Optional[Dict[str, Any]]:
     """Normalizes parsed JSON dicts or arrays into standard Serenity tool call structures."""
@@ -1234,6 +1622,9 @@ def _strip_tool_call_tags(text: str) -> str:
     # Fast check
     if "call:" not in text and "<|tool_call" not in text and "<tool_call" not in text and "tool_call" not in text and "```json" not in text:
         return text
+
+    # Strip XML-style <tool_call>...</tool_call>
+    text = re.sub(r'<tool_call>.*?(?:</tool_call>|$)', '', text, flags=re.DOTALL)
 
     # Pre-pass: Strip markdown code blocks containing tool call JSON
     text = re.sub(r'```json\s*\{\s*["\']action["\']\s*:\s*["\'](?:call_tool|delegate_worker)["\'].*?```', '', text, flags=re.DOTALL)
@@ -1278,7 +1669,7 @@ def _strip_tool_call_tags(text: str) -> str:
 
         # Consume trailing closing tool_call tags if present
         tail = text[end_idx:]
-        end_tag_match = re.match(r'\s*(?:<\|?tool_call\|?>?|<\|?tool_call\|?>|</tool_call>|<tool_call\|?>)', tail)
+        end_tag_match = re.match(r'\s*(?:<\|?tool_call\|?>|</?\|?tool_call\|?>)', tail)
         if end_tag_match:
             end_idx += end_tag_match.end()
 
@@ -1289,7 +1680,7 @@ def _strip_tool_call_tags(text: str) -> str:
 
     cleaned_text = "".join(result)
     # Secondary pass to strip any orphaned <|tool_call>, <tool_call|>, </tool_call> tags left in stream
-    cleaned_text = re.sub(r'<\|?tool_call\|?>?|<\|?tool_call\|?>|</tool_call>|<tool_call\|?>', '', cleaned_text)
+    cleaned_text = re.sub(r'<\|?tool_call\|?>|</?\|?tool_call\|?>', '', cleaned_text)
     return cleaned_text
 
 def _find_balanced_brace(text: str, start: int = 0) -> int:
@@ -1433,13 +1824,179 @@ def _parse_native_tool_args(args_str: str) -> dict:
                         result[key] = val
     return result
 
+def _parse_python_func_call(call_str: str) -> Optional[Dict[str, Any]]:
+    """Safely parses a Python function call into tool_name and args dict using AST."""
+    try:
+        parsed = ast.parse(call_str.strip(), mode='eval')
+        if isinstance(parsed.body, ast.Call):
+            func_node = parsed.body.func
+            func_name = ""
+            if isinstance(func_node, ast.Name):
+                func_name = func_node.id
+            elif isinstance(func_node, ast.Attribute):
+                func_name = func_node.attr
+
+            if not func_name or func_name in ["print", "len", "str", "int", "float", "list", "dict", "set"]:
+                return None
+
+            args = {}
+            for kw in parsed.body.keywords:
+                if kw.arg:
+                    try:
+                        args[kw.arg] = ast.literal_eval(kw.value)
+                    except Exception:
+                        if isinstance(kw.value, ast.Constant):
+                            args[kw.arg] = kw.value.value
+                        else:
+                            args[kw.arg] = ast.unparse(kw.value)
+
+            # Positional args fallback
+            if parsed.body.args and not args:
+                pos_vals = []
+                for a in parsed.body.args:
+                    try:
+                        pos_vals.append(ast.literal_eval(a))
+                    except Exception:
+                        if isinstance(a, ast.Constant):
+                            pos_vals.append(a.value)
+                        else:
+                            pos_vals.append(ast.unparse(a))
+                if func_name in ["run_command", "exec", "terminal", "bash", "sh"]:
+                    args["command"] = pos_vals[0] if pos_vals else ""
+                elif func_name in ["read_file", "view_file", "write_file", "list_directory"]:
+                    args["path"] = pos_vals[0] if pos_vals else "."
+                elif func_name in ["grep_search", "grep"]:
+                    args["query"] = pos_vals[0] if pos_vals else ""
+                elif func_name in ["create_or_update_plan"]:
+                    args["steps"] = pos_vals[0] if pos_vals else []
+
+            return {
+                "action": "call_tool",
+                "target": func_name,
+                "arguments_or_instructions": args,
+                "step_summary": f"PTC tool call: {func_name}",
+                "reason": "Parsed from Programmatic Tool Call (PTC)"
+            }
+    except Exception:
+        pass
+    return None
+
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """Defensively extracts and parses JSON from raw LLM output."""
-    cleaned = clean_thought_and_whitespace(text).strip()
-    if not cleaned or ('{' not in cleaned and '[' not in cleaned and '<|tool_call' not in cleaned and '<tool_call' not in cleaned):
+    """Defensively extracts and parses JSON or Programmatic Tool Calls (PTC) from raw LLM output."""
+    if not text:
         return None
 
-    # 0. Intercept native tool call syntax (<|tool_call>, <tool_call>, call:...)
+    decoder = json.JSONDecoder()
+
+    # Pre-pass: Try extracting JSON from markdown code blocks in raw text first
+    if "```" in text:
+        match = re.search(r'```(?:json)?\s*([\{\[].*?[\}\]])\s*```', text, re.DOTALL)
+        if match:
+            try:
+                obj, _ = decoder.raw_decode(match.group(1).strip())
+                norm = normalize_tool_action(obj)
+                if norm:
+                    return norm
+            except Exception:
+                pass
+
+    cleaned = strip_thought_blocks(text).strip()
+    if not cleaned:
+        cleaned = text.strip()
+
+    # 0. Intercept XML-style <tool_call>...</tool_call> wrappers
+    if "<tool_call>" in cleaned:
+        xml_match = re.search(r'<tool_call>\s*([\s\S]*?)\s*(?:</tool_call>|$)', cleaned)
+        if xml_match:
+            inner = xml_match.group(1).strip()
+            # Inner could be PTC python call
+            ptc_res = _parse_python_func_call(inner)
+            if ptc_res:
+                return ptc_res
+            # Inner could be JSON
+            try:
+                obj, _ = decoder.raw_decode(inner)
+                norm = normalize_tool_action(obj)
+                if norm:
+                    return norm
+            except Exception:
+                pass
+
+    # 1. Intercept Programmatic Python function calls (PTC - arXiv:2608.06370v1)
+    if "```python" in cleaned or "```py" in cleaned:
+        py_blocks = re.findall(r'```(?:python|py)\s*([\s\S]*?)\s*```', cleaned)
+        for block in py_blocks:
+            # Try full-block AST parse first (handles multi-line triple-quoted args)
+            block_stripped = block.strip()
+            try:
+                parsed_mod = ast.parse(block_stripped, mode='exec')
+                for node in ast.walk(parsed_mod):
+                    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                        call_node = node.value
+                        func_name = ""
+                        if isinstance(call_node.func, ast.Name):
+                            func_name = call_node.func.id
+                        elif isinstance(call_node.func, ast.Attribute):
+                            func_name = call_node.func.attr
+                        if func_name and func_name not in ["print", "len", "str", "int", "float", "list", "dict", "set"]:
+                            args = {}
+                            for kw in call_node.keywords:
+                                if kw.arg:
+                                    try:
+                                        args[kw.arg] = ast.literal_eval(kw.value)
+                                    except Exception:
+                                        if isinstance(kw.value, ast.Constant):
+                                            args[kw.arg] = kw.value.value
+                                        else:
+                                            args[kw.arg] = ast.unparse(kw.value)
+                            # Positional args fallback
+                            if call_node.args and not args:
+                                pos_vals = []
+                                for a in call_node.args:
+                                    try:
+                                        pos_vals.append(ast.literal_eval(a))
+                                    except Exception:
+                                        if isinstance(a, ast.Constant):
+                                            pos_vals.append(a.value)
+                                        else:
+                                            pos_vals.append(ast.unparse(a))
+                                if func_name in ["run_command", "exec", "terminal", "bash", "sh"]:
+                                    args["command"] = pos_vals[0] if pos_vals else ""
+                                elif func_name in ["read_file", "view_file", "write_file", "list_directory"]:
+                                    args["path"] = pos_vals[0] if pos_vals else "."
+                                elif func_name in ["grep_search", "grep"]:
+                                    args["query"] = pos_vals[0] if pos_vals else ""
+                                elif func_name in ["create_or_update_plan"]:
+                                    args["steps"] = pos_vals[0] if pos_vals else []
+                            return {
+                                "action": "call_tool",
+                                "target": func_name,
+                                "arguments_or_instructions": args,
+                                "step_summary": f"PTC tool call: {func_name}",
+                                "reason": "Parsed from Programmatic Tool Call (PTC) - full block AST"
+                            }
+            except SyntaxError:
+                pass
+            # Fallback: line-by-line parse for simple single-line calls
+            for line in block_stripped.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    res = _parse_python_func_call(line)
+                    if res:
+                        return res
+
+    direct_ptc = _parse_python_func_call(cleaned)
+    if direct_ptc:
+        return direct_ptc
+
+    known_tools = r'(?:create_or_update_plan|list_directory|read_file|write_file|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file|grep_search|run_command|mcp:[a-zA-Z0-9_:]+)'
+    ptc_match = re.search(rf'({known_tools}\s*\([^)]*\))', cleaned, re.DOTALL)
+    if ptc_match:
+        res = _parse_python_func_call(ptc_match.group(1))
+        if res:
+            return res
+
+    # 2. Intercept native tool call syntax (<|tool_call>, <tool_call>, call:...)
     if "<|tool_call" in cleaned or "<tool_call" in cleaned or "call:" in cleaned:
         # Find function name via regex, then use brace-balanced capture for args
         name_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*', cleaned)
@@ -1491,9 +2048,7 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                 "reason": "Parsed from native tool call"
             }
 
-    decoder = json.JSONDecoder()
-
-    # 1. Try to extract from markdown code blocks first
+    # 3. Try to extract from markdown code blocks in cleaned text
     if "```" in cleaned:
         match = re.search(r'```(?:json)?\s*([\{\[].*?[\}\]])\s*```', cleaned, re.DOTALL)
         if match:
@@ -1505,7 +2060,7 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
             except Exception:
                 pass
 
-    # 2. Iterate over all '{' and '[' matches using raw_decode to parse valid JSON surrounded by text
+    # 4. Iterate over all '{' and '[' matches using raw_decode to parse valid JSON surrounded by text
     for match in re.finditer(r'[\{\[]', cleaned):
         try:
             obj, _ = decoder.raw_decode(cleaned[match.start():])
@@ -1540,7 +2095,7 @@ async def preload_supervisor():
         resolved_model_name = await resolve_model(SUPERVISOR_MODEL)
         log_message(f"[Autoswap] Idle timeout. Warm-loading '{resolved_model_name}' into GPU VRAM...")
         try:
-            if llama_cpp_available and resolve_gguf_path(resolved_model_name):
+            if llama_cpp_available and "glimmer" not in resolved_model_name.lower() and resolve_gguf_path(resolved_model_name):
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, get_llama_model, resolved_model_name, CONTEXT_WINDOW)
             else:
@@ -1688,53 +2243,46 @@ def extract_instructions(payload: Any) -> str:
 
 @app.get("/api/models")
 async def get_active_models():
-    """Returns the dynamically discovered local models in the format expected by the VS Code extension."""
+    """Returns the dynamically discovered local models with accurate context size and capabilities for the VS Code extension."""
     global active_models_list
-    if not active_models_list:
-        active_models_list = get_installed_models()
+    active_models_list = get_installed_models()
+
+    def _build_model_entry(m_id: str, display_name: str, family: str, model_target: Optional[str] = None) -> dict:
+        target = model_target or m_id
+        _, _, native_ctx = get_model_info(target)
+        ctx = native_ctx if native_ctx is not None else CONTEXT_WINDOW
+        
+        m_lower = target.lower()
+        has_vision = any(tag in m_lower for tag in ['vision', 'diffusion', 'glimmer', 'vl', 'gemini'])
+        has_tools = not any(tag in m_lower for tag in ['fim', 'codegemma-2b'])
+
+        return {
+            "id": m_id,
+            "name": display_name,
+            "family": family,
+            "version": "1.0.0",
+            "maxInputTokens": ctx,
+            "maxOutputTokens": 16384,
+            "capabilities": {
+                "toolCalling": has_tools,
+                "imageInput": has_vision,
+                "tools": has_tools,
+                "vision": has_vision
+            }
+        }
 
     models_to_report = [
-        {
-            "id": "serenity-supervisor-high",
-            "name": f"Supervisor - High Mode ({SUPERVISOR_MODEL})",
-            "family": "serenity-supervisor",
-            "version": "1.0.0",
-            "maxInputTokens": 120000,
-            "maxOutputTokens": 16384,
-            "capabilities": {"toolCalling": True, "imageInput": False}
-        },
-        {
-            "id": "serenity-supervisor-low",
-            "name": f"Supervisor - Low Mode ({SUPERVISOR_MODEL})",
-            "family": "serenity-supervisor",
-            "version": "1.0.0",
-            "maxInputTokens": 120000,
-            "maxOutputTokens": 16384,
-            "capabilities": {"toolCalling": True, "imageInput": False}
-        },
-        {
-            "id": "serenity-supervisor",
-            "name": f"Orchestrator - Turbo Mode ({SUPERVISOR_MODEL})",
-            "family": "serenity-supervisor",
-            "version": "1.0.0",
-            "maxInputTokens": 120000,
-            "maxOutputTokens": 16384,
-            "capabilities": {"toolCalling": True, "imageInput": False}
-        }
+        _build_model_entry("serenity-supervisor-high", f"Supervisor - High Mode ({SUPERVISOR_HIGH_MODEL})", "serenity-supervisor", SUPERVISOR_HIGH_MODEL),
+        _build_model_entry("serenity-supervisor-low", f"Supervisor - Low Mode ({SUPERVISOR_LOW_MODEL})", "serenity-supervisor", SUPERVISOR_LOW_MODEL),
+        _build_model_entry("serenity-supervisor", f"Orchestrator - Turbo Mode ({ORCHESTRATOR_TURBO_MODEL})", "serenity-supervisor", ORCHESTRATOR_TURBO_MODEL)
     ]
 
     for model_name in active_models_list:
         gguf_path = resolve_gguf_path(model_name)
         if gguf_path and os.path.exists(gguf_path):
-            models_to_report.append({
-                "id": model_name,
-                "name": f"{model_name} (Agent)",
-                "family": model_name,
-                "version": "1.0.0",
-                "maxInputTokens": 120000,
-                "maxOutputTokens": 16384,
-                "capabilities": {"toolCalling": True, "imageInput": False}
-            })
+            models_to_report.append(
+                _build_model_entry(model_name, f"{model_name} (Agent)", model_name, model_name)
+            )
 
     return {"models": models_to_report}
 
@@ -1971,7 +2519,8 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                     }
                 full_cmd = f"powershell -NoProfile -Command \"{command}\""
                 sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
-                result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env)
+                flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env, creationflags=flags)
                 stdout = result.stdout[:2000] if result.stdout else ""
                 stderr = result.stderr[:2000] if result.stderr else ""
                 is_err = result.returncode != 0
@@ -2471,34 +3020,70 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
         try:
             args = safe_parse_tool_args(payload_data, "query")
             query = ""
-            search_dir = "."
+            search_path = "."
             if isinstance(args, dict):
                 query = args.get("query") or args.get("search_term") or args.get("term") or args.get("pattern") or args.get("text") or args.get("search_string") or args.get("grep") or ""
-                search_dir = args.get("path") or args.get("directory") or args.get("dir") or "."
+                search_path = args.get("path") or args.get("directory") or args.get("dir") or args.get("file") or args.get("filepath") or "."
             elif isinstance(args, str):
                 query = args.strip()
 
+            if not search_path or not is_path_allowed(search_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Access to '{search_path}' is restricted for security.]\n",
+                    "raw_output": f"Error: Path access restricted: '{search_path}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Access restricted",
+                    "target_norm": normalized_target,
+                    "file_path": search_path
+                }
+
             matches = []
-            ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__"}
-            if query and os.path.exists(search_dir):
-                for root, dirs, files in os.walk(search_dir):
-                    dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
-                    for file in files:
-                        if file.startswith(".env") or not is_path_allowed(file):
-                            continue
-                        if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md", ".java", ".cpp", ".h")):
-                            path = os.path.join(root, file)
-                            try:
-                                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                                    for line_num, line in enumerate(f, 1):
-                                        if query.lower() in line.lower():
-                                            matches.append(f"{path}:{line_num}: {line.strip()}")
-                                            if len(matches) >= 100:
-                                                break
-                            except Exception:
-                                pass
-                        if len(matches) >= 100:
+            re_pattern = None
+            if query:
+                try:
+                    re_pattern = re.compile(query, re.IGNORECASE)
+                except re.error:
+                    re_pattern = None
+
+            ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__", ".serenity_cache"}
+            if query and os.path.exists(search_path):
+                files_to_search = []
+                if os.path.isfile(search_path):
+                    files_to_search = [search_path]
+                elif os.path.isdir(search_path):
+                    for root, dirs, files in os.walk(search_path):
+                        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+                        for file in files:
+                            if file.startswith(".env") or not is_path_allowed(file):
+                                continue
+                            if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md", ".java", ".cpp", ".h", ".c", ".cs", ".go", ".rs", ".html", ".css")):
+                                files_to_search.append(os.path.join(root, file))
+                            if len(files_to_search) >= 500:
+                                break
+                        if len(files_to_search) >= 500:
                             break
+
+                for path in files_to_search:
+                    try:
+                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                            for line_num, line in enumerate(f, 1):
+                                is_match = False
+                                if re_pattern:
+                                    try:
+                                        is_match = bool(re_pattern.search(line))
+                                    except Exception:
+                                        is_match = False
+                                if not is_match:
+                                    is_match = query.lower() in line.lower()
+                                if is_match:
+                                    matches.append(f"{path}:{line_num}: {line.strip()}")
+                                    if len(matches) >= 100:
+                                        break
+                    except Exception:
+                        pass
                     if len(matches) >= 100:
                         break
 
@@ -2516,10 +3101,10 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                     "status": "success",
                     "details": f"Found {total} matches",
                     "target_norm": normalized_target,
-                    "file_path": None
+                    "file_path": search_path
                 }
             else:
-                tool_ctx = f"\n\n[System Tool Response: No occurrences of '{query}' were found in the workspace.]\n"
+                tool_ctx = f"\n\n[System Tool Response: No occurrences of '{query}' were found in '{search_path}'.]\n"
                 log_message(f"[Tool Warning] Grep found 0 matches for '{query}'.")
                 return {
                     "tool_context": tool_ctx,
@@ -2530,7 +3115,7 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                     "status": "warning",
                     "details": "0 matches found",
                     "target_norm": normalized_target,
-                    "file_path": None
+                    "file_path": search_path
                 }
         except Exception as e:
             return {
@@ -3207,77 +3792,148 @@ class StreamingThoughtFilter:
         self.buffer = ""
         self.in_thought = start_in_thought
         self.thought_started = start_in_thought
+        self.initial_start_in_thought = start_in_thought
         self.max_buffer_limit = max_buffer_limit
         self.start_tags = [
             "<|channel>thought", "<|channel|>thought", "<channel>thought",
             "<think>", "<|think|>", "<thought>", "<|thought|>"
         ]
         self.end_tags = [
-            "<channel|>", "<|channel|>",
+            "<channel|>", "<|channel|>", "<|turn|>", "<turn|>",
             "</think>", "</|think|>",
             "</thought>", "</|thought|>"
         ]
-        
+        self.lookahead_tags = [
+            "<|channel", "<channel", "<think", "<thought", "</think", "</thought", "<|turn", "<turn", "<|tool_call", "<tool_call", "call:", "<tool_call|>", "<|tool_call|>", "</tool_call>"
+        ]
+        self.has_seen_explicit_thought_tag = False
+
     def _is_incomplete_tool_call(self, text: str) -> bool:
         """Detects if text contains a tool call prefix whose arguments brace/paren has not closed yet, or trailing partial tags."""
         if not text:
             return False
-        # Check for trailing partial tag or call prefix at the end of text
-        if re.search(r'(?:<\|?tool_call\|?>?|<\|?channel\|?>*|<tool_call|call:?|call:[^\s{\(]*)$', text.strip(), re.DOTALL):
+        # Avoid false positives on words ending in 'call' (e.g. recall, system call)
+        if re.search(r'(?:<\|?tool_call\|?>?|<\|?channel\|?>*|<tool_call\b|\bcall:\s*[a-zA-Z0-9_:]*|\bcall:[^\s{\(]*)$', text.strip(), re.DOTALL):
+            return True
+        if "<tool_call>" in text and "</tool_call>" not in text:
             return True
         match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*', text, re.DOTALL)
         if not match:
-            # Also check for markdown json block starting for tool call
             if re.search(r'```json\s*\{\s*["\']action["\']\s*:\s*["\']call_tool["\']', text, re.DOTALL) and not text.rstrip().endswith("```"):
                 return True
             return False
         start_idx = match.end()
         if start_idx < len(text) and text[start_idx] == '{':
-            return _find_balanced_brace(text, start_idx) == -1
+            brace_end = _find_balanced_brace(text, start_idx)
+            if brace_end == -1:
+                return True
+            tail = text[brace_end + 1:]
+            if "<|tool_call" in text and not re.search(r'<\|?tool_call\|?>|</?\|?tool_call\|?>', tail):
+                return True
+            return False
         elif start_idx < len(text) and text[start_idx] == '(':
-            return text.find(')', start_idx) == -1
+            paren_close = text.find(')', start_idx)
+            if paren_close == -1:
+                return True
+            tail = text[paren_close + 1:]
+            if "<|tool_call" in text and not re.search(r'<\|?tool_call\|?>|</?\|?tool_call\|?>', tail):
+                return True
+            return False
         return True
 
+    def _has_trailing_partial_tag(self, text: str) -> bool:
+        """Checks if text ends in a partial tag that could become an end or start tag in the next chunk."""
+        stripped = text.rstrip()
+        if not stripped:
+            return False
+        for tag in self.lookahead_tags + self.start_tags + self.end_tags:
+            for i in range(2, min(len(tag), 15)):
+                if stripped.endswith(tag[:i]):
+                    return True
+        return False
+
     def feed(self, chunk: str) -> str:
+        thought_chunk, content_chunk = self.feed_demux(chunk)
+        return content_chunk
+
+    def feed_demux(self, chunk: str) -> tuple[str, str]:
+        """Demuxes incoming stream into (thought_chunk, content_chunk) with zero tag bleed."""
         self.buffer += chunk
-        
+        thought_out = ""
+        content_out = ""
+
+        # Special pass-through: explicit errors, markdown headers, or JSON error responses should never be swallowed as thoughts
+        if self.in_thought and not self.has_seen_explicit_thought_tag:
+            stripped_buf = self.buffer.lstrip()
+            if (stripped_buf.startswith("❌") or 
+                stripped_buf.startswith("Error:") or 
+                stripped_buf.startswith("### ") or 
+                stripped_buf.startswith("```") or
+                stripped_buf.startswith("def ") or
+                stripped_buf.startswith("import ")):
+                self.in_thought = False
+                self.thought_started = False
+
         if not self.thought_started:
             for tag in self.start_tags:
-                if tag in self.buffer:
+                idx = self.buffer.find(tag)
+                if idx != -1:
+                    pre_content = self.buffer[:idx]
+                    if pre_content:
+                        content_out += self.clean_tool_tags(pre_content)
                     self.in_thought = True
                     self.thought_started = True
+                    self.has_seen_explicit_thought_tag = True
+                    self.buffer = self.buffer[idx + len(tag):]
                     break
-            if not self.thought_started and len(self.buffer) > 50:
-                if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
-                    return ""
-                flushed = self.clean_tool_tags(self.buffer)
-                self.buffer = ""
-                return flushed
-                
+            if not self.thought_started:
+                if len(self.buffer) > 25 and not self._has_trailing_partial_tag(self.buffer):
+                    if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
+                        return ("", "")
+                    flushed = self.clean_tool_tags(self.buffer)
+                    self.buffer = ""
+                    content_out += flushed
+                    return (thought_out, content_out)
+
         if self.in_thought:
             for end_tag in self.end_tags:
                 idx = self.buffer.find(end_tag)
                 if idx != -1:
+                    thought_text = self.buffer[:idx]
+                    if thought_text:
+                        thought_out += thought_text
                     self.in_thought = False
                     self.buffer = self.buffer[idx + len(end_tag):]
                     if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
-                        return ""
+                        return (thought_out, "")
+                    if self._has_trailing_partial_tag(self.buffer):
+                        return (thought_out, "")
                     flushed = self.clean_tool_tags(self.buffer)
                     self.buffer = ""
-                    return flushed
-            return ""
+                    content_out += flushed
+                    return (thought_out, content_out)
+
+            return (thought_out, "")
         else:
             if self._is_incomplete_tool_call(self.buffer) and len(self.buffer) < self.max_buffer_limit:
-                return ""
+                return (thought_out, "")
+            if self._has_trailing_partial_tag(self.buffer):
+                return (thought_out, "")
             flushed = self.clean_tool_tags(self.buffer)
             self.buffer = ""
-            return flushed
+            content_out += flushed
+            return (thought_out, content_out)
 
     def clean_tool_tags(self, text: str) -> str:
         return _strip_tool_call_tags(text)
 
     def flush_remaining(self) -> str:
         if self.in_thought:
+            cleaned = self.clean_tool_tags(self.buffer).strip()
+            self.buffer = ""
+            # If started in thought without explicit start tags, return cleaned output
+            if not self.has_seen_explicit_thought_tag:
+                return cleaned
             return ""
         flushed = self.clean_tool_tags(self.buffer)
         self.buffer = ""
@@ -3372,10 +4028,13 @@ async def run_orchestration(request: QueryRequest, http_request: Request):
                     for turn in history
                 ) + "\n-----------------------------\n"
 
+            reasoning_injection = "\nReasoning strength: xhigh.\n" if "glimmer" in request.model.lower() else ""
             standalone_prompt = f"""<|turn>system
-<|think|>
+<|think|>{reasoning_injection}
 You are SerenityDev running in standalone mode for model {request.model}.
 Provide a clean, direct, production-ready response in Markdown format. Avoid system markers.
+
+{PYTHON_TOOL_STUBS}
 
 PONYTAIL LAZINESS LADDER:
 Before writing code, stop at the first rung that holds:
@@ -3473,11 +4132,12 @@ Never compromise on security, input validation, or error handling.
                         tool_result = res["tool_context"]
                         sa_target = res["target_norm"]
 
-                        # Emit tool result as progress update
+                        # Yield collapsible tool execution block to content stream for VSCode visibility
                         if not is_programmatic and tool_result:
                             is_err = res["is_error"]
-                            step_icon = "🔴" if is_err else "🟢"
-                            yield {"type": "progress", "text": f"⚙️ {step_icon} Standalone step {sa_step}: {sa_target}"}
+                            open_attr = " open" if is_err else ""
+                            details_md = f"<details{open_attr}>\n<summary><strong>🛠️ Standalone Tool (Step {sa_step}):</strong> <code>{sa_target}</code></summary>\n\n```text\n{tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
+                            yield {"type": "content", "content": details_md}
                             await asyncio.sleep(0.01)
 
                         # Append result to prompt for next iteration
@@ -3584,7 +4244,11 @@ Never compromise on security, input validation, or error handling.
         
         request.context = f"{session_context}{request.context}"
 
-        # Resolve models
+        # Determine Execution Mode (Low / High / Turbo-Orchestrator)
+        is_low_mode = (request.model == "serenity-supervisor-low")
+        is_high_mode = (request.model == "serenity-supervisor-high")
+
+        # Resolve models based on role and effort level
         if model_consolidation:
             supervisor_res = await resolve_model(str(CURRENT_MODEL))
             w1_res = supervisor_res
@@ -3593,18 +4257,26 @@ Never compromise on security, input validation, or error handling.
             w4_res = supervisor_res
             log_message(f"[Orchestrator] Consolidated Models Enabled -> Using '{supervisor_res}' for all phases.")
         else:
-            supervisor_res = await resolve_model(SUPERVISOR_MODEL)
+            if is_low_mode:
+                supervisor_res = await resolve_model(SUPERVISOR_LOW_MODEL)
+            elif is_high_mode:
+                supervisor_res = await resolve_model(SUPERVISOR_HIGH_MODEL)
+            else:
+                supervisor_res = await resolve_model(ORCHESTRATOR_TURBO_MODEL or SUPERVISOR_MODEL)
+
             w1_res = await resolve_model(W1_MODEL)
             w2_res = await resolve_model(W2_MODEL)
             w3_res = await resolve_model(W3_MODEL)
             w4_res = await resolve_model(W4_MODEL)
-            log_message(f"[Orchestrator] Resolved Models -> Supervisor/W1: {supervisor_res}, W2: {w2_res}, W3: {w3_res}, W4: {w4_res}")
+            log_message(f"[Orchestrator] Resolved Roles -> Supervisor ({'Low' if is_low_mode else ('High' if is_high_mode else 'Turbo')}): {supervisor_res}, W1: {w1_res}, W2: {w2_res}, W3: {w3_res}, W4: {w4_res}")
 
-        # Determine Execution Mode (Low / High / Turbo-Orchestrator)
-        is_low_mode = (request.model == "serenity-supervisor-low")
-        is_high_mode = (request.model == "serenity-supervisor-high")
+        # Check Auto-Continue (unlimited iteration)
+        effective_auto_continue = request.auto_continue if request.auto_continue is not None else auto_continue_enabled
 
-        if isinstance(request.max_steps, int) and request.max_steps > 0:
+        if effective_auto_continue:
+            max_tool_loops = 500
+            log_message("[Orchestrator] Auto-Continue Active -> Unlimited iteration enabled (up to 500 loops).")
+        elif isinstance(request.max_steps, int) and request.max_steps > 0:
             max_tool_loops = request.max_steps
         elif is_low_mode:
             max_tool_loops = 8
@@ -3653,34 +4325,7 @@ CRITICAL CONTEXT RULES:
 {mode_instructions}
 {mode_explanation_prompt}
 
-AVAILABLE TOOLS:
-- mcp:filesystem:create_or_update_plan
-  Args: {{"steps": ["string"], "current_focus": "string"}}
-  Description: Validates or adjusts the execution plan.
-- mcp:filesystem:list_directory
-  Args: {{}}
-  Description: Lists all files in the current workspace root.
-- mcp:filesystem:read_file
-  Args: {{"path": "relative_path", "start_line": int, "end_line": int}}
-  Description: Reads code from a file. If the file is large, start_line and end_line (1-indexed, inclusive) must be specified to read target regions and prevent context bloat.
-- mcp:filesystem:write_file
-  Args: {{"path": "relative_path", "content": "full_file_content"}}
-  Description: Writes or overwrites code.
-- mcp:filesystem:insert_edit_into_file
-  Args: {{"path": "relative_path", "target_content": "code_to_find", "new_content": "code_to_insert"}}
-  Description: Inserts new content in place of target content in a file.
-- mcp:filesystem:replace_string_in_file
-  Args: {{"path": "relative_path", "target_content": "code_to_find", "new_content": "replacement_code"}}
-  Description: Replaces target content with new content in a file.
-- mcp:filesystem:multi_replace_string_in_file
-  Args: {{"path": "relative_path", "replacements": [{{"target": "exact_string_to_find", "replacement": "replacement_string"}}]}}
-  Description: Replaces multiple specific non-adjacent or adjacent text blocks in a file by locating the exact 'target' string and replacing it with the 'replacement' string. Use this instead of write_file to avoid context limits.
-- mcp:filesystem:grep_search
-  Args: {{"query": "search_term"}}
-  Description: Searches for text patterns across project files.
-- mcp:terminal:run_command
-  Args: {{"command": "string"}}
-  Description: Runs a shell command in the workspace and returns stdout/stderr. Use this to run tests, linters, or build scripts.
+{PYTHON_TOOL_STUBS}
 
 DECISION RULE:
 1. If you haven't formulated a plan or need to look up file locations, call 'create_or_update_plan' or 'list_directory'.
@@ -3698,7 +4343,7 @@ Workers:
 - W3 (Qwen 35B): Fast explanations and shell scripts.
 - W4 (Qwen 27B): Specialized coding routines.
 
-You must respond with a JSON object matching this schema exactly:
+You must respond with a JSON object or Programmatic Tool Call (PTC) matching this schema:
 {{
   "action": "call_tool" | "delegate_worker",
   "target": "mcp:filesystem:create_or_update_plan" | "mcp:filesystem:list_directory" | "mcp:filesystem:read_file" | "mcp:filesystem:write_file" | "mcp:filesystem:insert_edit_into_file" | "mcp:filesystem:replace_string_in_file" | "mcp:filesystem:multi_replace_string_in_file" | "mcp:filesystem:grep_search" | "mcp:terminal:run_command" | "W1" | "W2" | "W3" | "W4",
@@ -3706,7 +4351,7 @@ You must respond with a JSON object matching this schema exactly:
   "step_summary": "A short summary of what was learned or done in this step, to be added to the timeline.",
   "reason": "Explain your tactical thinking."
 }}
-CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|tool_call> tags. No markdown wrappers.
+CRITICAL: Respond ONLY with raw JSON or Python function call syntax. Do NOT use <|tool_call> tags. No markdown wrappers.
 <turn|>
 <|turn>user
 <context>
@@ -3901,9 +4546,12 @@ CRITICAL: Respond ONLY with raw JSON matching the schema exactly. Do NOT use <|t
 You are SerenityDev {worker_id}, the Executor. You execute tasks assigned by the Supervisor.{worker_mode_constraint}
 ROLE & BEHAVIOR RULES:
 - You are a pure Executor. Do NOT re-plan, ask open-ended questions, or write conversational fluff.
-- Execute tool instructions directly and output clean, production-ready code.
+- Execute tool instructions directly via Python function calls and output clean, production-ready code.
+- Never state intent to call tools in plain prose; execute the tool call directly.
 - At the end of your response, provide an ultra-terse, caveman-style summary of executed changes for the Supervisor.
 Instructions: {instructions}
+
+{PYTHON_TOOL_STUBS}
 
 PONYTAIL LAZINESS LADDER:
 Before writing code, stop at the first rung that holds:
@@ -4360,6 +5008,15 @@ async def resume_server():
     log_message("[Control] SerenityDev Server RESUMED.")
     return {"status": "online"}
 
+@app.post("/api/control/unload")
+@app.post("/api/unload")
+async def unload_models_endpoint():
+    """Explicitly unloads active llama-server and direct llama-cpp-python models to immediately free VRAM."""
+    log_message("[Control] Unload models command received. Clearing VRAM...")
+    unload_llama_server()
+    unload_llama_model()
+    return {"status": "unloaded", "message": "Active model offloaded. VRAM freed successfully."}
+
 # --- Config Management ---
 
 class ConfigUpdate(BaseModel):
@@ -4367,50 +5024,157 @@ class ConfigUpdate(BaseModel):
     current_model: Optional[str] = None
     cache_type_k: Optional[str] = None
     cache_type_v: Optional[str] = None
+    context_window: Optional[int] = None
+    gpu_layers: Optional[int] = None
+    auto_continue: Optional[bool] = None
+    custom_models_dir: Optional[str] = None
+    custom_models_dirs: Optional[List[str]] = None
+    roles: Optional[Dict[str, str]] = None
+    supervisor_low_model: Optional[str] = None
+    supervisor_high_model: Optional[str] = None
+    orchestrator_turbo_model: Optional[str] = None
+    supervisor_model: Optional[str] = None
+    w1_model: Optional[str] = None
+    w2_model: Optional[str] = None
+    w3_model: Optional[str] = None
+    w4_model: Optional[str] = None
+    fim_model: Optional[str] = None
 
 @app.get("/api/config")
 async def get_config():
+    installed = get_installed_models()
     return {
         "model_consolidation": model_consolidation,
         "current_model": CURRENT_MODEL,
         "supervisor_model": SUPERVISOR_MODEL,
+        "supervisor_low_model": SUPERVISOR_LOW_MODEL,
+        "supervisor_high_model": SUPERVISOR_HIGH_MODEL,
+        "orchestrator_turbo_model": ORCHESTRATOR_TURBO_MODEL,
         "w1_model": W1_MODEL,
         "w2_model": W2_MODEL,
         "w3_model": W3_MODEL,
+        "w4_model": W4_MODEL,
         "fim_model": FIM_MODEL,
+        "auto_continue": auto_continue_enabled,
+        "roles": {
+            "supervisor_low": SUPERVISOR_LOW_MODEL,
+            "supervisor_high": SUPERVISOR_HIGH_MODEL,
+            "orchestrator_turbo": ORCHESTRATOR_TURBO_MODEL,
+            "w1_reasoning": W1_MODEL,
+            "w2_code": W2_MODEL,
+            "w3_fast": W3_MODEL,
+            "w4_specialized": W4_MODEL,
+            "fim": FIM_MODEL
+        },
+        "available_models": installed,
         "cache_type_k": cache_type_k,
-        "cache_type_v": cache_type_v
+        "cache_type_v": cache_type_v,
+        "context_window": CONTEXT_WINDOW,
+        "gpu_layers": gpu_layers_override,
+        "custom_models_dirs": get_candidate_model_dirs()
     }
 
 @app.post("/api/config")
 async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks):
-    global model_consolidation, CURRENT_MODEL, cache_type_k, cache_type_v
+    global model_consolidation, CURRENT_MODEL, cache_type_k, cache_type_v, CONTEXT_WINDOW, gpu_layers_override, auto_continue_enabled
+    global SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL, SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
+    
+    if config.custom_models_dir is not None:
+        if add_custom_model_dir(config.custom_models_dir):
+            log_message(f"[Config] Added custom model folder: {config.custom_models_dir}")
+        else:
+            log_message(f"[Config Error] Custom model folder not found: {config.custom_models_dir}")
+    if config.custom_models_dirs is not None:
+        for d in config.custom_models_dirs:
+            add_custom_model_dir(d)
+        log_message(f"[Config] Updated custom model folders: {config.custom_models_dirs}")
     if config.model_consolidation is not None:
         model_consolidation = config.model_consolidation
         log_message(f"[Config] Model consolidation set to: {model_consolidation}")
+    if config.auto_continue is not None:
+        auto_continue_enabled = config.auto_continue
+        log_message(f"[Config] Auto-continue unlimited iteration set to: {auto_continue_enabled}")
     if config.cache_type_k is not None:
         cache_type_k = config.cache_type_k
         log_message(f"[Config] Key cache type (K) set to: {cache_type_k}")
     if config.cache_type_v is not None:
         cache_type_v = config.cache_type_v
         log_message(f"[Config] Value cache type (V) set to: {cache_type_v}")
+    if config.context_window is not None and config.context_window > 0:
+        CONTEXT_WINDOW = config.context_window
+        log_message(f"[Config] Context window set to: {CONTEXT_WINDOW}")
+    if config.gpu_layers is not None:
+        gpu_layers_override = config.gpu_layers if config.gpu_layers >= 0 else None
+        log_message(f"[Config] GPU layers override set to: {gpu_layers_override}")
+
+    # Process Role Model Assignments
+    if config.roles is not None:
+        for role_k, model_v in config.roles.items():
+            if not model_v:
+                continue
+            r_k = role_k.lower()
+            if r_k in ["supervisor_low", "low"]:
+                SUPERVISOR_LOW_MODEL = model_v
+            elif r_k in ["supervisor_high", "high"]:
+                SUPERVISOR_HIGH_MODEL = model_v
+            elif r_k in ["orchestrator_turbo", "turbo", "orchestrator"]:
+                ORCHESTRATOR_TURBO_MODEL = model_v
+                SUPERVISOR_MODEL = model_v
+            elif r_k in ["w1_reasoning", "w1", "reasoning"]:
+                W1_MODEL = model_v
+            elif r_k in ["w2_code", "w2", "code"]:
+                W2_MODEL = model_v
+            elif r_k in ["w3_fast", "w3", "fast"]:
+                W3_MODEL = model_v
+            elif r_k in ["w4_specialized", "w4"]:
+                W4_MODEL = model_v
+            elif r_k in ["fim", "autocomplete"]:
+                FIM_MODEL = model_v
+        log_message(f"[Config] Updated roles mapping: {config.roles}")
+
+    if config.supervisor_low_model is not None:
+        SUPERVISOR_LOW_MODEL = config.supervisor_low_model
+    if config.supervisor_high_model is not None:
+        SUPERVISOR_HIGH_MODEL = config.supervisor_high_model
+    if config.orchestrator_turbo_model is not None:
+        ORCHESTRATOR_TURBO_MODEL = config.orchestrator_turbo_model
+        SUPERVISOR_MODEL = config.orchestrator_turbo_model
+    if config.supervisor_model is not None:
+        SUPERVISOR_MODEL = config.supervisor_model
+    if config.w1_model is not None:
+        W1_MODEL = config.w1_model
+    if config.w2_model is not None:
+        W2_MODEL = config.w2_model
+    if config.w3_model is not None:
+        W3_MODEL = config.w3_model
+    if config.w4_model is not None:
+        W4_MODEL = config.w4_model
+    if config.fim_model is not None:
+        FIM_MODEL = config.fim_model
         
-    if config.current_model is not None or config.cache_type_k is not None or config.cache_type_v is not None:
+    needs_reload = (
+        config.current_model is not None or
+        config.cache_type_k is not None or
+        config.cache_type_v is not None or
+        config.context_window is not None or
+        config.gpu_layers is not None
+    )
+    if needs_reload:
         resolved = await resolve_model(config.current_model if config.current_model is not None else CURRENT_MODEL)
         if config.current_model is not None:
             CURRENT_MODEL = resolved
             log_message(f"[Config] Current consolidated model set to: {CURRENT_MODEL}")
         
-        # Warm-load/preload the consolidated model in background to apply cache settings
+        # Warm-load/preload the consolidated model in background to apply cache and context settings
         async def run_preload():
             async with inference_lock:
-                log_message(f"[Config] Warm-loading selected consolidated model '{resolved}' with cache K={cache_type_k}, V={cache_type_v}...")
+                log_message(f"[Config] Warm-loading model '{resolved}' (ctx={CONTEXT_WINDOW}, gpu_layers={gpu_layers_override}, K={cache_type_k}, V={cache_type_v})...")
                 try:
                     if llama_cpp_available and resolve_gguf_path(resolved):
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW)
                     else:
-                        if llama_server_process is None or active_llama_server_model_name != resolved:
+                        if llama_server_process is None or active_llama_server_model_name != resolved or needs_reload:
                             await start_llama_server(resolved, CONTEXT_WINDOW)
                         payload = {"model": resolved, "prompt": "", "stream": False, "keep_alive": -1}
                         async with httpx.AsyncClient(timeout=25) as client:
@@ -4419,13 +5183,29 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
                 except Exception as e:
                     log_message(f"[Config] Dynamic preload failed for '{resolved}': {e}")
         background_tasks.add_task(run_preload)
+
+    # Persist config to disk after every update
+    save_server_config()
         
     return {
         "status": "success",
         "model_consolidation": model_consolidation,
         "current_model": CURRENT_MODEL,
+        "auto_continue": auto_continue_enabled,
+        "roles": {
+            "supervisor_low": SUPERVISOR_LOW_MODEL,
+            "supervisor_high": SUPERVISOR_HIGH_MODEL,
+            "orchestrator_turbo": ORCHESTRATOR_TURBO_MODEL,
+            "w1_reasoning": W1_MODEL,
+            "w2_code": W2_MODEL,
+            "w3_fast": W3_MODEL,
+            "w4_specialized": W4_MODEL,
+            "fim": FIM_MODEL
+        },
         "cache_type_k": cache_type_k,
-        "cache_type_v": cache_type_v
+        "cache_type_v": cache_type_v,
+        "context_window": CONTEXT_WINDOW,
+        "gpu_layers": gpu_layers_override
     }
 
 class RevertEditRequest(BaseModel):
@@ -4465,17 +5245,33 @@ cached_gpu_memory = None
 
 def query_nvidia_smi_sync():
     global cached_gpu_memory
+    if pynvml_available:
+        try:
+            device_count = nvmlDeviceGetCount()
+            if device_count > 0:
+                handle = nvmlDeviceGetHandleByIndex(0)
+                mem_info = nvmlDeviceGetMemoryInfo(handle)
+                cached_gpu_memory = {
+                    "used": round(mem_info.used / (1024.0 * 1024.0 * 1024.0), 2),
+                    "total": round(mem_info.total / (1024.0 * 1024.0 * 1024.0), 2),
+                    "unit": "GiB"
+                }
+                return cached_gpu_memory
+        except Exception:
+            pass
+
     try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         res = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
-            capture_output=True, text=True, timeout=1.5
+            capture_output=True, text=True, timeout=1.5, creationflags=flags
         )
         if res.returncode == 0 and res.stdout:
             parts = res.stdout.strip().split(",")
             if len(parts) == 2:
                 cached_gpu_memory = {
-                    "used": float(parts[0].strip()) / 1024.0, # convert MiB to GiB
-                    "total": float(parts[1].strip()) / 1024.0,
+                    "used": round(float(parts[0].strip()) / 1024.0, 2), # convert MiB to GiB
+                    "total": round(float(parts[1].strip()) / 1024.0, 2),
                     "unit": "GiB"
                 }
                 return cached_gpu_memory
@@ -5301,8 +6097,19 @@ async def serve_dashboard():
     return HTMLResponse(content=html_content)
 
 def free_port(port: int = 8002):
-    """Checks if the target port is occupied on Windows or Linux/macOS and terminates the occupying process to prevent WinError 10048."""
+    """Checks if the target port is occupied on Windows or Linux/macOS and terminates stale occupying processes to prevent WinError 10048."""
     print(f"[Port Initializer] Scanning port {port}...")
+    # First check if the port is already actively responding to SerenityDev /api/status
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/status", headers={"User-Agent": "SerenityDev-Port-Check"})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            if resp.status == 200:
+                print(f"[Port Initializer] Port {port} is already actively serving SerenityDev. Skipping termination.")
+                return
+    except Exception:
+        pass
+
     if os.name == 'nt':  # Windows
         try:
             cmd = f"netstat -ano | findstr LISTENING | findstr :{port}"
@@ -5312,10 +6119,13 @@ def free_port(port: int = 8002):
                 for line in lines:
                     parts = line.strip().split()
                     if len(parts) >= 5:
-                        pid = int(parts[-1])
-                        if pid != os.getpid() and pid > 0:
-                            print(f"[Port Initializer] Port {port} is occupied by PID {pid}. Terminating process...")
-                            subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
+                        try:
+                            pid = int(parts[-1])
+                            if pid != os.getpid() and pid > 0:
+                                print(f"[Port Initializer] Port {port} is occupied by PID {pid}. Terminating stale process...")
+                                subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
+                        except Exception:
+                            pass
         except Exception as e:
             print(f"[Port Initializer] Failed to free port on Windows: {e}")
     else:  # Linux / macOS
@@ -5325,10 +6135,13 @@ def free_port(port: int = 8002):
             if res.returncode == 0 and res.stdout:
                 pids = res.stdout.strip().split('\n')
                 for pid_str in pids:
-                    pid = int(pid_str.strip())
-                    if pid != os.getpid() and pid > 0:
-                        print(f"[Port Initializer] Port {port} is occupied by PID {pid}. Terminating process...")
-                        os.kill(pid, signal.SIGKILL)
+                    try:
+                        pid = int(pid_str.strip())
+                        if pid != os.getpid() and pid > 0:
+                            print(f"[Port Initializer] Port {port} is occupied by PID {pid}. Terminating stale process...")
+                            os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"[Port Initializer] Failed to free port on Unix: {e}")
 
@@ -5559,6 +6372,7 @@ class EndpointFilter(logging.Filter):
 if __name__ == "__main__":
     import logging
     logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+    load_server_config()
     free_port(8002)
     print("[Server] Starting SerenityDev Orchestrator...")
     uvicorn.run("serenitydevserver:app", host="127.0.0.1", port=8002, reload=False)
