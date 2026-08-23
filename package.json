@@ -2,7 +2,7 @@
   "name": "SerenityDev",
   "displayName": "Serenity Dev",
   "description": "Local Python Agent interface running on llama.cpp with llama-server backend.",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "publisher": "GhostHeartZer0",
   "repository": {
     "type": "git",
@@ -71,8 +71,56 @@
     },
     "commands": [
       {
+        "command": "serenity.startServer",
+        "title": "Serenity: Start Server"
+      },
+      {
+        "command": "serenity.selectModel",
+        "title": "Serenity: Select Active Model"
+      },
+      {
+        "command": "serenity.scanModels",
+        "title": "Serenity: Scan & Detect Models"
+      },
+      {
         "command": "serenity.showMenu",
         "title": "Serenity: Open Server Status Control Panel"
+      },
+      {
+        "command": "serenity.explainPlanning",
+        "title": "Serenity: Explain Planning & Orchestration Library"
+      },
+      {
+        "command": "serenity.restartServer",
+        "title": "Serenity: Restart Server"
+      },
+      {
+        "command": "serenity.unloadModel",
+        "title": "Serenity: Unload Model (Free VRAM)"
+      },
+      {
+        "command": "serenity.setKVCache",
+        "title": "Serenity: Set K/V Cache Quantization Size"
+      },
+      {
+        "command": "serenity.setContextSize",
+        "title": "Serenity: Set Context Window (ctx size)"
+      },
+      {
+        "command": "serenity.setGpuLayers",
+        "title": "Serenity: Set GPU Layer Offload Count"
+      },
+      {
+        "command": "serenity.setRoleModel",
+        "title": "Serenity: Assign Model to Role/Effort Level"
+      },
+      {
+        "command": "serenity.toggleAutoContinue",
+        "title": "Serenity: Toggle Auto-Continue (Unlimited Iteration)"
+      },
+      {
+        "command": "serenity.addModelFolder",
+        "title": "Serenity: Add Custom GGUF Model Folder"
       }
     ],
     "configuration": {
@@ -82,6 +130,11 @@
           "type": "string",
           "default": "python",
           "description": "Path to the Python interpreter used to run the Serenity server."
+        },
+        "serenitydev.modelsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom directory path containing GGUF model files (e.g. S:\\LLM or /path/to/models)."
         }
       }
     }
@@ -104,7 +157,7 @@
     "axios": "^1.18.0"
   },
   "devDependencies": {
-    "@types/mocha": "^12.0.0-beta-3",
+    "@types/mocha": "^10.0.0",
     "@types/node": "22.x",
     "@types/vscode": "^1.107.0",
     "@vscode/test-cli": "^0.0.15",
@@ -120,6 +173,9 @@
     "js-yaml": "^4.2.1",
     "brace-expansion": "^5.0.8",
     "diff": "^8.0.3",
-    "mocha": "^12.0.0"
+    "mocha": "^10.2.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
   }
 }

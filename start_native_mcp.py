@@ -1,3 +1,12 @@
+from startup import initialize_environment
+
+try:
+    initialize_environment()
+except RuntimeError as e:
+    import sys
+    print(f"\n{e}")
+    sys.exit(1)
+
 import os
 import socket
 import sys
