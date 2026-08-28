@@ -1,0 +1,49 @@
+[TOML]
+[build-system]
+requires = ["setuptools>=61.0.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "SerenityDev"
+version = "1.6.0"
+description = "Local Python Agent interface running on llama.cpp with llama-server backend"
+authors = [{name = "GhostHeartZer0"}]
+maintainers = [{name = "GhostHeartZer0", email = "ccrg69@gmail.com"}]
+requires-python = ">=3.9"
+requires = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.24.0",
+    "cryptography>=41.0.0",
+    "python-dotenv>=1.0.0",
+    "starlette>=0.27.0",
+]
+classifiers = [
+    "Topic :: Software Development",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: GPL-3.0-only",
+    "Operating System :: POSIX",
+    "Operating System :: Windows",
+    "Topic :: Text::Chat",
+    "Development Status :: Beta",
+]
+
+[tool.setuptools]
+packages = ["serenitydev"]
+py-modules = [
+    "serenitydev.server",
+    "serenitydev.startup",
+    "serenitydev.mcp",
+    "serenitydev.config",
+    "serenitydev.guard",
+    "serenitydev.crypto",
+    "serenitydev.build",
+]
