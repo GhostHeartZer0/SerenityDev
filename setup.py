@@ -12,7 +12,8 @@ Usage:
 import sys
 import os
 import subprocess
-from setuptools import setup
+from typing import Any
+from setuptools import setup  # type: ignore[reportMissingModuleSource]
 
 def read_requirements():
     """Reads dependencies from requirements.txt."""
@@ -95,9 +96,9 @@ def setup_environment():
     return True
 
 # Standard setuptools configuration
-setup_args = dict(
+setup_args: dict[str, Any] = dict(
     name="SerenityDev",
-    version="1.5.0",
+    version="1.6.0",
     description="Local Python Agent interface running on llama.cpp with llama-server backend",
     author="GhostHeartZer0",
     py_modules=[

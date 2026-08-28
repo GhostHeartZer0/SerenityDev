@@ -6,11 +6,42 @@ File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
-Overhaul repeat handling / detection, make it a toggle [hyper, lazy, off] so that coding and repeat tool calling [eg. search hi, search low, search windows] can go forward.
+[2026-08-27] Done: Fixed Webview Regex Syntax Error & Restored UI Button Handlers:
+- Fixed `parseProofBadges` and `renderMemories` in `src/extension.ts` where template literal evaluation in Node stripped backslashes from `\'`, emitting broken JS string concatenations (`'' + safeBId + ''`) and invalid regex quantifiers into the webview `<script>` block, causing `Uncaught SyntaxError: Unexpected string` that prevented `sendCmd`, `onModelChange`, `submitQuery`, and all buttons from initializing (`ReferenceError: sendCmd is not defined`).
+- Recompiled and repackaged `SerenityDev-1.6.0.vsix`.
 
-[2026-08-22] Done: Multi-Line PTC Parsing Fix — Fixed `extract_json` to parse full Python code blocks via `ast.parse(mode='exec')` + `ast.walk()` for multi-line triple-quoted args. Falls back to line-by-line for simple calls.
-[2026-08-22] Done: Config Persistence (`serenity_config.json`) — All server engine settings (KV cache, context window, GPU layers, auto-continue, model, roles) persisted to disk on every `/api/config` POST and loaded on startup.
-[2026-08-22] Done: Added 96k (98304 tokens) context window option to `serenity.setContextSize` QuickPick.
+[2026-08-27] Done: Verified & Unified MCP StreamableHTTP JSON-RPC Engine:
+- Standardized Model Context Protocol (MCP) StreamableHTTP `/mcp` endpoint in `serenitydevserver.py` with timing-safe PQC Bearer token validation (`ENFORCE_MCP_AUTH`), HTTPS scheme checking (`ENFORCE_MCP_HTTPS`), and full tool dispatch across 11 workspace & memory tools.
+- Removed duplicate unmounted legacy handlers.
+- Created `src/test/test_mcp.py` covering handshake, initialization, ping, notifications, tools list, tools call, memory lifecycle, error codes (`-32601`, `-32700`), auth enforcement, and HTTPS enforcement. 100% test pass rate.
+
+[2026-08-27] Done: SerenityDev Agent Console Overhaul, Decoupled Reasoning & Limits, Subagent Budgeting, LTM & GPU Layer Text Input:
+- Decoupled `reasoning_strength` (`low`, `medium`, `high`, `xhigh`) from `limit_tier` (`default`, `low`, `medium`, `high`, `autonomy`).
+- Implemented `LongTermMemoryManager` with persistent storage in `.serenity_cache/long_term_memory.json` and agent tools (`store_memory`, `query_memory`, `update_memory`, `delete_memory`).
+- Added subagent independent execution budgets with "Offload then load" pattern, allowing workers to bypass parent loop caps.
+- Overhauled GPU layer offloading to direct text box / integer input (`Auto (-1)` or any custom layer number), removing fixed dropdown limits.
+- Fully overhauled VS Code Webview console: offline status requiring boot (`🔴 Offline (Click to Start)`), model/reasoning/limits dropdowns, KV cache quant, context size, GPU layers text box, Auto-Cont toggle, Long-Term Memory modal with search/delete/purge, thought accordions, subagent delegation cards, and Keep/Reject proof badges.
+- Verified test suite passes cleanly via `src/test/test_all_features.py` and `src/test/test_controls.py`.
+- Fixed `WinError 10048` port 8002 debug collision: removed `/api/status` bypass in `free_port()` so debugging cleanly terminates stale background servers, and fixed Pylance type narrowing on `dispatch_tool_call(s_target, ...)` in `serenitydevserver.py`.
+
+Overhaul repeat handling / detection, make it a toggle [hyper, lazy, off] so that coding and repeat tool calling [eg. search hi, search low, search windows] can go forward.
+[2026-08-25] Done: Fixed llama-server startup pipe deadlock & test suite compatibility:
+- Fixed `start_llama_server()` in `serenitydevserver.py` to drain `stdout`/`stderr` pipes continuously in background threads, eliminating OS pipe buffer saturation hangs on Windows.
+- Added `@pytest.mark.asyncio` to `src/test/test_agent.py` and verified all unit/integration tests passing.
+[2026-08-25] Done: Adaptive Thought Channel Closure, Zero-Response Fallback & Subprocess Window Fix:
+- Fixed `StreamingThoughtFilter.flush_remaining()` in `serenitydevserver.py` to synthesize and preserve unclosed thought/response buffers when model generation completes without explicit `<channel|>` tags.
+- Added safety text fallback in `run_orchestration` preventing 0-token empty returns to VS Code Copilot/Chat.
+- Broadened part value extraction in `src/extension.ts` (`provideLanguageModelChatResponse`) to support all part types and reference attachments.
+- Added `creationflags=subprocess.CREATE_NO_WINDOW` across all `start_llama_server` and `free_port` Windows commands (`netstat`, `taskkill`).
+- Rebuilt and packaged `SerenityDev-1.6.0.vsix`.
+[2026-08-25] Done: SerenityDev Renaming, Standalone Server, Model Reporting & Direct Llama-CPP Streaming Fixes:
+- Renamed planning & orchestration library view and command manifests to "SerenityDev" across package.json and src/extension.ts.
+- Nuked model consolidation entirely across server state, config persistence (serenity_config.json), extension UI, and orchestration loops.
+- Overhauled resolve_model with token intersection and substring fuzzy matching, ensuring exact models (e.g. gemma-4-e2b-q2 -> gemma-4-E2B-it-qat-UD-Q2_K_XL) load with quantized KV cache (q8_0/q5_1) and ultra-low VRAM usage without falling back to heavy supervisor models.
+- Fixed direct Llama-CPP streaming (fixed llm.n_ctx() typo, strict SSE event-stream formatting, dynamic headroom clamping, client disconnect cancellation).
+- Cleaned up /api/models and standard OpenAI /v1/models endpoints to dynamically report all 25+ installed GGUF models and role aliases to VS Code Copilot Chat and local clients.
+- Verified standalone server execution (serenitydevserver.py), direct model streaming, and MCP tool execution (list_directory) passing cleanly via src/test/verify_fixes.py.
+- Rebuilt extension package (SerenityDev-1.6.0.vsix).
 [2026-08-22] Done: Eliminated Windows Terminal Window Flashing — Switched `/api/status` GPU telemetry to in-process `pynvml` (zero subprocesses), cached machine entropy in `SerenityKeyVault`, added `subprocess.CREATE_NO_WINDOW` across all Python subprocess calls (`wmic`, `powershell`, `nvidia-smi`, `mcp:terminal`), and added `windowsHide: true` on Node.js `cp.spawn` in `src/extension.ts`.
 [2026-08-22] Done: Server Auto-Start, Model Selection Dropdown & Detection Scanner — Implemented `ensureServerStarted()` with multi-path virtualenv detection, health polling loop, and auto-sealing hardware key fallback in `startup.py`. Added active Model Selector dropdown directly inside the Planning & Orchestration sidebar webview, plus `serenity.startServer`, `serenity.selectModel` (one-click model switching across all detected GGUFs), and `serenity.scanModels` (dynamic directory rescan and detection reporting).
 [2026-08-22] Done: Role-Based Effort Levels, Model Mapping & Auto-Continue Toggle — Configured Supervisor effort tiers as first-class roles (`supervisor_low`, `supervisor_high`, `orchestrator_turbo`, `w1_reasoning`, `w2_code`, `w3_fast`, `w4_specialized`, `fim`), enabled dynamic model assignment per role in Planning & Orchestration Library webview and via `serenity.setRoleModel`, and added `auto_continue` toggle (500 max loops) in server and via `serenity.toggleAutoContinue`.

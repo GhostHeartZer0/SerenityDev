@@ -1,7 +1,50 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
-## Version 1.7.1
+- **Direct Model GPU Offload & GGML Split Inputs Fix**: Resolved `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` crash during hybrid CPU/GPU layer offload in `get_llama_model()` by conditionally setting `flash_attn` to match `offload_kqv`. Enabled active in-memory model loading and inference execution directly utilizing VRAM (4.62 / 6.0 GiB active).
+- **Online/Offline Server Toggle & Process Lifecycle Control**: Added `serenity.stopServer` and `serenity.toggleServer` commands with clean child process termination. Upgraded the SerenityDev webview status badge so clicking while online stops the server and clicking while offline starts it, with hover state and click feedback.
+- **Active Model Dispatch & Config Corruption Fix**: Fixed `load_server_config()` and `update_config()` in `serenitydevserver.py` where `SUPERVISOR_MODEL` was inadvertently overwritten by `roles["orchestrator_turbo"]` (Nemotron). Updated `run_orchestration()` to respect `request.model` and fall back to `CURRENT_MODEL` before `SUPERVISOR_MODEL`. Updated webview `sendQuery` to pass the user's actively selected model directly in the query payload.
+- **Chat Error Retry Button**: Added `[🔄 Retry]` action button in webview output whenever a model loading or inference error occurs, automatically re-submitting the last prompt with the active configuration.
+
+- **Webview Script Syntax Error & UI Button Crash Fix**: Fixed unescaped inline single quotes in `parseProofBadges` and `renderMemories` (`src/extension.ts`) by replacing them with HTML entity `&quot;`. Template literal string evaluation in Node previously stripped backslashes from `\'`, emitting broken JS string concatenations (`'' + safeBId + ''`) and invalid regex quantifiers into the webview `<script>` block. This syntax error stopped webview script execution entirely and caused `Uncaught ReferenceError: sendCmd is not defined` on button clicks. Recompiled and packaged `SerenityDev-1.6.0.vsix`.
+- **Debugging Attach to Process & Process-Blindness Fix**: Restored Python and Node "Attach using Process ID" (`debugpy`, `python`, `node`) as well as direct "Python Debugger: Launch SerenityDev Server" configurations in `.vscode/launch.json`. Added `PYTHONUNBUFFERED=1` environment variable when spawning `serenitydevserver.py` in `src/extension.ts` so all server startup, diagnostic, and error logs stream to the VS Code Output Channel in real time without block buffering delay.
+- **MCP Logic Verification & Unified StreamableHTTP Engine**: Verified and unified the Model Context Protocol (MCP) JSON-RPC 2.0 StreamableHTTP `/mcp` endpoint in `serenitydevserver.py`. Standardized PQC Bearer token authentication (`ENFORCE_MCP_AUTH`), timing-safe verification, HTTPS scheme enforcement (`ENFORCE_MCP_HTTPS`), and tool execution dispatch across all 11 MCP tools (`read_file`, `write_file`, `list_directory`, `grep_search`, `insert_edit_into_file`, `replace_string_in_file`, `run_command`, `store_memory`, `query_memory`, `update_memory`, `delete_memory`). Cleaned up duplicate unmounted legacy handlers.
+- **Dedicated MCP Test Suite**: Created automated unit test suite `src/test/test_mcp.py` validating MCP handshake (`GET /mcp`), protocol negotiation (`initialize`), notifications, ping, tools listing, tool calling, error handling (`-32601`, `-32700`), auth enforcement, and HTTPS enforcement. All 26 test cases pass cleanly.
+- **Decoupled Reasoning Strength vs Limit Tiers**: Decoupled thought depth (`reasoning_strength`: `low`, `medium`, `high`, `xhigh`) from execution loop turn bounds (`limit_tier`: `default` [16 turns], `low` [8 turns], `medium` [25 turns], `high` [50 turns], `autonomy` [1000+ unconstrained turns with unlimited tool calling and auto-continue]).
+- **Subagent Independent Loop Budgets & "Offload then Load" Flow**: Subagent worker tasks (`W1`..`W4`) execute with independent per-agent execution loop budgets (15 turns in standard mode, 100+ turns in autonomy mode), bypassing parent loop bounds. Subagent context is serialized, loaded into the subagent, and synthesized into a structured `HandoffReport` loaded back into the supervisor context without context bloat.
+- **Agent-Maintained Persistent Long-Term Memory (LTM)**: Implemented `LongTermMemoryManager` with persistent JSON storage in `.serenity_cache/long_term_memory.json`. Integrated typed Python memory tools (`store_memory`, `query_memory`, `update_memory`, `delete_memory`), REST API endpoints (`GET /api/memory`, `POST /api/memory`, `DELETE /api/memory/{key}`, `DELETE /api/memory`, `DELETE /api/session/clear`), and automatic top-fact prompt context injection.
+- **GPU Layer Text Input**: Replaced fixed hardcoded GPU layer offload dropdown options with direct text box / integer input (`Auto (-1)` or any custom layer count like `0` for CPU or `33`, `60`, `99`), applying changes directly without artificial layer limits.
+- **Debugging Port Conflict & Server Startup Fix**: Removed `/api/status` bypass in `free_port()` so starting `serenitydevserver.py` directly (or in debugger) cleanly terminates stale background processes holding port 8002, eliminating `WinError 10048` socket collisions.
+- **Pylance Type Narrowing for Subagent Dispatch**: Added explicit `isinstance(sub_tool.get("target"), str)` validation and typing for `dispatch_tool_call` target argument.
+
+## Version 1.6.3
+- **Auto Context Window Expansion Fix**: Fixed `cap_n_ctx_for_model()` and dynamic context expansion in `serenitydevserver.py`. Context window dynamically scales upward to fit prompts and tool outputs for models with large native train contexts without getting artificially clamped by the default `CONTEXT_WINDOW` config, while properly enforcing hard context caps on models like `codegemma` and `gemma-2`.
+- **Accurate Model Execution Error Reporting**: Improved direct `llama_cpp` and server fallback error handling in `serenitydevserver.py` to report exact exception reasons rather than incorrectly masking context limit errors as unsupported architecture errors.
+- **Split-Mode Bypass & Graph Partition Protection**: Passed `split_mode=0` (`LLAMA_SPLIT_MODE_NONE`) into `Llama` initialization and `-sm none` into `llama-server` in `serenitydevserver.py`. Prevents the GGML scheduler from treating partial CPU/GPU layer offloading as cross-device multi-GPU splits, completely preventing `GGML_SCHED_MAX_SPLIT_INPUTS` assertion crashes during hybrid execution.
+- **Dynamic VRAM KV Guard for Large Architectures**: Retains full native context window and reasoning capacity for Qwen 3.8 and Nemotron 30B without arbitrary token truncation; memory safety is handled dynamically by pinning KV Cache to system RAM (`offload_kqv=False`) and scaling layer offload dynamically.
+- **Virtual Environment & Python Interpreter Resolution**: Fixed Python interpreter discovery in `src/extension.ts` (`findPythonInterpreter`) to support direct `python.exe` binary paths, auto-derive `VIRTUAL_ENV` root directory and `PATH` prepending for virtualenvs, resolve `${workspaceFolder}` template variables, and fall back to VS Code's `python.defaultInterpreterPath`. Cleaned up `activate_virtualenv()` in `startup.py` to inspect active `VIRTUAL_ENV` and `sys.prefix` dynamically without hardcoded machine paths.
+- **Dynamic Context Session History**: Replaced static 3-turn orchestration cap in `serenitydevserver.py` with dynamic session history retention scaled to the active context token budget.
+- **Direct Model Output**: Eliminated hardcoded fallback placeholder string (`"I have completed analyzing the workspace."`) in favor of direct, unfiltered model output.
+- **Font Options & UI Customization**:
+  - Updated `UI_FONT_OPTIONS` and `MONO_FONT_OPTIONS` font configurations across UI themes.
+  - Font packages referenced in `Misc/Fonts` with native Windows system font fallbacks.
+
+## Version 1.6.2
+- **Llama-Server Background Pipe Drain & Non-Blocking Polling**: Fixed `start_llama_server()` in serenitydevserver.py by attaching continuous daemon threads to drain `llama_server_process` `stdout` and `stderr` pipes. Eliminates OS pipe buffer saturation deadlocks and guarantees failure messages are captured cleanly during health checks.
+- **Async Test Suite Integration**: Marked async test functions in `src/test/test_agent.py` with `@pytest.mark.asyncio`, allowing test suite execution across all test files.
+- **Adaptive Thought Channel Closure & Zero-Response Fallback**: Fixed `StreamingThoughtFilter.flush_remaining()` and `run_orchestration` in `serenitydevserver.py` to synthesize and preserve valid final content when models complete generation without an explicit `<channel|>` closing tag. Added a safety text fallback so requests never return 0 tokens to VS Code.
+- **Robust VS Code Chat Part Extraction**: Updated `provideLanguageModelChatResponse` in `src/extension.ts` to extract text from all part formats and duck-typed reference attachments.
+- **Eliminated Subprocess Window Popups**: Added `creationflags=subprocess.CREATE_NO_WINDOW` across `start_llama_server` and `free_port` Windows commands (`netstat`, `taskkill`), guaranteeing 100% silent background subprocess execution without console popups.
+- **Tool Workspace Path Resolution**: Implemented `resolve_workspace_path` and `get_primary_workspace_dir` in `serenitydevserver.py`. Filesystem tools (`read_file`, `list_directory`, `grep_search`, `write_file`, `insert_edit_into_file`, `replace_string_in_file`, `multi_replace_string_in_file`, `run_command`) now dynamically resolve relative paths against the active VS Code workspace folder (`request.workspace_dir` / `SERENITY_WORKSPACE_DIR`) instead of falling back to the packaged extension installation directory.
+- **Nuked Model Consolidation**: Completely removed model consolidation flags, persistence, state variables, and UI controls across `serenitydevserver.py`, `serenity_config.json`, `src/extension.ts`, and Dashboard UI.
+- **SerenityDev Rebranding**: Renamed planning and orchestration library views, commands, and headers to "SerenityDev" across `package.json`, `src/extension.ts`, and webviews.
+- **Accurate Model Resolution & Low Memory Footprint**: Upgraded `resolve_model()` in `serenitydevserver.py` with token intersection scoring and substring matching. Short/abbreviated model names (such as `gemma-4-e2b-q2`) resolve directly to exact quantized GGUF weights (`gemma-4-E2B-it-qat-UD-Q2_K_XL`) rather than erroneously falling back to heavy supervisor models.
+- **Direct Llama-CPP Streaming Fixes**: Fixed `llm.n_ctx()` call in `generate_completion_stream`, passed `type_k` and `type_v` quantized KV cache parameters (`q8_0`, `q5_1`) into `Llama` constructor, added dynamic context headroom clamping, and standardized SSE response headers with `data: [DONE]\n\n` termination.
+- **Standardized Model Reporting**: Cleaned up `/api/models` and OpenAI-compatible `/v1/models` routes in `serenitydevserver.py` to dynamically report all 25+ installed GGUF models and role aliases directly to VS Code Copilot Chat and local OpenAI clients.
+- **Verified Tool Calling & Standalone Boot**: Verified `serenitydevserver.py` standalone execution, port initialization with socket cleanup delay, streaming inference, and MCP tool execution (`list_directory`) via automated test suite `src/test/verify_fixes.py`.
+- **Extension Package Build**: Rebuilt `SerenityDev-1.6.0.vsix` with 0 compilation errors.
+
+## Version 1.6.1
 - **Streaming Output Disaggregation**: Reorganized streaming loop in `serenitydevserver.py` to dispatch `thought`, `tool_call`, and `result` events on separate async channels, ensuring JSON blocks are parsed and yielded immediately upon closing tag detection without being blocked by long-running synchronous operations like `llama_server_response.stdout.readline()` or `mcp.run_command()`.
 - **Direct MCP Tool Execution**: Bypassed `llama-server` for MCP-registered Python tools by implementing a new streaming handler that detects tool calls targeting `mcp` scopes and routes them directly through the `subprocess.Popen` managed `mcp:terminal:run_command` interface.
 - **Real-Time Stream Monitoring**: Added `is_streaming` flag and `asyncio.create_task` for non-blocking monitoring of the tool execution subprocess, enabling concurrent generation of completion tokens and command output.
@@ -161,27 +204,6 @@ All notable changes to the "SerenityDev" extension will be documented in this fi
 - Redesigned Orchestration Report output formatting in `serenitydevserver.py` using native GFM Markdown and `<details open>` collapsible blocks, ensuring clean layout rendering in VS Code and Android Studio IDE clients. [Done]
 - Fixed host string literal in `start_native_mcp.py` (`host="0.0.0.0"`), resolving socket `[Errno 11001] getaddrinfo failed` startup crashes. [Done]
 - Added automatic `free_port()` cleanup in `start_native_mcp.py` to auto-terminate zombie processes occupying ports 8443 or 8080 on Windows (`Errno 10048 WSAEADDRINUSE`) with `subprocess.run` exit code handling. [Done]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 ## Version 1.4.20 2026-07-20 
 - Gemma-4 Chat templates updated to the july release, boasting improved benchmark scores, tool call handling, and thought handling.

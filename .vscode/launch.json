@@ -16,6 +16,34 @@
 				"${workspaceFolder}/dist/**/*.js"
 			],
 			"preLaunchTask": "${defaultBuildTask}"
+		},
+		{
+			"name": "Python Debugger: Attach using Process ID",
+			"type": "debugpy",
+			"request": "attach",
+			"processId": "${command:pickProcess}",
+			"justMyCode": false
+		},
+		{
+			"name": "Python: Attach using Process ID (Legacy)",
+			"type": "python",
+			"request": "attach",
+			"processId": "${command:pickProcess}",
+			"justMyCode": false
+		},
+		{
+			"name": "Python Debugger: Launch SerenityDev Server",
+			"type": "debugpy",
+			"request": "launch",
+			"program": "${workspaceFolder}/serenitydevserver.py",
+			"console": "integratedTerminal",
+			"justMyCode": false
+		},
+		{
+			"name": "Node: Attach to Process",
+			"type": "node",
+			"request": "attach",
+			"processId": "${command:pickProcess}"
 		}
 	]
 }

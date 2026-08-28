@@ -2,11 +2,15 @@ import asyncio
 import httpx
 import json
 import sys
+import pytest
 
 if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8')
+    reconfigure = getattr(sys.stdout, 'reconfigure', None)
+    if reconfigure is not None:
+        reconfigure(encoding='utf-8')
 
 
+@pytest.mark.asyncio
 async def test_tool_calling():
     print("Testing SerenityDev backend tool calling...")
     url = "http://127.0.0.1:8002/ask_stream"
@@ -39,6 +43,7 @@ async def test_tool_calling():
                 print("FAILED: Could not connect to devserver after 30 seconds.")
                 return
 
+            assert models_res is not None
             print("SUCCESS: /api/models returned:")
             print(json.dumps(models_res.json(), indent=2))
 
@@ -83,8 +88,7 @@ async def test_tool_calling():
                 print("SUCCESS: /api/status retrieved.")
                 print(f"Server Status: {status_data.get('status')}")
                 print(f"GPU Memory: {status_data.get('gpu_memory')}")
-                print(f"Model Consolidation: {status_data.get('model_consolidation')}")
-                print(f"Current Model: {status_data.get('current_model')}")
+                print(f"Current Active Model: {status_data.get('current_model')}")
             else:
                 print(f"FAILED: /api/status returned {status_res.status_code}")
                 

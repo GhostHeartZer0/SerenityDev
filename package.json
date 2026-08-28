@@ -64,7 +64,7 @@
         {
           "type": "webview",
           "id": "serenity.chatView",
-          "name": "Planning & Orchestration Library",
+          "name": "SerenityDev",
           "icon": "$(comment)"
         }
       ]
@@ -73,6 +73,14 @@
       {
         "command": "serenity.startServer",
         "title": "Serenity: Start Server"
+      },
+      {
+        "command": "serenity.stopServer",
+        "title": "Serenity: Stop Server"
+      },
+      {
+        "command": "serenity.toggleServer",
+        "title": "Serenity: Toggle Server State"
       },
       {
         "command": "serenity.selectModel",
@@ -88,7 +96,7 @@
       },
       {
         "command": "serenity.explainPlanning",
-        "title": "Serenity: Explain Planning & Orchestration Library"
+        "title": "Serenity: Explain SerenityDev Architecture"
       },
       {
         "command": "serenity.restartServer",
@@ -115,6 +123,22 @@
         "title": "Serenity: Assign Model to Role/Effort Level"
       },
       {
+        "command": "serenity.setReasoningStrength",
+        "title": "Serenity: Set Reasoning Strength (Thought Depth)"
+      },
+      {
+        "command": "serenity.setLimitTier",
+        "title": "Serenity: Set Limit Tier (Execution Bounds)"
+      },
+      {
+        "command": "serenity.manageMemory",
+        "title": "Serenity: Manage Long-Term Memory"
+      },
+      {
+        "command": "serenity.purgeSession",
+        "title": "Serenity: Purge Current Session Memory"
+      },
+      {
         "command": "serenity.toggleAutoContinue",
         "title": "Serenity: Toggle Auto-Continue (Unlimited Iteration)"
       },
@@ -135,6 +159,11 @@
           "type": "string",
           "default": "",
           "description": "Optional custom directory path containing GGUF model files (e.g. S:\\LLM or /path/to/models)."
+        },
+        "serenitydev.serverScript": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to serenitydevserver.py when the Python server is installed outside the extension or workspace."
         }
       }
     }
@@ -153,15 +182,14 @@
     "lint": "eslint src",
     "test": "vscode-test"
   },
-  "dependencies": {
-    "axios": "^1.18.0"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "@types/mocha": "^10.0.0",
-    "@types/node": "22.x",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.20.1",
     "@types/vscode": "^1.107.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.1",
     "esbuild": "^0.28.1",
     "eslint": "^9.39.3",
     "npm-run-all": "^4.1.5",

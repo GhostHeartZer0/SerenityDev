@@ -1,4 +1,4 @@
-# Added by SerenityDev for testing tool-calling functionality# serenitydevserver.py
+# serenitydevserver.py
 from startup import initialize_environment
 
 try:
@@ -23,9 +23,9 @@ import hmac
 import uuid
 import hashlib
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, AsyncGenerator
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -45,44 +45,34 @@ class SerenityKeyVault:
 
     @classmethod
     def get_machine_entropy(cls) -> bytes:
-        """Reads composite multi-factor hardware attributes (OS MAC, Windows MachineGuid, BIOS UUID) to prevent user-space MAC spoofing."""
         if cls._cached_entropy is not None:
             return cls._cached_entropy
 
         components = [str(uuid.getnode()).encode("utf-8")]
-        # 1. Windows Registry MachineGuid
         try:
             import winreg
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
-                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+                guid, _ = winreg.QueryValueEx(key, "MachineGuid")
                 if guid:
                     components.append(str(guid).encode("utf-8"))
         except Exception:
             pass
-        # 2. BIOS / Motherboard UUID
+
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        uuid_found = False
         try:
-            res = subprocess.run(["wmic", "csproduct", "get", "UUID"], shell=False, capture_output=True, text=True, timeout=2, creationflags=flags)
-            if res.returncode == 0 and res.stdout:
-                lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip() and "UUID" not in l]
+            result = subprocess.run(
+                ["wmic", "csproduct", "get", "UUID"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                creationflags=flags
+            )
+            if result.returncode == 0:
+                lines = [line.strip() for line in result.stdout.splitlines() if line.strip() and "UUID" not in line]
                 if lines:
                     components.append(lines[0].encode("utf-8"))
-                    uuid_found = True
         except Exception:
             pass
-
-        # Windows 11+ fallback when wmic is deprecated/absent
-        if not uuid_found and sys.platform == "win32":
-            try:
-                ps_res = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID"],
-                    shell=False, capture_output=True, text=True, timeout=3, creationflags=flags
-                )
-                if ps_res.returncode == 0 and ps_res.stdout.strip():
-                    components.append(ps_res.stdout.strip().encode("utf-8"))
-            except Exception:
-                pass
 
         combined = b"|".join(components)
         cls._cached_entropy = hashlib.sha3_512(combined).digest()
@@ -90,33 +80,18 @@ class SerenityKeyVault:
 
     @staticmethod
     def get_legacy_entropy() -> bytes:
-        mac = str(uuid.getnode()).encode("utf-8")
-        return hashlib.sha3_512(mac).digest()
+        return hashlib.sha3_512(str(uuid.getnode()).encode("utf-8")).digest()
 
     @classmethod
     def get_entropy_candidates(cls) -> List[bytes]:
-        """Returns ordered list of candidate hardware entropy signatures for unlock fallback."""
         candidates = [cls.get_machine_entropy()]
         legacy = cls.get_legacy_entropy()
         if legacy not in candidates:
             candidates.append(legacy)
-
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as k:
-                guid, _ = winreg.QueryValueEx(k, "MachineGuid")
-                if guid:
-                    mac_guid = hashlib.sha3_512(f"{uuid.getnode()}|{guid}".encode("utf-8")).digest()
-                    if mac_guid not in candidates:
-                        candidates.append(mac_guid)
-        except Exception:
-            pass
-
         return candidates
 
     @classmethod
     def generate_nonce(cls, entropy: bytes, extra: bytes = b"") -> bytes:
-        """Squeezes a fresh 96-bit (12-byte) IV directly from SHAKE-256 to prevent GCM nonce reuse catastrophes."""
         seed = os.urandom(16) + time.monotonic_ns().to_bytes(8, "big") + entropy + extra
         return hashlib.shake_256(seed).digest(12)
 
@@ -133,22 +108,19 @@ class SerenityKeyVault:
 
         nonce = raw_payload[:12]
         ciphertext = raw_payload[12:]
-
         for entropy in cls.get_entropy_candidates():
             try:
                 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
                 derived_key = hashlib.shake_256(entropy).digest(32)
-                aesgcm = AESGCM(derived_key)
-                decrypted_bytes = aesgcm.decrypt(nonce, ciphertext, None)
-                return decrypted_bytes.decode("utf-8")
+                return AESGCM(derived_key).decrypt(nonce, ciphertext, None).decode("utf-8")
             except Exception:
                 pass
 
             try:
                 keystream = hashlib.shake_256(entropy + nonce).digest(len(ciphertext))
-                plain_bytes = bytes(b ^ k for b, k in zip(ciphertext, keystream))
+                plain_bytes = bytes(value ^ key for value, key in zip(ciphertext, keystream))
                 text = plain_bytes.decode("utf-8")
-                if text and all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in text):
+                if text and all(32 <= ord(char) <= 126 or char in "\r\n\t" for char in text):
                     return text
             except Exception:
                 pass
@@ -175,20 +147,14 @@ class SerenityKeyVault:
 
 raw_env_key = os.getenv("LOCAL_API_KEY") or os.getenv("LOCALAPI_KEY") or os.getenv("LOCALAPIKEY") or ""
 try:
-    LOCAL_API_KEY = SerenityKeyVault.unlock(raw_env_key)
+    LOCAL_API_KEY = SerenityKeyVault.unlock(raw_env_key) if raw_env_key.startswith("pqc_v1") else raw_env_key
 except Exception as e:
-    logging.error(f"[Auth Error] Failed to unlock key: {e}")
-    raise RuntimeError(f"CRITICAL ERROR: [Auth] Hardware-bound key unlock failed: {e}\nShutting down to prevent insecure operation.")
-
-if not LOCAL_API_KEY:
-    raise RuntimeError("CRITICAL ERROR: [Auth] Unlocked key is empty. Shutting down to prevent insecure operation.")
-
+    LOCAL_API_KEY = raw_env_key
   
 # Force working directory to be the directory of this server script
 workspace_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(workspace_dir)
 
-# Localize TEMP/TMP and compiler cache paths to bypass Windows Smart App Control blocks
 cache_dir = os.path.abspath(os.path.join(workspace_dir, ".serenity_cache"))
 cache_subdirs = {
     "TEMP": os.path.join(cache_dir, "temp"),
@@ -203,87 +169,195 @@ for path in set(cache_subdirs.values()):
 for env_var, path in cache_subdirs.items():
     os.environ[env_var] = path
 
-# Configuration Constants
 LLAMA_SERVER_BASE = "http://localhost:8080"
 LLAMA_SERVER_URL = f"{LLAMA_SERVER_BASE}/v1/completions"
 LLAMA_SERVER_CHAT_URL = f"{LLAMA_SERVER_BASE}/v1/chat/completions"
 llama_server_process = None
 
-# Model Mapping Config & Role-Based Effort Levels
-SUPERVISOR_LOW_MODEL = "gemma-4-26B-A4B"
-SUPERVISOR_HIGH_MODEL = "gemma-4-26B-A4B"
-ORCHESTRATOR_TURBO_MODEL = "gemma-4-26B-A4B"
+SUPERVISOR_LOW_MODEL = "gemma-4-E4B-it-qat-UD-Q4_K_XL"
+SUPERVISOR_HIGH_MODEL = "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL"
+ORCHESTRATOR_TURBO_MODEL = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE"
 SUPERVISOR_MODEL = "gemma-4-26B-A4B"
-W1_MODEL = "gemma-4-26B-A4B"       # Reasoning & Architecture
-W2_MODEL = "codegemma-7b-it"         # Heavy Code Synthesis
-W3_MODEL = "qwen3.6-35B-A3B"           # Fast Utilities / Scripting / Explanations
-W4_MODEL = "qwen3.6-27B"           # Additional specialized worker
-FIM_MODEL = "codegemma-2b"         # Inline Autocomplete
+W1_MODEL = "Qwen3.8-27B-UD-Q4_K_XL"  # Reasoning & Architecture
+W2_MODEL = "codegemma-7b-it"  # Heavy Code Synthesis
+W3_MODEL = "gemma-4-E4B-it-Coder.Q4_K_M"  # Fast Utilities / Scripting / Explanations
+W4_MODEL = "gemma4-v2-Q4_K_M"      # Specialized worker
+FIM_MODEL = "codegemma-2b"    # Inline Autocomplete
 
 auto_continue_enabled: bool = False  # Unlimited auto-continue iteration toggle
-
 AUTOSWAP_TIMEOUT = 240.0            # Seconds before swapping back to Supervisor VRAM
 CONTEXT_WINDOW = int(os.environ.get("SERENITY_CONTEXT_WINDOW", "16384")) # Configurable context window (default 16k)
-MAX_RESPONSE_LENGTH = 1200          # Character limit for responses to Copilot Chat (~300 tokens, safe limit for VS Code Copilot)
+MAX_RESPONSE_TOKENS = CONTEXT_WINDOW //4  #e.g. 4096 tokens on a 16k window
+MAX_RESPONSE_LENGTH = MAX_RESPONSE_TOKENS * 4  # ~16,384 characters
 
 # KV Cache Compression Settings
 cache_type_k = "f16"
 cache_type_v = "f16"
 gpu_layers_override: Optional[int] = None
+CURRENT_MODEL = SUPERVISOR_MODEL
 
-# --- Config Persistence ---
+# Decoupled Reasoning Strength (Thoughts) and Limit Tiers (Execution bounds)
+reasoning_strength: str = "medium"  # "low", "medium", "high", "xhigh"
+limit_tier: str = "default"         # "default", "low", "medium", "high", "autonomy"
 
-SERENITY_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serenity_config.json")
+SERENITY_CONFIG_PATH = os.path.join(workspace_dir, "serenity_config.json")
+MEMORY_STORE_PATH = os.path.join(cache_dir, "long_term_memory.json")
+
+class LongTermMemoryManager:
+    """Persistent Long-Term Memory Database maintained by agents and users."""
+    _lock = threading.Lock()
+
+    @classmethod
+    def _load_data(cls) -> Dict[str, Any]:
+        with cls._lock:
+            if not os.path.exists(MEMORY_STORE_PATH):
+                return {}
+            try:
+                with open(MEMORY_STORE_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                log_message(f"[Memory Error] Failed to read long_term_memory.json: {e}")
+                return {}
+
+    @classmethod
+    def _save_data(cls, data: Dict[str, Any]):
+        with cls._lock:
+            try:
+                os.makedirs(os.path.dirname(MEMORY_STORE_PATH), exist_ok=True)
+                with open(MEMORY_STORE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                log_message(f"[Memory Error] Failed to save long_term_memory.json: {e}")
+
+    @classmethod
+    def store(cls, key: str, category: str, content: str, source: str = "agent") -> Dict[str, Any]:
+        data = cls._load_data()
+        clean_key = str(key).strip().lower().replace(" ", "_")
+        entry = {
+            "key": clean_key,
+            "category": str(category).strip().lower() if category else "general",
+            "content": str(content).strip(),
+            "source": source,
+            "updated_at": time.time(),
+            "created_at": data.get(clean_key, {}).get("created_at", time.time())
+        }
+        data[clean_key] = entry
+        cls._save_data(data)
+        log_message(f"[Memory] Stored persistent memory '{clean_key}' under category '{entry['category']}'")
+        return entry
+
+    @classmethod
+    def query(cls, query_text: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        data = cls._load_data()
+        if not data:
+            return []
+        q_lower = (query_text or "").strip().lower()
+        cat_lower = (category or "").strip().lower() if category else None
+        results = []
+        for k, v in data.items():
+            if cat_lower and v.get("category") != cat_lower:
+                continue
+            if not q_lower:
+                results.append(v)
+            else:
+                score = 0
+                k_match = q_lower in k
+                c_match = q_lower in v.get("content", "").lower()
+                cat_match = q_lower in v.get("category", "").lower()
+                if k_match: score += 5
+                if c_match: score += 3
+                if cat_match: score += 2
+                for word in q_lower.split():
+                    if len(word) > 2:
+                        if word in k: score += 2
+                        if word in v.get("content", "").lower(): score += 1
+                if score > 0:
+                    results.append((score, v))
+        if q_lower:
+            results.sort(key=lambda x: x[0], reverse=True)
+            return [item[1] for item in results[:15]]
+        return list(data.values())
+
+    @classmethod
+    def update(cls, key: str, content: str) -> Optional[Dict[str, Any]]:
+        data = cls._load_data()
+        clean_key = str(key).strip().lower().replace(" ", "_")
+        if clean_key not in data:
+            return None
+        data[clean_key]["content"] = str(content).strip()
+        data[clean_key]["updated_at"] = time.time()
+        cls._save_data(data)
+        log_message(f"[Memory] Updated memory '{clean_key}'")
+        return data[clean_key]
+
+    @classmethod
+    def delete(cls, key: str) -> bool:
+        data = cls._load_data()
+        clean_key = str(key).strip().lower().replace(" ", "_")
+        if clean_key in data:
+            del data[clean_key]
+            cls._save_data(data)
+            log_message(f"[Memory] Deleted memory '{clean_key}'")
+            return True
+        return False
+
+    @classmethod
+    def purge_all(cls) -> int:
+        data = cls._load_data()
+        count = len(data)
+        cls._save_data({})
+        log_message(f"[Memory] Purged all {count} long-term memory entries.")
+        return count
+
+    @classmethod
+    def get_all(cls) -> List[Dict[str, Any]]:
+        data = cls._load_data()
+        return sorted(list(data.values()), key=lambda x: x.get("updated_at", 0), reverse=True)
+
+    @classmethod
+    def get_context_summary(cls, max_items: int = 6) -> str:
+        """Formats top long-term memory facts for agent system prompt context injection."""
+        items = cls.get_all()[:max_items]
+        if not items:
+            return ""
+        lines = ["[Long-Term Memory / Persistent Knowledge]"]
+        for it in items:
+            lines.append(f"- [{it.get('category', 'general').upper()}] {it.get('key')}: {it.get('content')}")
+        return "\n".join(lines)
 
 def load_server_config():
     """Loads saved server configuration from serenity_config.json on startup."""
     global cache_type_k, cache_type_v, gpu_layers_override, CONTEXT_WINDOW, auto_continue_enabled
     global CURRENT_MODEL, SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL
-    global SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL, model_consolidation
+    global SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
+    global reasoning_strength, limit_tier
     if not os.path.exists(SERENITY_CONFIG_PATH):
         return
     try:
         with open(SERENITY_CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        if cfg.get("cache_type_k"):
-            cache_type_k = cfg["cache_type_k"]
-        if cfg.get("cache_type_v"):
-            cache_type_v = cfg["cache_type_v"]
-        if cfg.get("gpu_layers") is not None:
-            gpu_layers_override = cfg["gpu_layers"]
-        if cfg.get("context_window") and cfg["context_window"] > 0:
-            CONTEXT_WINDOW = cfg["context_window"]
-        if cfg.get("auto_continue") is not None:
-            auto_continue_enabled = cfg["auto_continue"]
-        if cfg.get("current_model"):
-            CURRENT_MODEL = cfg["current_model"]
-        if cfg.get("model_consolidation") is not None:
-            model_consolidation = cfg["model_consolidation"]
-        # Role model assignments
+        cache_type_k = cfg.get("cache_type_k", "f16")
+        cache_type_v = cfg.get("cache_type_v", "f16")
+        gpu_layers_override = cfg.get("gpu_layers")
+        CONTEXT_WINDOW = cfg.get("context_window", 16384)
+        auto_continue_enabled = cfg.get("auto_continue", False)
+        CURRENT_MODEL = cfg.get("current_model", SUPERVISOR_MODEL)
+        reasoning_strength = cfg.get("reasoning_strength", "medium")
+        limit_tier = cfg.get("limit_tier", "default")
         roles = cfg.get("roles", {})
-        if roles.get("supervisor_low"):
-            SUPERVISOR_LOW_MODEL = roles["supervisor_low"]
-        if roles.get("supervisor_high"):
-            SUPERVISOR_HIGH_MODEL = roles["supervisor_high"]
-        if roles.get("orchestrator_turbo"):
-            ORCHESTRATOR_TURBO_MODEL = roles["orchestrator_turbo"]
-            SUPERVISOR_MODEL = roles["orchestrator_turbo"]
-        if roles.get("w1_reasoning"):
-            W1_MODEL = roles["w1_reasoning"]
-        if roles.get("w2_code"):
-            W2_MODEL = roles["w2_code"]
-        if roles.get("w3_fast"):
-            W3_MODEL = roles["w3_fast"]
-        if roles.get("w4_specialized"):
-            W4_MODEL = roles["w4_specialized"]
-        if roles.get("fim"):
-            FIM_MODEL = roles["fim"]
-        print(f"[+] Loaded saved config from {SERENITY_CONFIG_PATH} (ctx={CONTEXT_WINDOW}, K={cache_type_k}, V={cache_type_v}, gpu={gpu_layers_override})")
+        SUPERVISOR_LOW_MODEL = roles.get("supervisor_low", SUPERVISOR_LOW_MODEL)
+        SUPERVISOR_HIGH_MODEL = roles.get("supervisor_high", SUPERVISOR_HIGH_MODEL)
+        ORCHESTRATOR_TURBO_MODEL = roles.get("orchestrator_turbo", ORCHESTRATOR_TURBO_MODEL)
+        SUPERVISOR_MODEL = cfg.get("current_model", SUPERVISOR_MODEL)
+        W1_MODEL = roles.get("w1_reasoning", W1_MODEL)
+        W2_MODEL = roles.get("w2_code", W2_MODEL)
+        W3_MODEL = roles.get("w3_fast", W3_MODEL)
+        W4_MODEL = roles.get("w4_specialized", W4_MODEL)
+        FIM_MODEL = roles.get("fim", FIM_MODEL)
     except Exception as e:
         print(f"[!] Failed to load serenity_config.json: {e}")
 
 def save_server_config():
-    """Persists current server configuration to serenity_config.json."""
     cfg = {
         "cache_type_k": cache_type_k,
         "cache_type_v": cache_type_v,
@@ -291,7 +365,8 @@ def save_server_config():
         "context_window": CONTEXT_WINDOW,
         "auto_continue": auto_continue_enabled,
         "current_model": CURRENT_MODEL,
-        "model_consolidation": model_consolidation,
+        "reasoning_strength": reasoning_strength,
+        "limit_tier": limit_tier,
         "roles": {
             "supervisor_low": SUPERVISOR_LOW_MODEL,
             "supervisor_high": SUPERVISOR_HIGH_MODEL,
@@ -312,37 +387,54 @@ def save_server_config():
 # --- Security & Validation Helpers ---
 # NOTE: Security hardened - Subprocess command execution & path containment module
 def validate_path_containment(target_path: str, base_workspace: str, allowed_dirs: Optional[List[str]] = None) -> bool:
-    """Validates that target_path stays within base_workspace or user-allowed directories (resolving symlinks)."""
+    """Validates that target_path stays within base_workspace or user-allowed directories (resolving symlinks and drive casing)."""
     if not target_path:
         return False
     try:
         real_target = os.path.realpath(target_path)
-        bases = [os.path.realpath(base_workspace)]
-        if allowed_dirs:
-            for d in allowed_dirs:
-                if d:
-                    bases.append(os.path.realpath(d))
-        for base in bases:
-            if real_target == base or real_target.startswith(base + os.sep):
+        candidates = [base_workspace] + (allowed_dirs or [])
+
+        for base in candidates:
+            if not base:
+                continue
+            real_base = os.path.realpath(base)
+
+            #Normalize casing for Windows paths
+            if sys.platform == "win32":
+                rt = os.path.normcase(real_target)
+                rb = os.path.normcase(real_base)
+
+            else:
+                rt, rb = real_target, real_base
+
+            if rt == rb or rt.startswith(rb + os.sep):        
                 return True
         return False
     except Exception:
         return False
+        
 
 # Global State Management
 inference_lock = asyncio.Lock()
 autoswap_timer_task: Optional[asyncio.Task] = None
 active_models_list: List[str] = []
+model_registry_initialized = False
+model_registry_refresh_lock = asyncio.Lock()
 orchestrator_logs: List[str] = []
 independenttask_count: int = 0  # Tracks concurrent FIM requests
+file_edit_backups: Dict[str, Dict[str, Any]] = {}
+sessions_history: Dict[str, List[Dict[str, str]]] = {}
+server_paused = False
 active_system_plan = {"focus": "None", "steps": []}
 
-CURRENT_MODEL = SUPERVISOR_MODEL
-model_consolidation = True
-sessions_history = {} # session_id -> list of message context dicts
-server_paused = False
-
-# --- Architectural Insights from gork-build ---
+def log_message(msg: str):
+    clean_msg = "".join(c for c in msg if 32 <= ord(c) <= 126 or c in "\n\r\t")
+    sys.stdout.write(clean_msg + "\n")
+    sys.stdout.flush()
+    global orchestrator_logs
+    orchestrator_logs.append(clean_msg)
+    if len(orchestrator_logs) > 60:
+        orchestrator_logs.pop(0)
 
 class CircuitBreaker:
     """Sliding-window circuit breaker for API calls and tool executions (adapted from gork-build xai-circuit-breaker)."""
@@ -360,7 +452,6 @@ class CircuitBreaker:
     def record_failure(self):
         now = time.time()
         self.failures.append(now)
-        # Prune failures outside 60s sliding window
         self.failures = [t for t in self.failures if now - t <= 60.0]
         if len(self.failures) >= self.failure_threshold:
             self.state = "OPEN"
@@ -384,12 +475,7 @@ class WorkspaceQueue:
     def enqueue(self, session_id: str, prompt_id: str, text: str, kind: str = "user"):
         if session_id not in self.queues:
             self.queues[session_id] = []
-        entry = {
-            "id": prompt_id,
-            "text": text,
-            "kind": kind,
-            "timestamp": time.time()
-        }
+        entry = {"id": prompt_id, "text": text, "kind": kind, "timestamp": time.time()}
         self.queues[session_id].append(entry)
         return entry
 
@@ -424,16 +510,12 @@ def trim_context_tool_pairs(messages: List[Dict[str, str]], max_items: int) -> L
         trimmed = trimmed[1:]
     return trimmed
 
-# Global instances
 global_circuit_breaker = CircuitBreaker()
 global_workspace_queue = WorkspaceQueue()
 
 class SessionRotationManager:
-    """Manages active session rotations, key generation epochs, state preservation, and autonomous downtime rotations."""
-
-    idle_minutes: int = int(os.environ.get("SERENITY_SESSION_ROTATION_IDLE_MINUTES", "10"))
-    max_age_hours: float = float(os.environ.get("SERENITY_MAX_SESSION_AGE_HOURS", "1.0"))
-
+    idle_minutes: int = 10
+    max_age_hours: float = 1.0
     last_client_activity: float = time.time()
     key_created_at: float = time.time()
     rotation_epoch: int = 1
@@ -445,28 +527,27 @@ class SessionRotationManager:
 
     @classmethod
     def rotate(cls, store_and_resume: bool = True) -> Dict[str, Any]:
-        global sessions_history, global_workspace_queue
-        cache_path = os.path.join(cache_dir, "session_rotation_state.bin")
-        stored_items_count = 0
-
-        if store_and_resume:
-            state_data = {
-                "epoch": cls.rotation_epoch,
-                "timestamp": time.time(),
-                "sessions_history": sessions_history,
-                "workspace_queues": global_workspace_queue.queues
-            }
-            json_bytes = json.dumps(state_data).encode("utf-8")
-            encrypted_blob = SerenityKeyVault.encrypt(json_bytes.decode("latin1"))
-            with open(cache_path, "w", encoding="utf-8") as f:
-                f.write(encrypted_blob)
-            stored_items_count = len(sessions_history)
-
+        global sessions_history
         cls.rotation_epoch += 1
         cls.key_created_at = time.time()
         cls.pending_rotation_notice = True
 
-        if store_and_resume and os.path.exists(cache_path):
+        cache_path = os.path.join(cache_dir, "session_state.pqc")
+        stored_items_count = 0
+        if store_and_resume:
+            try:
+                state = {
+                    "sessions_history": sessions_history,
+                    "workspace_queues": global_workspace_queue.queues
+                }
+                encrypted_state = SerenityKeyVault.encrypt(json.dumps(state))
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(encrypted_state)
+
+                stored_items_count = len(sessions_history)
+            except Exception as e:
+                logging.error(f"[Session Rotation] Failed to store session state: {e}")
+
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     blob = f.read()
@@ -515,18 +596,12 @@ class SessionRotationManager:
             cls.rotate(store_and_resume=True)
 
 class SessionRotationMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request: Request, call_next) -> Response:
         SessionRotationManager.record_activity()
         response = await call_next(request)
-        if SessionRotationManager.pending_rotation_notice:
-            response.headers["X-Serenity-Session-Notice"] = (
-                f"session_rotated; epoch={SessionRotationManager.rotation_epoch}; session_preserved=true; endpoint=/api/session/rotate"
-            )
         return response
 
 import importlib.util
-
-# llama-cpp-python state management
 active_llama_model = None
 active_llama_model_name = None
 llama_cpp_available = False
@@ -541,23 +616,18 @@ custom_models_dirs: List[str] = []
 
 def get_candidate_model_dirs() -> List[str]:
     """Returns candidate directories to search for GGUF model files."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = workspace_dir
     dirs = [os.path.join(base_dir, "models")]
-    
-    # 1. Environment variables (SERENITY_MODELS_PATH, MODELS_DIR, MODELS_PATH)
-    env_paths = os.environ.get("SERENITY_MODELS_PATH") or os.environ.get("MODELS_DIR") or os.environ.get("MODELS_PATH")
+    env_paths = os.environ.get("SERENITY_MODELS_PATH") or os.environ.get("MODELS_DIR")
     if env_paths:
         for p in env_paths.replace(";", os.pathsep).split(os.pathsep):
             p = p.strip()
             if p and os.path.exists(p) and p not in dirs:
                 dirs.append(p)
-                
-    # 2. Configured custom model directories in memory
     for p in custom_models_dirs:
-        p = p.strip()
         if p and os.path.exists(p) and p not in dirs:
             dirs.append(p)
-            
+
     # 3. Saved custom dirs in models_dirs.json
     dirs_file = os.path.join(base_dir, "models_dirs.json")
     if os.path.exists(dirs_file):
@@ -572,7 +642,7 @@ def get_candidate_model_dirs() -> List[str]:
         except Exception:
             pass
             
-    return dirs
+    return [os.path.abspath(p) for p in dirs if os.path.isdir(p)]
 
 def add_custom_model_dir(dir_path: str) -> bool:
     """Adds a custom folder path to search for GGUF models and updates models_dirs.json."""
@@ -595,10 +665,9 @@ def add_custom_model_dir(dir_path: str) -> bool:
 def resolve_gguf_path(model_name: str) -> Optional[str]:
     if not model_name:
         return None
-        
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # 1. Check dynamic JSON directory mapping
     json_path = os.path.join(base_dir, "models.json")
     if os.path.exists(json_path):
         try:
@@ -609,27 +678,25 @@ def resolve_gguf_path(model_name: str) -> Optional[str]:
                     if os.path.exists(mapped_path):
                         return mapped_path
         except Exception as e:
-            log_message(f"[Models] Error reading models.json: {e}")
+            log_message(f"[Models] Error loading models.json: {e}")
 
-    # 2. Check absolute path directly
     if os.path.exists(model_name):
         return model_name
-        
-    # 3. Check candidate model directories (local models dir and custom folders)
+
     target_file = f"{model_name}.gguf" if not model_name.endswith('.gguf') else model_name
     candidate_dirs = get_candidate_model_dirs()
-    
+
     for models_dir in candidate_dirs:
         if not os.path.exists(models_dir):
             continue
         direct_match = os.path.join(models_dir, target_file)
         if os.path.exists(direct_match):
             return direct_match
-            
+        
         for root, _, files in os.walk(models_dir):
             if target_file in files:
                 return os.path.join(root, target_file)
-            
+
     return None
 
 active_llama_server_model_name = None
@@ -660,37 +727,38 @@ def unload_llama_server():
         active_llama_server_model_name = None
 
 def unload_llama_model():
-    """Explicitly unloads the direct llama-cpp-python model to clear VRAM without blocking."""
     global active_llama_model, active_llama_model_name
-    if active_llama_model is not None:
-        model_to_close = active_llama_model
-        model_name_to_close = active_llama_model_name
+    try:
+        if active_llama_model is not None:
+            if hasattr(active_llama_model, "close"):
+                active_llama_model.close()
+            del active_llama_model
+            import gc; gc.collect()
+            log_message("[Llama-CPP] Direct model offloaded successfully.")
+    except Exception as e:
+        log_message(f"[Llama-CPP] Warning unloading direct model: {e}")
+    finally:
         active_llama_model = None
         active_llama_model_name = None
-        log_message(f"[Llama-CPP] Unloading model '{model_name_to_close}'...")
-        try:
-            if hasattr(model_to_close, "close") and callable(getattr(model_to_close, "close")):
-                model_to_close.close()
-            del model_to_close
-        except Exception as e:
-            log_message(f"[Llama-CPP] Warning during model close: {e}")
-        import gc
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        log_message("[Llama-CPP] Direct model offloaded successfully.")
 
 unload_direct_llama_model = unload_llama_model
 
-async def start_llama_server(model_name: str, n_ctx: int):
+def unload_all_models():
+    """Release both model backends so a replacement cannot overlap in memory."""
+    unload_llama_server()
+    with direct_llama_lock:
+        unload_llama_model()
+
+async def start_llama_server(model_name: str, n_ctx: int, force_reload: bool = False):
     """Starts the llama-server subprocess if using API fallback."""
     global llama_server_process, active_llama_server_model_name
     
-    unload_llama_server() # This will kill existing server if any
+    with direct_llama_lock:
+        unload_llama_model()
+    if not force_reload and llama_server_process is not None and llama_server_process.poll() is None and active_llama_server_model_name == model_name:
+        return
+    if force_reload or llama_server_process is None or active_llama_server_model_name != model_name:
+        unload_llama_server()
     
     gguf_path = resolve_gguf_path(model_name)
     if not gguf_path:
@@ -726,6 +794,7 @@ async def start_llama_server(model_name: str, n_ctx: int):
         "-m", gguf_path,
         "-c", str(n_ctx),
         "-ngl", str(gpu_layers),
+        "-sm", "none",
         "--port", "8080",
         "--host", "127.0.0.1",
         "-fa", "on" # flash attention
@@ -749,6 +818,7 @@ async def start_llama_server(model_name: str, n_ctx: int):
     
     import subprocess
     try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         # Popen capturing stdout and stderr to inspect process health and log errors
         llama_server_process = subprocess.Popen(
             cmd,
@@ -756,8 +826,26 @@ async def start_llama_server(model_name: str, n_ctx: int):
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            errors="replace"
+            errors="replace",
+            creationflags=flags
         )
+
+        stderr_lines: List[str] = []
+        def _drain_stream(stream, sink: Optional[List[str]] = None):
+            try:
+                for line in iter(stream.readline, ''):
+                    if sink is not None and len(sink) < 100:
+                        sink.append(line)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_drain_stream, args=(llama_server_process.stdout, None), daemon=True).start()
+        threading.Thread(target=_drain_stream, args=(llama_server_process.stderr, stderr_lines), daemon=True).start()
         
         # Poll health status to ensure it's ready
         log_message("[Llama-Server] Server process spawned. Polling health check...")
@@ -770,8 +858,7 @@ async def start_llama_server(model_name: str, n_ctx: int):
 
                 # Instant check: if process died, break immediately and capture stderr
                 if llama_server_process.poll() is not None:
-                    _, stderr_out = llama_server_process.communicate()
-                    err_msg = stderr_out.strip() or f"Exited with code {llama_server_process.returncode}"
+                    err_msg = "".join(stderr_lines).strip() or f"Exited with code {llama_server_process.returncode}"
                     log_message(f"[Llama-Server Error] Process exited prematurely: {err_msg}")
                     break
 
@@ -795,8 +882,7 @@ async def start_llama_server(model_name: str, n_ctx: int):
         else:
             if not err_msg:
                 if llama_server_process.poll() is not None:
-                    _, stderr_out = llama_server_process.communicate()
-                    err_msg = stderr_out.strip() or f"Exited with code {llama_server_process.returncode}"
+                    err_msg = "".join(stderr_lines).strip() or f"Exited with code {llama_server_process.returncode}"
                 else:
                     err_msg = "Health check timed out after 45 seconds"
             log_message(f"[Llama-Server Error] Startup failed: {err_msg}")
@@ -836,89 +922,59 @@ MODEL_MAX_CONTEXT_LIMITS = {
 }
 
 def cap_n_ctx_for_model(model_name: str, requested_n_ctx: int) -> int:
-    """Cap requested n_ctx to model's maximum trained context length to prevent training context overflow warnings."""
     model_lower = model_name.lower()
     for key, max_limit in MODEL_MAX_CONTEXT_LIMITS.items():
         if key in model_lower:
-            if requested_n_ctx > max_limit:
-                log_message(f"[Llama-CPP] Capping requested n_ctx ({requested_n_ctx}) to model '{model_name}' max trained context limit ({max_limit}).")
-                return max_limit
+            return min(requested_n_ctx, max_limit)
     return requested_n_ctx
 
-def get_llama_model(model_name: str, n_ctx: int = 16384, cache_type_k: str = "f16", cache_type_v: str = "f16"):
+def get_llama_model(model_name: str, n_ctx: int = 16384, force_reload: bool = False):
     global active_llama_model, active_llama_model_name
     n_ctx = cap_n_ctx_for_model(model_name, n_ctx)
-    
-    if active_llama_model is not None and (active_llama_model_name != model_name or active_llama_model.n_ctx() < n_ctx):
-        log_message(f"[Llama-CPP] Unloading active model '{active_llama_model_name}' to reload for '{model_name}'...")
-        unload_direct_llama_model()
+
+    with direct_llama_lock:
+        unload_llama_server()
+        if active_llama_model is not None and (force_reload or active_llama_model_name != model_name or active_llama_model.n_ctx() < n_ctx):
+            unload_direct_llama_model()
         
-    if active_llama_model is None:
-        gguf_path = resolve_gguf_path(model_name)
-        if not gguf_path:
-            raise ValueError(f"Could not resolve GGUF path for model: {model_name}")
+        if active_llama_model is None:
+            gguf_path = resolve_gguf_path(model_name)
+            if not gguf_path:
+                raise ValueError(f"Could not resolve GGUF path for model: {model_name}")
             
-        try:
-            gpu_layers, offload_kqv = calculate_dynamic_gpu_layers(model_name, n_ctx)
-            if gpu_layers <= 0:
-                gpu_layers = 1
-        except Exception as e:
-            log_message(f"[Llama-CPP] Error calculating GPU layers: {e}. Falling back to 1 layer.")
-            gpu_layers = 1
-            offload_kqv = False
-            
-        log_message(f"[Llama-CPP] Loading {model_name} from {gguf_path} (n_ctx={n_ctx}, gpu_layers={gpu_layers}) with KV cache compression K={cache_type_k}, V={cache_type_v}...")
-        from llama_cpp import Llama
-        try:
-            active_llama_model = Llama(
-                model_path=gguf_path,
-                n_ctx=n_ctx,
-                n_gpu_layers=gpu_layers,
-                flash_attn=True,
-                offload_kqv=offload_kqv,
-                n_threads=8,
-                verbose=False,
-                type_k=get_ggml_type(cache_type_k),
-                type_v=get_ggml_type(cache_type_v)
-            )
-        except Exception as load_err:
-            log_message(f"[VRAM-GUARD] Initial model instantiation failed: {load_err}. Engaging Safe Recovery Fallback...")
-            try:
-                fallback_layers = max(1, gpu_layers // 2) if gpu_layers > 1 else 0
-                log_message(f"[VRAM-GUARD] Retrying with safe layers={fallback_layers}, offload_kqv=False, flash_attn=False...")
-                active_llama_model = Llama(
-                    model_path=gguf_path,
-                    n_ctx=n_ctx,
-                    n_gpu_layers=fallback_layers,
-                    flash_attn=False,
-                    offload_kqv=False,
-                    n_threads=8,
-                    verbose=False,
-                    type_k=get_ggml_type(cache_type_k),
-                    type_v=get_ggml_type(cache_type_v)
-                )
-            except Exception as load_err2:
-                log_message(f"[VRAM-GUARD] Safe layer fallback failed: {load_err2}. Retrying on CPU (n_gpu_layers=0)...")
-                active_llama_model = Llama(
-                    model_path=gguf_path,
-                    n_ctx=n_ctx,
-                    n_gpu_layers=0,
-                    flash_attn=False,
-                    offload_kqv=False,
-                    n_threads=8,
-                    verbose=False,
-                    type_k=get_ggml_type(cache_type_k),
-                    type_v=get_ggml_type(cache_type_v)
-                )
+            from llama_cpp import Llama
+            log_message(f"[Llama-CPP] Loading model {model_name} (n_ctx={n_ctx}, K={cache_type_k}, V={cache_type_v})...")
+            layers, offload_kqv = calculate_dynamic_gpu_layers(model_name, n_ctx)
 
-        active_llama_model_name = model_name
-    return active_llama_model
+            type_k = get_ggml_type(cache_type_k)
+            type_v = get_ggml_type(cache_type_v)
 
-direct_llama_lock = threading.Lock()
+            kwargs = {
+                "model_path": gguf_path,
+                "n_ctx": n_ctx,
+                "n_gpu_layers": layers,
+                "split_mode": 0, # LLAMA_SPLIT_MODE_NONE (prevents GGML_SCHED_MAX_SPLIT_INPUTS clipping on hybrid offload)
+                "flash_attn": offload_kqv,
+                "verbose": False
+            }
+            if type_k is not None:
+                kwargs["type_k"] = type_k
+            if type_v is not None:
+                kwargs["type_v"] = type_v
+            if not offload_kqv:
+                kwargs["offload_kqv"] = False
+
+            active_llama_model = Llama(**kwargs)
+
+        active_llama_model_name = model_name    
+        return active_llama_model
+
+direct_llama_lock = threading.RLock()
 
 async def generate_completion_stream(model_name: str, prompt: str, temperature: float, num_ctx: int, max_tokens: int = -1, stop: Optional[List[str]] = None, min_p: float = 0.05, repeat_penalty: float = 1.05):
     if stop is None:
         stop = ["<turn|>", "<|turn|>", "<bos>", "<eos>"]
+
     if llama_cpp_available and "glimmer" not in model_name.lower():
         try:
             gguf_path = resolve_gguf_path(model_name)
@@ -929,27 +985,33 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                 except RuntimeError:
                     loop = asyncio.get_event_loop()
                 cancel_event = threading.Event()
-
+                        
                 def producer():
                     try:
                         with direct_llama_lock:
                             if cancel_event.is_set():
                                 return
-                            llm = get_llama_model(model_name, num_ctx)
-                            # Dynamically check if prompt length exceeds current context window
+                            # Initial model load with current CONTEXT_WINDOW
+                            llm = get_llama_model(model_name, CONTEXT_WINDOW)
+                            
+                            # Pre-check token count and dynamic context expansion with clamped headroom
                             try:
                                 import math
-                                prompt_tokens = llm.tokenize(prompt.encode('utf-8'))
+                                prompt_tokens = llm.tokenize(prompt.encode("utf-8"))
                                 token_count = len(prompt_tokens)
-                                # Give a safety buffer (default to 8192 if max_tokens is -1 or None)
-                                headroom = max_tokens if max_tokens > 0 else 8192
+                                
+                                headroom = max_tokens if (max_tokens > 0 and max_tokens <= 2048) else 2048
                                 needed_ctx = token_count + headroom
-                                if needed_ctx > llm.n_ctx():
-                                    required_ctx = math.ceil(needed_ctx / 8192) * 8192
-                                    log_message(f"[Llama-CPP] Prompt tokens ({token_count}) + headroom ({headroom}) exceeds loaded context limit ({llm.n_ctx()}). Dynamic reloading to n_ctx={required_ctx}...")
-                                    llm = get_llama_model(model_name, required_ctx)
+                                # Target context rounded up to 2048 chunks
+                                target_ctx = math.ceil(needed_ctx / 2048) * 2048
+                                target_ctx = max(target_ctx, CONTEXT_WINDOW)
+                                capped_ctx = cap_n_ctx_for_model(model_name, target_ctx)
+
+                                if needed_ctx > llm.n_ctx() and llm.n_ctx() < capped_ctx:
+                                    log_message(f"[Llama-CPP] Context expansion triggered: {llm.n_ctx()} -> {capped_ctx} (Needed: {needed_ctx})")
+                                    llm = get_llama_model(model_name, capped_ctx, force_reload=True)
                             except Exception as token_ex:
-                                log_message(f"[Llama-CPP] Error during token count pre-check: {token_ex}")
+                                log_message(f"[Llama-CPP] Token count pre-check notice: {token_ex}")
 
                             limit_tokens = max_tokens if max_tokens > 0 else None
                             chunks = llm(
@@ -962,24 +1024,17 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                                 repeat_penalty=repeat_penalty
                             )
                             for chunk in chunks:
-                                if cancel_event.is_set():
+                                if cancel_event.is_set(): 
                                     break
-                                if not isinstance(chunk, dict):
-                                    continue
-                                choices = chunk.get("choices")
-                                if not isinstance(choices, list) or len(choices) == 0:
-                                    continue
-                                first_choice = choices[0]
-                                if not isinstance(first_choice, dict):
-                                    continue
-                                text = first_choice.get("text", "")
-                                if text:
-                                    loop.call_soon_threadsafe(queue.put_nowait, text)
+                                if isinstance(chunk, dict) and chunk.get("choices"):
+                                    text = chunk["choices"][0].get("text", "")
+                                    if text:
+                                        loop.call_soon_threadsafe(queue.put_nowait, text)
                     except Exception as ex:
+                        log_message(f"[Llama-CPP] Stream Generation Error: {ex}")
                         loop.call_soon_threadsafe(queue.put_nowait, ex)
                     finally:
                         loop.call_soon_threadsafe(queue.put_nowait, None)
-
                 loop.run_in_executor(None, producer)
                 try:
                     while True:
@@ -991,16 +1046,15 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                         yield val
                 except asyncio.CancelledError:
                     cancel_event.set()
-                    log_message("[Llama-CPP Stream] Stream cancelled by client connection drop.")
+                    log_message("[Llama-CPP] Stream cancelled by client connection drop.")
                     raise
                 return
         except asyncio.CancelledError:
-            log_message("[Llama-CPP Stream] Generation cancelled.")
+            log_message("[Llama-CPP] Stream Generation cancelled.")
             raise
         except Exception as e:
-            log_message(f"[Llama-CPP Stream Error] Direct streaming failed, falling back to Llama-Server API: {e}")
+            log_message(f"[Llama.cpp Stream Error] Direct Streaming Failed, falling back to Llama-Server API: {e}")        
 
-    # Start or ensure llama-server is running for this model
     try:
         if llama_server_process is None or active_llama_server_model_name != model_name:
             await start_llama_server(model_name, num_ctx)
@@ -1027,10 +1081,10 @@ async def generate_completion_stream(model_name: str, prompt: str, temperature: 
                 return
             except Exception as direct_err:
                 log_message(f"[Fallback Error] Direct llama_cpp load also failed for '{model_name}': {direct_err}")
-                yield f"\n\n❌ **Model Error:** Failed to load model '{model_name}' (unsupported GGUF architecture). Please switch to a supported model like `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` or `gemma-4-E4B-it-Coder.Q4_K_M`."
+                yield f"\n\n❌ **Model Error:** Failed to execute model '{model_name}': {direct_err}"
                 return
         else:
-            yield f"\n\n❌ **Model Error:** Failed to load model '{model_name}' (unsupported GGUF architecture). Please switch to a supported model like `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL` or `gemma-4-E4B-it-Coder.Q4_K_M`."
+            yield f"\n\n❌ **Model Error:** Failed to load model '{model_name}'. Please verify model status and context settings."
             return
 
     payload = {
@@ -1074,47 +1128,18 @@ async def generate_completion(model_name: str, prompt: str, temperature: float, 
         raise
     return {"response": "".join(result)}
 
-PYTHON_TOOL_STUBS = """AVAILABLE TOOLS (Programmatic Tool Calling - Typed Python Stubs):
+PYTHON_TOOL_STUBS = """AVAILABLE TOOLS (Programmatic Tool Calling):
 ```python
 def create_or_update_plan(steps: list[str], current_focus: str) -> dict:
-    \"\"\"Validates or updates the multi-step execution plan.\"\"\"
-    ...
-
 def list_directory(path: str = ".") -> list[str]:
-    \"\"\"Lists all files and directories in the target workspace path.\"\"\"
-    ...
-
 def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
-    \"\"\"Reads code from a file. If the file is large, start_line and end_line (1-indexed, inclusive) must be specified to read target regions and prevent context bloat.\"\"\"
-    ...
-
 def write_file(path: str, content: str) -> str:
-    \"\"\"Writes or overwrites code at path.\"\"\"
-    ...
-
 def insert_edit_into_file(path: str, target_content: str, new_content: str) -> str:
-    \"\"\"Inserts new content in place of target content in a file.\"\"\"
-    ...
-
 def replace_string_in_file(path: str, target_content: str, new_content: str) -> str:
-    \"\"\"Replaces target content with new content in a file.\"\"\"
-    ...
-
 def multi_replace_string_in_file(path: str, replacements: list[dict[str, str]]) -> str:
-    \"\"\"Replaces multiple specific non-adjacent or adjacent text blocks in a file by locating the exact 'target' string and replacing it with the 'replacement' string. Use this instead of write_file to avoid context limits.\"\"\"
-    ...
-
 def grep_search(query: str, path: str = ".") -> list[str]:
-    \"\"\"Searches for text patterns across project files.\"\"\"
-    ...
-
 def run_command(command: str) -> str:
-    \"\"\"Runs a shell command in the workspace and returns stdout/stderr. Use this to run tests, linters, or build scripts.\"\"\"
-    ...
-```
-HOW TO CALL TOOLS:
-When you need to inspect files, execute code, run tests, or modify files, you MUST invoke tools as Python function calls directly (e.g. `read_file(path="main.py")` or `run_command(command="...")`) or wrapped in ```python ... ``` blocks.
-Do NOT talk about calling tools or state that you will call tools in plain natural language without executing the function call. Call the function directly."""
+```"""
 
 SUPERVISOR_PROMPT = f"""
 Reasoning strength: xhigh.
@@ -1151,48 +1176,43 @@ SCHEMA:
 class QueryRequest(BaseModel):
     prompt: str
     context: str = ""
-    model: str = SUPERVISOR_MODEL
+    model: Optional[str] = None
     session_id: Optional[str] = None
     workspace_dir: Optional[str] = None
-    max_steps: Optional[int] = None
-    auto_continue: Optional[bool] = None
 
 class FimRequest(BaseModel):
     prefix: str
     suffix: str
-    model: str = FIM_MODEL
+    model: Optional[str] = None
 
-# --- Activity Log Helper ---
 
-def log_message(msg: str):
-    """Prints a message to console and appends it to the orchestrator log buffer, filtering out non-ASCII to prevent Windows console crashes."""
-    clean_msg = "".join(c for c in msg if 32 <= ord(c) <= 126 or c in "\n\r\t")
-    print(clean_msg)
-    global orchestrator_logs
-    orchestrator_logs.append(clean_msg)
-    if len(orchestrator_logs) > 55:
-        orchestrator_logs.pop(0)
+FIM_CONTEXT_CHARS = 16000
+
+
+def fit_fim_context(prefix: str, suffix: str) -> tuple[str, str]:
+    """Keep inline completion prompts within the native context of small FIM models."""
+    prefix_budget = min(len(prefix), FIM_CONTEXT_CHARS * 3 // 4)
+    suffix_budget = FIM_CONTEXT_CHARS - prefix_budget
+    return prefix[-prefix_budget:], suffix[:suffix_budget]
 
 # --- Startup Check & Auto-Registration ---
 
 def get_installed_models() -> List[str]:
-    """Scan local models directory recursively for .gguf files, register them, and maintain models.json."""
+    """Scan local modes directory recursively for GGUF files, register them, and maintains a models.json"""
     base_dir = os.path.dirname(os.path.abspath(__file__))
     models = []
-    
+
     json_path = os.path.join(base_dir, "models.json")
     model_map = {}
     map_updated = False
     
-    # 1. Load existing models.json map
     if os.path.exists(json_path):
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 model_map = json.load(f)
                 for model_name, path in list(model_map.items()):
                     model_name_lower = model_name.lower()
-                    # Filter out MTP, assistant, and mmproj files
-                    if any(tag in model_name_lower for tag in ['mmproj', 'assistant', 'mtp']):
+                    if any(tag in model_name_lower for tag in ['mmproj', 'assistant', 'mtp', 'glimmer', 'gemma-3', 'dflash', 'diffusiongemma']):
                         del model_map[model_name]
                         map_updated = True
                         continue
@@ -1201,7 +1221,6 @@ def get_installed_models() -> List[str]:
         except Exception as e:
             log_message(f"[Models] Error reading models.json: {e}")
 
-    # 2. Scan candidate model directories and update map
     candidate_dirs = get_candidate_model_dirs()
     for models_dir in candidate_dirs:
         try:
@@ -1212,24 +1231,22 @@ def get_installed_models() -> List[str]:
                 
             for root, _, files in os.walk(models_dir):
                 for f in files:
-                    if f.endswith('.gguf'):
+                    if f.lower().endswith('.gguf'):
                         name = f[:-5]
                         name_lower = name.lower()
-                        # Filter out MTP, assistant, and mmproj files
-                        if any(tag in name_lower for tag in ['mmproj', 'assistant', 'mtp']):
+                        if any(tag in name_lower for tag in ['mmproj', 'assistant', 'mtp', 'glimmer', 'gemma-3', 'dflash', 'diffusiongemma']):
                             continue
+                        abs_path = os.path.abspath(os.path.join(root, f))
                         if name not in models:
-                            models.append(name) # remove .gguf extension
-                        
-                        # Ensure absolute path is in the map
+                            models.append(name)
+
                         abs_path = os.path.abspath(os.path.join(root, f))
                         if name not in model_map or model_map[name] != abs_path:
                             model_map[name] = abs_path
                             map_updated = True
         except Exception as e:
-            log_message(f"[Startup Error] Failed to scan models in {models_dir}: {e}")
-        
-    # 3. Save updated map back to models.json if changes occurred
+            log_message(f"[Models] Error scanning for Models in {models_dir}: {e}")
+
     if map_updated or not os.path.exists(json_path):
         try:
             with open(json_path, 'w', encoding='utf-8') as f:
@@ -1241,36 +1258,46 @@ def get_installed_models() -> List[str]:
 
 def check_and_register_models():
     """Initializes active model targets by auto-discovering GGUFs."""
-    global active_models_list, SUPERVISOR_MODEL, SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
+    global active_models_list, model_registry_initialized, SUPERVISOR_MODEL, SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
     log_message("[Startup] Scanning for local model files...")
     active_models_list = get_installed_models()
+    model_registry_initialized = True
     log_message(f"[Startup] Found models: {active_models_list}")
-    
+
+    # Reload saved user config first so saved assignments take precedence
+    load_server_config()
+
     if active_models_list:
         models = sorted(active_models_list, reverse=True)
         
-        main_models = [m for m in models if not any(tag in m.lower() for tag in ['mmproj', 'assistant', 'mtp'])]
+        main_models = [m for m in models if not any(tag in m.lower() for tag in ['mmproj', 'assistant', 'mtp', 'glimmer', 'gemma-3', 'dflash', 'diffusiongemma'])]
         if not main_models:
             main_models = models
             
-        fim_candidates = [m for m in main_models if '2b' in m.lower() or 'code' in m.lower()]
-        FIM_MODEL = fim_candidates[-1] if fim_candidates else main_models[-1]
-        
-        w2_candidates = [m for m in main_models if ('7b' in m.lower() or 'code' in m.lower()) and m != FIM_MODEL]
-        W2_MODEL = w2_candidates[0] if w2_candidates else main_models[0]
-        
-        super_candidates = [m for m in main_models if 'a4b' in m.lower() or '35b' in m.lower() or '26b' in m.lower()]
-        SUPERVISOR_MODEL = super_candidates[0] if super_candidates else main_models[0]
-        SUPERVISOR_LOW_MODEL = SUPERVISOR_MODEL
-        SUPERVISOR_HIGH_MODEL = SUPERVISOR_MODEL
-        ORCHESTRATOR_TURBO_MODEL = SUPERVISOR_MODEL
-        W1_MODEL = SUPERVISOR_MODEL
-        W3_MODEL = super_candidates[1] if len(super_candidates) > 1 else SUPERVISOR_MODEL
-        W4_MODEL = super_candidates[2] if len(super_candidates) > 2 else SUPERVISOR_MODEL
-        
-        log_message(f"[Startup] Auto-Assigned Supervisor (Low/High/Turbo): {SUPERVISOR_MODEL}")
-        log_message(f"[Startup] Auto-Assigned Agent (Code): {W2_MODEL}")
-        log_message(f"[Startup] Auto-Assigned Agent (FIM): {FIM_MODEL}")
+        if not FIM_MODEL:
+            fim_candidates = [m for m in main_models if '2b' in m.lower() or 'code' in m.lower()]
+            FIM_MODEL = fim_candidates[-1] if fim_candidates else main_models[-1]
+
+        if not W2_MODEL:
+            w2_candidates = [m for m in main_models if ('7b' in m.lower() or 'code' in m.lower()) and m != FIM_MODEL]
+            W2_MODEL = w2_candidates[0] if w2_candidates else main_models[0]
+
+        if not SUPERVISOR_MODEL:
+            super_candidates = [m for m in main_models if 'a4b' in m.lower() or '35b' in m.lower() or '26b' in m.lower()]
+            SUPERVISOR_MODEL = super_candidates[0] if super_candidates else main_models[0]
+            SUPERVISOR_LOW_MODEL = SUPERVISOR_MODEL
+            SUPERVISOR_HIGH_MODEL = SUPERVISOR_MODEL
+            ORCHESTRATOR_TURBO_MODEL = SUPERVISOR_MODEL
+            W1_MODEL = SUPERVISOR_MODEL
+            W3_MODEL = super_candidates[1] if len(super_candidates) > 1 else SUPERVISOR_MODEL
+            W4_MODEL = super_candidates[2] if len(super_candidates) > 2 else SUPERVISOR_MODEL
+
+        # Re-apply persisted config to guarantee exact user choices remain active
+        load_server_config()
+
+        log_message(f"[Startup] Active Supervisor: {SUPERVISOR_MODEL}")
+        log_message(f"[Startup] Active Agent (Code): {W2_MODEL}")
+        log_message(f"[Startup] Active Agent (FIM): {FIM_MODEL}")
 
 async def autonomous_downtime_session_rotation_loop():
     while True:
@@ -1284,35 +1311,27 @@ async def autonomous_downtime_session_rotation_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Run model check synchronously to avoid race conditions with early requests
-    check_and_register_models()
-    rotation_task = asyncio.create_task(autonomous_downtime_session_rotation_loop())
-    try:
-        yield
-    finally:
-        rotation_task.cancel()
+    global active_models_list, model_registry_initialized
+    load_server_config()
+    active_models_list = get_installed_models()
+    model_registry_initialized = True
+    log_message(f"[Startup] Model registry initialized: {len(active_models_list)} local GGUF model(s)")
+    if active_models_list:
+        log_message(f"[Startup] Registered models: {', '.join(active_models_list)}")
+    else:
+        log_message("[Startup] No local GGUF models found. Check SERENITY_MODELS_PATH or models_dirs.json.")
+    yield
 
-app = FastAPI(
-    title="Serenity Orchestrator",
-    description="Multi-agent local orchestrator featuring Hierarchical Supervisor routing and Autoreplacer (FIM) autocomplete management.",
-    lifespan=lifespan
-)
-
+app = FastAPI(title="Serenity Orchestrator Core", lifespan=lifespan)
 app.add_middleware(SessionRotationMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class PQCEnforcementMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, secret_key: str):
         super().__init__(app)
         self.secret_key = secret_key
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request: Request, call_next) -> Response:
         pqc_signature = request.headers.get("X-PQC-Signature")
         timestamp_str = request.headers.get("X-PQC-Timestamp")
 
@@ -1332,6 +1351,18 @@ class PQCEnforcementMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(PQCEnforcementMiddleware, secret_key=LOCAL_API_KEY)
 
+import importlib.util
+# llama-cpp-python state management
+active_llama_model = None
+active_llama_model_name = None
+llama_cpp_available = False
+if importlib.util.find_spec("llama_cpp") is not None:
+    try:
+        import llama_cpp  # type: ignore
+        llama_cpp_available = True
+    except Exception:
+        pass
+
 # --- GPU Layer Offloading Helpers ---
 
 def get_vram_info(ctx_size: int = 16384) -> dict:
@@ -1350,9 +1381,9 @@ def get_vram_info(ctx_size: int = 16384) -> dict:
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            total_mb = mem_info.total / (1024 * 1024)
-            free_mb = mem_info.free / (1024 * 1024)
-            used_mb = mem_info.used / (1024 * 1024)
+            total_mb = float(mem_info.total) / (1024 * 1024)
+            free_mb = float(mem_info.free) / (1024 * 1024)
+            used_mb = float(mem_info.used) / (1024 * 1024)
 
         target_pids = {os.getpid()}
         if 'llama_server_process' in globals() and llama_server_process and llama_server_process.poll() is None:
@@ -1389,10 +1420,9 @@ def get_vram_info(ctx_size: int = 16384) -> dict:
     usable_mb = free_mb + self_used_mb
     
     # Shared VRAM Guard:
-    # Scale safety headroom by context size to protect against compute graph & CUDA runtime overhead
-    # Base CUDA driver buffer (600 MB) + context-scaled graph scratch memory
-    graph_scratch_mb = max(256.0, (ctx_size / 49152.0) * 800.0)
-    safety_headroom_mb = min(1800.0, 600.0 + graph_scratch_mb)
+    # Base CUDA driver buffer from 600 MB to 900-1000MB
+    graph_scratch_mb = max(384.0, (ctx_size / 49152.0) * 1024.0)
+    safety_headroom_mb = min(2200.0, 950.0 + graph_scratch_mb)
     
     target_vram = max(200.0, usable_mb - safety_headroom_mb)
     target_vram = min(target_vram, total_mb - safety_headroom_mb)
@@ -1464,14 +1494,6 @@ def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, b
     Guards against GGML_SCHED_MAX_SPLIT_INPUTS graph assertion failures and Windows Shared VRAM thrashing.
     """
     global gpu_layers_override
-    if gpu_layers_override is not None:
-        total_layers, _, _ = get_model_info(model_name)
-        if total_layers == 0:
-            total_layers = 32
-        final_layers = max(0, min(total_layers, gpu_layers_override)) if gpu_layers_override >= 0 else total_layers
-        log_message(f"[VRAM-CONFIG] Using explicit GPU layer offload: {final_layers}/{total_layers} layers.")
-        return final_layers, True
-
     vram_info = get_vram_info(ctx_size=ctx_size)
     targeted_reserve_vram_mb = vram_info["available_target"]
     total_layers, model_base_vram_bytes, _ = get_model_info(model_name)
@@ -1510,7 +1532,19 @@ def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, b
         safe_layers = max(1, min(total_layers, safe_layers))
         log_message(f"[VRAM-GUARD] Partial layer offload mode ({safe_layers}/{total_layers} layers). KV Cache pinned to RAM (offload_kqv=False) to prevent GGML_SCHED_MAX_SPLIT_INPUTS graph assertion crashes.")
 
-    final_layers = max(1, min(total_layers, safe_layers))
+    if gpu_layers_override is not None:
+        if gpu_layers_override == 0:
+            final_layers = 0
+            offload_kqv = False
+            log_message(f"[VRAM-CONFIG] Explicit CPU-only mode: 0 layers.")
+        else:
+            requested = gpu_layers_override if (gpu_layers_override > 0 and gpu_layers_override < 90) else safe_layers
+            final_layers = min(requested, safe_layers)
+            if final_layers < total_layers:
+                offload_kqv = False
+            log_message(f"[VRAM-CONFIG] User requested {gpu_layers_override} layers. Clamped to safe physical limit: {final_layers}/{total_layers} layers (offload_kqv={offload_kqv}).")
+    else:
+        final_layers = max(1, min(total_layers, safe_layers))
     
     log_message("--- SHARED VRAM GUARD REPORT ---")
     log_message(f"Model:            {model_name}")
@@ -1530,27 +1564,80 @@ def calculate_dynamic_gpu_layers(model_name: str, ctx_size: int) -> tuple[int, b
 
 async def resolve_model(target: str) -> str:
     """Returns the requested model if installed, or falls back to Supervisor."""
-    global active_models_list
-    if not active_models_list:
+    global active_models_list, model_registry_initialized
+    if not model_registry_initialized or not active_models_list:
         loop = asyncio.get_event_loop()
         active_models_list = await loop.run_in_executor(None, get_installed_models)
+        model_registry_initialized = True
+
+    if not target:
+        return SUPERVISOR_MODEL
+
+    # Resolve public role aliases before matching installed model names.
+    role_aliases = {
+        "serenity-supervisor": SUPERVISOR_MODEL,
+        "serenity-supervisor-high": SUPERVISOR_HIGH_MODEL,
+        "serenity-supervisor-low": SUPERVISOR_LOW_MODEL,
+        "custom-model": SUPERVISOR_MODEL,
+        "default": SUPERVISOR_MODEL,
+        "copilot-chat": SUPERVISOR_MODEL,
+        "gpt-4": SUPERVISOR_MODEL,
+        "gpt-4o": SUPERVISOR_MODEL,
+        "gpt-4o-mini": W3_MODEL,
+        "gpt-3.5-turbo": W3_MODEL,
+        "claude-3-5-sonnet": SUPERVISOR_MODEL,
+    }
+    target_clean = target.strip()
+    target_lower = target_clean.lower()
+    requested_target = role_aliases.get(target_lower, target_clean)
+    req_lower = requested_target.lower()
+
+    # 1. Exact case-insensitive match
+    for m in active_models_list:
+        if m.lower() == req_lower:
+            return m
+
+    # 2. Check if direct file / gguf path resolves
+    direct_path = resolve_gguf_path(requested_target)
+    if direct_path and os.path.exists(direct_path):
+        base_no_ext = os.path.splitext(os.path.basename(direct_path))[0]
+        if base_no_ext in active_models_list:
+            return base_no_ext
+        return requested_target
+
+    # 3. Token-based and Substring scoring
+    def extract_tokens(s: str) -> List[str]:
+        return [tok for tok in re.split(r'[^a-zA-Z0-9]+', s.lower()) if tok]
+
+    target_tokens = extract_tokens(req_lower)
     
-    # Prioritize main models over mmproj/assistant/mtp when doing prefix matching
-    main_candidates = []
-    other_candidates = []
+    scored_candidates = []
     for model_name in active_models_list:
-        if model_name.startswith(target) or target.startswith(model_name):
-            if any(tag in model_name.lower() for tag in ['mmproj', 'assistant', 'mtp']):
-                other_candidates.append(model_name)
-            else:
-                main_candidates.append(model_name)
+        m_lower = model_name.lower()
+        if any(tag in m_lower for tag in ['mmproj', 'assistant', 'mtp']):
+            continue
+        
+        m_tokens = extract_tokens(m_lower)
+        
+        # Calculate token match score
+        matches = 0
+        for t_tok in target_tokens:
+            if any(t_tok == m_tok or m_tok.startswith(t_tok) or t_tok.startswith(m_tok) for m_tok in m_tokens):
+                matches += 1
                 
-    if main_candidates:
-        return main_candidates[0]
-    if other_candidates:
-        return other_candidates[0]
-            
-    log_message(f"[Fallback] Model '{target}' not found. Falling back to '{SUPERVISOR_MODEL}'.")
+        token_ratio = matches / len(target_tokens) if target_tokens else 0.0
+        prefix_bonus = 1.0 if m_lower.startswith(req_lower[:min(len(req_lower), 6)]) else 0.0
+        total_score = (token_ratio * 10.0) + prefix_bonus
+        if token_ratio >= 0.5:
+            scored_candidates.append((total_score, matches, model_name))
+
+    if scored_candidates:
+        scored_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        matched = scored_candidates[0][2]
+        log_message(f"[Model Resolver] Fuzzy matched '{target}' -> '{matched}' (score: {scored_candidates[0][0]:.1f})")
+        return matched
+
+    log_message(f"[Fallback] Model '{target}' resolved to '{requested_target}' but was not found in active models. Falling back to '{SUPERVISOR_MODEL}'.")
     return SUPERVISOR_MODEL
 
 def strip_thought_blocks(text: str) -> str:
@@ -1909,11 +1996,9 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
         xml_match = re.search(r'<tool_call>\s*([\s\S]*?)\s*(?:</tool_call>|$)', cleaned)
         if xml_match:
             inner = xml_match.group(1).strip()
-            # Inner could be PTC python call
             ptc_res = _parse_python_func_call(inner)
             if ptc_res:
                 return ptc_res
-            # Inner could be JSON
             try:
                 obj, _ = decoder.raw_decode(inner)
                 norm = normalize_tool_action(obj)
@@ -1926,7 +2011,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
     if "```python" in cleaned or "```py" in cleaned:
         py_blocks = re.findall(r'```(?:python|py)\s*([\s\S]*?)\s*```', cleaned)
         for block in py_blocks:
-            # Try full-block AST parse first (handles multi-line triple-quoted args)
             block_stripped = block.strip()
             try:
                 parsed_mod = ast.parse(block_stripped, mode='exec')
@@ -1949,7 +2033,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                                             args[kw.arg] = kw.value.value
                                         else:
                                             args[kw.arg] = ast.unparse(kw.value)
-                            # Positional args fallback
                             if call_node.args and not args:
                                 pos_vals = []
                                 for a in call_node.args:
@@ -1977,7 +2060,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                             }
             except SyntaxError:
                 pass
-            # Fallback: line-by-line parse for simple single-line calls
             for line in block_stripped.splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -1985,10 +2067,14 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                     if res:
                         return res
 
-    direct_ptc = _parse_python_func_call(cleaned)
-    if direct_ptc:
-        return direct_ptc
+    for line in cleaned.splitlines():
+        line_s = line.strip()
+        if line_s and not line.startswith("#"):
+            direct_ptc = _parse_python_func_call(line_s)
+            if direct_ptc:
+                return direct_ptc
 
+#Fixed regex search (added * to \([^)]*\) for multi-character argument lists)
     known_tools = r'(?:create_or_update_plan|list_directory|read_file|write_file|insert_edit_into_file|replace_string_in_file|multi_replace_string_in_file|grep_search|run_command|mcp:[a-zA-Z0-9_:]+)'
     ptc_match = re.search(rf'({known_tools}\s*\([^)]*\))', cleaned, re.DOTALL)
     if ptc_match:
@@ -1998,13 +2084,11 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
 
     # 2. Intercept native tool call syntax (<|tool_call>, <tool_call>, call:...)
     if "<|tool_call" in cleaned or "<tool_call" in cleaned or "call:" in cleaned:
-        # Find function name via regex, then use brace-balanced capture for args
         name_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\s*', cleaned)
         if name_match:
             func_name = name_match.group(1).strip()
             rest = cleaned[name_match.end():]
 
-            # Brace-balanced arg capture (handles inner braces in f-strings, nested dicts)
             if rest.startswith('{'):
                 brace_end = _find_balanced_brace(rest)
                 if brace_end > 0:
@@ -2018,7 +2102,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                         "reason": "Parsed from native tool call"
                     }
 
-            # Fallback: original non-greedy regex for simple args
             simple_match = re.search(r'(\{.*?\})', rest, re.DOTALL)
             if simple_match:
                 args_str = simple_match.group(1).strip()
@@ -2035,7 +2118,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
                     "reason": "Parsed from native tool call"
                 }
         
-        # Fallback for parenthesized syntaxes like <|tool_call>call:run_task(task_id="npm: 3")<tool_call|>
         alt_match = re.search(r'(?:<\|?channel\|?>)*\s*(?:<\|?tool_call\|?>?)\s*call:\s*([^\s{\(]+)\((.*?)\)\s*(?:<\|?tool_call\|?>?|<\|?tool_call\|?>|</tool_call>)?', cleaned, re.DOTALL)
         if alt_match:
             func_name = alt_match.group(1).strip()
@@ -2244,8 +2326,10 @@ def extract_instructions(payload: Any) -> str:
 @app.get("/api/models")
 async def get_active_models():
     """Returns the dynamically discovered local models with accurate context size and capabilities for the VS Code extension."""
-    global active_models_list
-    active_models_list = get_installed_models()
+    global active_models_list, model_registry_initialized
+    if not model_registry_initialized or not active_models_list:
+        active_models_list = get_installed_models()
+        model_registry_initialized = True
 
     def _build_model_entry(m_id: str, display_name: str, family: str, model_target: Optional[str] = None) -> dict:
         target = model_target or m_id
@@ -2274,15 +2358,19 @@ async def get_active_models():
     models_to_report = [
         _build_model_entry("serenity-supervisor-high", f"Supervisor - High Mode ({SUPERVISOR_HIGH_MODEL})", "serenity-supervisor", SUPERVISOR_HIGH_MODEL),
         _build_model_entry("serenity-supervisor-low", f"Supervisor - Low Mode ({SUPERVISOR_LOW_MODEL})", "serenity-supervisor", SUPERVISOR_LOW_MODEL),
-        _build_model_entry("serenity-supervisor", f"Orchestrator - Turbo Mode ({ORCHESTRATOR_TURBO_MODEL})", "serenity-supervisor", ORCHESTRATOR_TURBO_MODEL)
+        _build_model_entry("serenity-supervisor", f"Orchestrator - Turbo Mode ({ORCHESTRATOR_TURBO_MODEL})", "serenity-supervisor", ORCHESTRATOR_TURBO_MODEL),
+        _build_model_entry("custom-model", f"Active Custom Model ({CURRENT_MODEL})", "custom", CURRENT_MODEL),
+        _build_model_entry("copilot-chat", f"Copilot Model ({CURRENT_MODEL})", "copilot", CURRENT_MODEL),
+        _build_model_entry("gpt-4o", f"GPT-4o Alias ({SUPERVISOR_MODEL})", "openai", SUPERVISOR_MODEL),
+        _build_model_entry("gpt-4", f"GPT-4 Alias ({SUPERVISOR_MODEL})", "openai", SUPERVISOR_MODEL),
+        _build_model_entry("gpt-3.5-turbo", f"Fast Worker ({W3_MODEL})", "openai", W3_MODEL),
+        _build_model_entry("claude-3-5-sonnet", f"Claude Sonnet Alias ({SUPERVISOR_MODEL})", "anthropic", SUPERVISOR_MODEL)
     ]
 
     for model_name in active_models_list:
-        gguf_path = resolve_gguf_path(model_name)
-        if gguf_path and os.path.exists(gguf_path):
-            models_to_report.append(
-                _build_model_entry(model_name, f"{model_name} (Agent)", model_name, model_name)
-            )
+        models_to_report.append(
+            _build_model_entry(model_name, f"{model_name} (Local GGUF)", model_name, model_name)
+        )
 
     return {"models": models_to_report}
 
@@ -2319,28 +2407,39 @@ async def get_ollama_version():
     return {"version": "0.1.30"}
 
 @app.get("/v1/models")
+@app.get("/models")
 async def get_openai_v1_models():
     """OpenAI API standard model listing endpoint."""
     models_resp = await get_active_models()
     v1_models = []
     now = int(time.time())
+    seen = set()
     for m in models_resp.get("models", []):
-        v1_models.append({
-            "id": m.get("id", "serenity-supervisor"),
-            "object": "model",
-            "created": now,
-            "owned_by": "serenity"
-        })
+        m_id = m.get("id", "serenity-supervisor")
+        if m_id not in seen:
+            seen.add(m_id)
+            v1_models.append({
+                "id": m_id,
+                "object": "model",
+                "created": now,
+                "owned_by": "local",
+                "permission": [],
+                "root": m_id,
+                "parent": None
+            })
     return {"object": "list", "data": v1_models}
 
-@app.get("/v1/models/{model_id}")
+@app.get("/v1/models/{model_id:path}")
+@app.get("/models/{model_id:path}")
 async def get_openai_v1_model_by_id(model_id: str):
     """OpenAI API standard single model metadata endpoint."""
+    resolved = await resolve_model(model_id)
     return {
         "id": model_id,
         "object": "model",
         "created": int(time.time()),
-        "owned_by": "serenity"
+        "owned_by": "local",
+        "resolved_model": resolved
     }
 
 @app.get("/health")
@@ -2441,15 +2540,135 @@ MCP_TOOLS_DEFINITIONS = [
             },
             "required": ["command"]
         }
+    },
+    {
+        "name": "store_memory",
+        "description": "Store persistent knowledge or decisions in the long-term memory database.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Unique key identifier for the memory"},
+                "category": {"type": "string", "description": "Category (architecture, decisions, code_patterns, preferences, general)"},
+                "content": {"type": "string", "description": "Detailed persistent content to remember"}
+            },
+            "required": ["key", "category", "content"]
+        }
+    },
+    {
+        "name": "query_memory",
+        "description": "Search the persistent long-term memory database for past architectural decisions, patterns, or facts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query or keyword"},
+                "category": {"type": "string", "description": "Optional category filter"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "update_memory",
+        "description": "Update an existing long-term memory entry.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key of the memory to update"},
+                "content": {"type": "string", "description": "New content"}
+            },
+            "required": ["key", "content"]
+        }
+    },
+    {
+        "name": "delete_memory",
+        "description": "Delete a long-term memory entry by key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key of the memory to delete"}
+            },
+            "required": ["key"]
+        }
     }
 ]
 
-def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step_num: int = 1) -> Dict[str, Any]:
-    """
-    Centralized Unified Tool Execution Engine.
-    Handles target normalization, mode permissions, security rules, edit backups, diff calculations,
-    line range formatting, output truncation, and returns a structured result dictionary.
-    """
+def _extra_workspace_dirs() -> List[str]:
+    raw = os.environ.get("SERENITY_WORKSPACE_DIR", "")
+    paths = []
+    if raw:
+        paths.extend([path.strip() for path in raw.replace(";", os.pathsep).split(os.pathsep) if path.strip()])
+    # Auto-allow adjacent Serenity workspace paths
+    user_home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    candidates = [
+        os.path.join(user_home, "Documents", "SerenityPC"),
+        os.path.join(user_home, "Documents", "SerenityDev"),
+        os.path.join(user_home, "SerenityDev"),
+        os.path.join(user_home, "Desktop", "Hub")
+    ]
+    for c in candidates:
+        if os.path.exists(c) and c not in paths:
+            paths.append(os.path.abspath(c))
+    return paths
+
+def get_primary_workspace_dir(req_workspace: Optional[str] = None) -> str:
+    """Returns the effective workspace directory: request workspace > SERENITY_WORKSPACE_DIR > server directory."""
+    if req_workspace and isinstance(req_workspace, str) and req_workspace.strip():
+        rw = os.path.abspath(req_workspace.strip())
+        if os.path.exists(rw):
+            return rw
+    extra = _extra_workspace_dirs()
+    if extra:
+        for d in extra:
+            if os.path.exists(d):
+                return os.path.abspath(d)
+        return os.path.abspath(extra[0])
+    return os.path.abspath(workspace_dir)
+
+def resolve_workspace_path(path_val: Optional[str], req_workspace: Optional[str] = None) -> Optional[str]:
+    """Resolves relative and absolute file/directory paths against workspace roots."""
+    if not path_val or not isinstance(path_val, str):
+        return None
+    p = path_val.strip()
+    if not p:
+        return None
+    if os.path.isabs(p):
+        return os.path.abspath(p)
+
+    primary = get_primary_workspace_dir(req_workspace)
+    cand = os.path.abspath(os.path.join(primary, p))
+    if os.path.exists(cand):
+        return cand
+
+    for extra_dir in _extra_workspace_dirs():
+        extra_cand = os.path.abspath(os.path.join(extra_dir, p))
+        if os.path.exists(extra_cand):
+            return extra_cand
+
+    server_cand = os.path.abspath(os.path.join(workspace_dir, p))
+    if os.path.exists(server_cand):
+        return server_cand
+
+    return cand
+
+def is_path_allowed(file_path: Optional[str], req_workspace: Optional[str] = None) -> bool:
+    """Restricts filesystem tools to the workspace, dynamic environment paths, model directories."""
+    if not file_path or not isinstance(file_path, str):
+        return False
+    try:
+        resolved = resolve_workspace_path(file_path, req_workspace) or file_path
+        abs_path = os.path.abspath(resolved)
+        base_name = os.path.basename(abs_path).lower()
+        if base_name == ".env" or base_name.startswith(".env.") or ".env" in base_name:
+            return False
+
+        allowed = get_candidate_model_dirs() + _extra_workspace_dirs()
+        if req_workspace and isinstance(req_workspace, str) and req_workspace.strip():
+            allowed.append(os.path.abspath(req_workspace.strip()))
+
+        return validate_path_containment(abs_path, workspace_dir, allowed_dirs=allowed)
+    except Exception:
+        return False
+
+def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step_num: int = 1, workspace_dir: Optional[str] = None) -> Dict[str, Any]:
     target_raw = (target or "").strip()
     target_norm = target_raw.lower()
     core = target_norm.split(":")[-1].strip()
@@ -2458,30 +2677,32 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
         normalized_target = "mcp:filesystem:read_file"
     elif core in ["grep_search", "grep", "search", "search_files"]:
         normalized_target = "mcp:filesystem:grep_search"
-    elif core in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
+    elif core in ["list_directory", "list_dir", "ls"]:
         normalized_target = "mcp:filesystem:list_directory"
     elif core in ["write_file", "write", "create_file"]:
         normalized_target = "mcp:filesystem:write_file"
-    elif core in ["insert_edit_into_file", "insert_edit"]:
+    elif core in ["insert_edit_into_file", "insert"]:
         normalized_target = "mcp:filesystem:insert_edit_into_file"
-    elif core in ["replace_string_in_file", "replace_string"]:
+    elif core in ["replace_string_in_file", "replace"]:
         normalized_target = "mcp:filesystem:replace_string_in_file"
     elif core in ["multi_replace_string_in_file", "multi_replace"]:
         normalized_target = "mcp:filesystem:multi_replace_string_in_file"
-    elif core in ["create_or_update_plan", "update_plan", "plan"]:
-        normalized_target = "mcp:filesystem:create_or_update_plan"
+    elif core in ["create_or_update_plan", "update_plan", "plan", "create_plan"]:
+        normalized_target = "mcp:plan:create_or_update_plan"    
     elif core in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
-        normalized_target = "mcp:terminal:run_command"
+        normalized_target = "mcp:filesystem:run_command"
+    elif core in ["store_memory", "save_memory", "remember"]:
+        normalized_target = "mcp:memory:store_memory"
+    elif core in ["query_memory", "search_memory", "recall_memory", "recall"]:
+        normalized_target = "mcp:memory:query_memory"
+    elif core in ["update_memory", "modify_memory"]:
+        normalized_target = "mcp:memory:update_memory"
+    elif core in ["delete_memory", "forget_memory", "remove_memory"]:
+        normalized_target = "mcp:memory:delete_memory"
     else:
         normalized_target = target_raw
 
-    # Read-only mode check
-    is_edit_tool = normalized_target in [
-        "mcp:filesystem:write_file",
-        "mcp:filesystem:insert_edit_into_file",
-        "mcp:filesystem:replace_string_in_file",
-        "mcp:filesystem:multi_replace_string_in_file"
-    ]
+    is_edit_tool = normalized_target in ["mcp:filesystem:write_file", "mcp:filesystem:insert_edit_into_file", "mcp:filesystem:replace_string_in_file", "mcp:filesystem:multi_replace_string_in_file"]        
     if mode in ["explore", "plan"] and is_edit_tool:
         err_msg = f"[System Tool Error: Action blocked. You are in {mode.upper()} mode, which is read-only. Modifying files is forbidden.]"
         log_message(f"[Constraint Blocked] Blocked write tool {normalized_target} in {mode} mode.")
@@ -2492,13 +2713,12 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
             "proof_tag": None,
             "backup_id": None,
             "status": "error",
-            "details": f"Blocked by read-only mode ({mode})",
+            "details": f"blocked by read-only mode ({mode})",
             "target_norm": normalized_target,
             "file_path": None
-        }
+        }   
 
-    # 1. run_command
-    if normalized_target == "mcp:terminal:run_command":
+    if normalized_target == "mcp:filesystem:run_command":
         try:
             args = safe_parse_tool_args(payload_data, "command")
             command = args.get("command") if isinstance(args, dict) else (payload_data if isinstance(payload_data, str) else None)
@@ -2520,7 +2740,8 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 full_cmd = f"powershell -NoProfile -Command \"{command}\""
                 sub_env = {k: v for k, v in os.environ.items() if k not in ["LOCAL_API_KEY", "OPENAI_API_KEY", "OPENAIAPI_KEY"]}
                 flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env, creationflags=flags)
+                cmd_cwd = get_primary_workspace_dir(workspace_dir)
+                result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=30, env=sub_env, cwd=cmd_cwd, creationflags=flags)
                 stdout = result.stdout[:2000] if result.stdout else ""
                 stderr = result.stderr[:2000] if result.stderr else ""
                 is_err = result.returncode != 0
@@ -2575,144 +2796,255 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 "file_path": None
             }
 
-    # 2. create_or_update_plan
-    elif normalized_target == "mcp:filesystem:create_or_update_plan":
-        try:
-            global active_system_plan
-            args = safe_parse_tool_args(payload_data, "steps")
-            steps = args.get("steps", []) if isinstance(args, dict) else []
-            focus = (args.get("current_focus") or args.get("focus") or "Unknown") if isinstance(args, dict) else "Unknown"
-            active_system_plan = {"focus": focus, "steps": steps}
-            log_message(f"[Tool Success] Plan state updated locally with {len(steps)} steps.")
-            return {
-                "tool_context": f"\n[System: Execution plan successfully synchronized. Current focus: {focus}. Proceed to next step.]\n",
-                "raw_output": f"Plan focus: {focus}, steps: {len(steps)}",
-                "is_error": False,
-                "proof_tag": None,
-                "backup_id": None,
-                "status": "success",
-                "details": f"Plan focus: {focus}",
-                "target_norm": normalized_target,
-                "file_path": None
-            }
-        except Exception as e:
-            return {
-                "tool_context": f"\n\n[System Tool Error: Failed to update plan: {e}]\n",
-                "raw_output": f"Error: {e}",
-                "is_error": True,
-                "proof_tag": None,
-                "backup_id": None,
-                "status": "error",
-                "details": "Plan update failed",
-                "target_norm": normalized_target,
-                "file_path": None
-            }
-
-    # 3. list_directory
     elif normalized_target == "mcp:filesystem:list_directory":
         try:
             args = safe_parse_tool_args(payload_data, "path")
-            target_dir = "."
-            if isinstance(args, dict):
-                target_dir = args.get("path") or args.get("directory") or args.get("dir") or args.get("folder") or "."
-            elif isinstance(args, str) and args.strip():
-                target_dir = args.strip()
+            raw_dir = (
+                args.get("path") or args.get("directory") or args.get("dir") or "."
+            ) if isinstance(args, dict) else (payload_data if isinstance(payload_data, str) else ".")
+            dir_path = resolve_workspace_path(raw_dir, workspace_dir)
 
-            if not is_path_allowed(target_dir):
+            if not dir_path or not is_path_allowed(dir_path, workspace_dir):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Access to '{target_dir}' is restricted.]\n",
-                    "raw_output": f"Error: Path access restricted: '{target_dir}'",
+                    "tool_context": f"\n\n[System Tool Error: Access to '{raw_dir}' is restricted or path missing.]\n",
+                    "raw_output": f"Error: Access restricted or path missing: '{raw_dir}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "Access restricted",
                     "target_norm": normalized_target,
-                    "file_path": target_dir
+                    "file_path": raw_dir
                 }
-            if not os.path.exists(target_dir) or not os.path.isdir(target_dir):
+            if not os.path.exists(dir_path):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Directory '{target_dir}' not found.]\n",
-                    "raw_output": f"Error: Directory not found: '{target_dir}'",
+                    "tool_context": f"\n\n[System Tool Error: Directory '{raw_dir}' not found.]\n",
+                    "raw_output": f"Error: Directory not found: '{raw_dir}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "Directory not found",
                     "target_norm": normalized_target,
-                    "file_path": target_dir
+                    "file_path": raw_dir
                 }
-            files = os.listdir(target_dir)
-            file_list = []
-            for f in files:
-                if f.startswith(".") or f == "__pycache__":
-                    continue
-                full_p = os.path.join(target_dir, f)
-                is_dir = os.path.isdir(full_p)
-                size = os.path.getsize(full_p) if not is_dir else 0
-                file_list.append(f"[{'DIR' if is_dir else 'FILE'}] {f}" + ("" if is_dir else f" ({size} bytes)"))
+            if not os.path.isdir(dir_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: '{raw_dir}' is not a directory.]\n",
+                    "raw_output": f"Error: Not a directory: '{raw_dir}'",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Not a directory",
+                    "target_norm": normalized_target,
+                    "file_path": raw_dir
+                }
+            entries: List[str] = []
+            with os.scandir(dir_path) as it:
+                for entry in sorted(it, key=lambda e: (not e.is_dir(), e.name.lower())):
+                    try:
+                        if entry.is_dir():
+                            entries.append(f"dir:  {entry.name}/")
+                        else:
+                            size = entry.stat().st_size
+                            entries.append(f"file: {entry.name} ({size} bytes)")
+                    except Exception:
+                        entries.append(f"unknown: {entry.name}")
+                        
+            total = len(entries)
+            if total > 200:
+                entries = entries[:200] + [f"... truncated, {total} total entries"]
 
-            total_entries = len(file_list)
-            if total_entries > 100:
-                truncated_list = file_list[:100]
-                raw_out = "\n".join(file_list)
-                tool_ctx = f"\n\n[System Tool Response: Directory Listing for '{target_dir}' (Showing 100 of {total_entries} items)]\n" + "\n".join(truncated_list) + f"\n... [{total_entries - 100} more items omitted] ...\n"
-            else:
-                raw_out = "\n".join(file_list)
-                tool_ctx = f"\n\n[System Tool Response: Directory Listing for '{target_dir}']\n{raw_out}\n"
-
-            log_message(f"[Tool Success] Listed directory '{target_dir}'. Found {total_entries} entries.")
+            out = "\n".join(entries) if entries else "(empty_directory)"
+            display_dir = raw_dir if raw_dir != "." else os.path.basename(dir_path) or dir_path
+            tool_ctx = f"\n\n[System Tool Response: Directory listing for '{display_dir}' ({total} entries)]\n{out}\n"
+            log_message(f"[Tool Success] Listed directory: {dir_path} ({total} entries)")
             return {
                 "tool_context": tool_ctx,
-                "raw_output": raw_out,
+                "raw_output": out,
                 "is_error": False,
                 "proof_tag": None,
                 "backup_id": None,
                 "status": "success",
-                "details": f"Found {total_entries} entries",
+                "details": f"{total} entries",
                 "target_norm": normalized_target,
-                "file_path": target_dir
+                "file_path": dir_path
             }
         except Exception as e:
             return {
-                "tool_context": f"\n\n[System Tool Error: list_directory failed: {e}]\n",
-                "raw_output": f"Error: list_directory failed: {e}",
+                "tool_context": f"\n\n[System Tool Error: Failed to list directory: {e}]\n",
+                "raw_output": f"Error: {e}",
                 "is_error": True,
                 "proof_tag": None,
                 "backup_id": None,
                 "status": "error",
-                "details": "Failed to list directory",
+                "details": "List failed",
                 "target_norm": normalized_target,
                 "file_path": None
             }
 
-    # 4. read_file
+    elif normalized_target == "mcp:filesystem:grep_search":
+        try:
+            args = safe_parse_tool_args(payload_data, "query")
+            query = (args.get("query") or args.get("pattern") or args.get("search") or "") if isinstance(args, dict) else (payload_data if isinstance(payload_data, str) else "")
+            raw_search = (args.get("path") or args.get("directory") or ".") if isinstance(args, dict) else "."
+            search_path = resolve_workspace_path(raw_search, workspace_dir)
+            if not query:
+                return {
+                    "tool_context": "\n\n[System Tool Error: No search query provided]\n",
+                    "raw_output": "Error: Missing query",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Missing query",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            if not search_path or not is_path_allowed(search_path, workspace_dir):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Search path not allowed: {raw_search}]\n",
+                    "raw_output": f"Error: Path not allowed: {raw_search}",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Path not allowed",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            if not os.path.exists(search_path):
+                return {
+                    "tool_context": f"\n\n[System Tool Error: Search path does not exist: {raw_search}]\n",
+                    "raw_output": f"Error: Path does not exist: {raw_search}",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Path not found",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            matches = []
+            primary_ws = get_primary_workspace_dir(workspace_dir)
+            if os.path.isfile(search_path):
+                try:
+                    with open(search_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line_idx, line in enumerate(f, start=1):
+                            if query.lower() in line.lower():
+                                rel_p = os.path.relpath(search_path, primary_ws)
+                                matches.append(f"{rel_p}:{line_idx}: {line.strip()[:140]}")
+                                if len(matches) >= 50:
+                                    break
+                except Exception:
+                    pass
+            else:
+                for root, dirs, files in os.walk(search_path):
+                    dirs[:] = [d for d in dirs if d not in [".git", ".serenity_cache", "node_modules", "__pycache__", ".venv", "venv"]]
+                    for fname in files:
+                        full_p = os.path.join(root, fname)
+                        if is_path_allowed(full_p, workspace_dir):
+                            try:
+                                if os.path.getsize(full_p) > 2_000_000:
+                                    continue
+                                with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                                    for line_idx, line in enumerate(f, start=1):
+                                        if query.lower() in line.lower():
+                                            rel_p = os.path.relpath(full_p, primary_ws)
+                                            matches.append(f"{rel_p}:{line_idx}: {line.strip()[:140]}")
+                                            if len(matches) >= 50:
+                                                break
+                            except Exception:
+                                pass
+                    if len(matches) >= 50:
+                        break
+            out_text = "\n".join(matches) if matches else f"No matches found for '{query}'."
+            tool_ctx = f"\n\n[System Tool Response: Grep search for '{query}']\n{out_text}\n"
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": out_text,
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"Found {len(matches)} matches",
+                "target_norm": normalized_target,
+                "file_path": search_path
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Grep search failed: {e}]\n",
+                "raw_output": f"Error: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Grep failed",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    elif normalized_target == "mcp:plan:create_or_update_plan":
+        try:
+            args = safe_parse_tool_args(payload_data, "steps")
+            steps = args.get("steps", []) if isinstance(args, dict) else []
+            focus = args.get("current_focus", "In progress") if isinstance(args, dict) else "In progress"
+            global active_system_plan
+            active_system_plan = {"focus": focus, "steps": steps}
+            plan_str = f"Plan Focus: {focus}\n" + "\n".join([f"- {s}" for s in steps])
+            tool_ctx = f"\n\n[System Tool Response: Plan updated successfully]\n{plan_str}\n"
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": plan_str,
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"Plan updated ({len(steps)} steps)",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Plan update failed: {e}]\n",
+                "raw_output": f"Error: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": "Plan error",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
     elif normalized_target == "mcp:filesystem:read_file":
         try:
-            file_path, start_line, end_line = parse_read_file_args(payload_data)
-            if not file_path or not is_path_allowed(file_path):
+            raw_path, start_line, end_line = parse_read_file_args(payload_data)
+            file_path = resolve_workspace_path(raw_path, workspace_dir)
+            if not file_path or not is_path_allowed(file_path, workspace_dir):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Access to '{file_path}' is restricted or path missing.]\n",
-                    "raw_output": f"Error: Access restricted or path missing: '{file_path}'",
+                    "tool_context": f"\n\n[System Tool Error: Access to '{raw_path}' is restricted or path missing.]\n",
+                    "raw_output": f"Error: Access restricted or path missing: '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "Access restricted",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
             if not os.path.exists(file_path):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: File '{file_path}' was not found.]\n",
-                    "raw_output": f"Error: File not found: '{file_path}'",
+                    "tool_context": f"\n\n[System Tool Error: File '{raw_path}' was not found.]\n",
+                    "raw_output": f"Error: File not found: '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "File not found",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 file_contents = f.read()
@@ -2725,17 +3057,17 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 e = min(total_lines, int(end_line))
                 sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[s-1:e], start=s)]
                 response_content = "\n".join(sliced_lines)
-                tool_ctx = f"\n\n[System Tool Response: Contents of file '{file_path}' (Lines {s}-{e} of {total_lines})]\n{response_content}\n"
+                tool_ctx = f"\n\n[System Tool Response: Contents of file '{raw_path}' (Lines {s}-{e} of {total_lines})]\n{response_content}\n"
             else:
                 if total_lines > 150:
                     sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines[:100], start=1)]
                     response_content = "\n".join(sliced_lines)
                     warn_msg = f"\n... [File too large ({total_lines} lines). Auto-truncated to first 100 lines. Use 'read_file' with 'start_line' and 'end_line' or 'grep_search' to target code.] ...\n"
-                    tool_ctx = f"\n\n[System Tool Response: Contents of file '{file_path}' (First 100 lines of {total_lines})]\n{response_content}{warn_msg}"
+                    tool_ctx = f"\n\n[System Tool Response: Contents of file '{raw_path}' (First 100 lines of {total_lines})]\n{response_content}{warn_msg}"
                 else:
                     sliced_lines = [f"{idx}: {line}" for idx, line in enumerate(file_lines, start=1)]
                     response_content = "\n".join(sliced_lines)
-                    tool_ctx = f"\n\n[System Tool Response: Contents of file '{file_path}']\n{response_content}\n"
+                    tool_ctx = f"\n\n[System Tool Response: Contents of file '{raw_path}']\n{response_content}\n"
 
             log_message(f"[Tool Success] Read {len(file_contents)} characters from: {file_path}")
             return {
@@ -2762,15 +3094,15 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 "file_path": None
             }
 
-    # 5. write_file
     elif normalized_target == "mcp:filesystem:write_file":
         try:
             args = safe_parse_tool_args(payload_data, "path")
-            file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+            raw_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
             content = (args.get("content") or args.get("code") or args.get("text") or args.get("data") or args.get("body") or "") if isinstance(args, dict) else ""
             if not isinstance(content, str):
                 content = str(content)
-            if not file_path or not is_path_allowed(file_path):
+            file_path = resolve_workspace_path(raw_path, workspace_dir)
+            if not file_path or not is_path_allowed(file_path, workspace_dir):
                 return {
                     "tool_context": "\n\n[System Tool Error: Access restricted or path missing for write_file.]\n",
                     "raw_output": "Error: Access restricted or path missing for write_file",
@@ -2780,7 +3112,7 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                     "status": "error",
                     "details": "Access restricted",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
             b_id, old_c = create_edit_backup(file_path)
             parent_dir = os.path.dirname(file_path)
@@ -2791,11 +3123,11 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
             dels, adds = calculate_diff_counts(old_c, content)
             rel_name = os.path.basename(file_path)
             proof_tag = f"edited:{rel_name}-{dels}+{adds}"
-            tool_ctx = f"\n\n[System Tool Response: Successfully wrote {len(content)} characters to '{file_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
+            tool_ctx = f"\n\n[System Tool Response: Successfully wrote {len(content)} characters to '{raw_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
             log_message(f"[Tool Success] Wrote file: {file_path} ({proof_tag})")
             return {
                 "tool_context": tool_ctx,
-                "raw_output": f"Successfully wrote {len(content)} bytes to '{file_path}'",
+                "raw_output": f"Successfully wrote {len(content)} bytes to '{raw_path}'",
                 "is_error": False,
                 "proof_tag": proof_tag,
                 "backup_id": b_id,
@@ -2817,36 +3149,36 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 "file_path": None
             }
 
-    # 6 & 7. insert_edit_into_file / replace_string_in_file
     elif normalized_target in ["mcp:filesystem:insert_edit_into_file", "mcp:filesystem:replace_string_in_file"]:
         try:
             args = safe_parse_tool_args(payload_data, "path")
-            file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+            raw_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
             target_content = (args.get("target_content") or args.get("search_string") or args.get("search_text") or args.get("old_content") or args.get("target") or "") if isinstance(args, dict) else ""
             new_content = (args.get("new_content") or args.get("new_string") or args.get("replace_string") or args.get("code_to_insert") or args.get("replacement") or args.get("code") or "") if isinstance(args, dict) else ""
-            if not file_path or not is_path_allowed(file_path):
+            file_path = resolve_workspace_path(raw_path, workspace_dir)
+            if not file_path or not is_path_allowed(file_path, workspace_dir):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Access to '{file_path}' is restricted for security.]\n",
-                    "raw_output": f"Error: Path access restricted: '{file_path}'",
+                    "tool_context": f"\n\n[System Tool Error: Access to '{raw_path}' is restricted for security.]\n",
+                    "raw_output": f"Error: Path access restricted: '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "Access restricted",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
             if not os.path.exists(file_path):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: File '{file_path}' not found.]\n",
-                    "raw_output": f"Error: File not found: '{file_path}'",
+                    "tool_context": f"\n\n[System Tool Error: File '{raw_path}' not found.]\n",
+                    "raw_output": f"Error: File not found: '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "File not found",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
             b_id, old_c = create_edit_backup(file_path)
             if target_content in old_c:
@@ -2861,11 +3193,11 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 dels, adds = calculate_diff_counts(old_c, modified)
                 rel_name = os.path.basename(file_path)
                 proof_tag = f"edited:{rel_name}-{dels}+{adds}"
-                tool_ctx = f"\n\n[System Tool Response: Successfully {action_word} '{file_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
+                tool_ctx = f"\n\n[System Tool Response: Successfully {action_word} '{raw_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
                 log_message(f"[Tool Success] {action_word}: {file_path} ({proof_tag})")
                 return {
                     "tool_context": tool_ctx,
-                    "raw_output": f"Successfully {action_word} '{file_path}'",
+                    "raw_output": f"Successfully {action_word} '{raw_path}'",
                     "is_error": False,
                     "proof_tag": proof_tag,
                     "backup_id": b_id,
@@ -2875,11 +3207,11 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                     "file_path": file_path
                 }
             else:
-                tool_ctx = f"\n\n[System Tool Error: target_content not found in '{file_path}']\n"
+                tool_ctx = f"\n\n[System Tool Error: target_content not found in '{raw_path}']\n"
                 log_message(f"[Tool Warning] Target content not found in {file_path}")
                 return {
                     "tool_context": tool_ctx,
-                    "raw_output": f"Error: target_content not found in '{file_path}'",
+                    "raw_output": f"Error: target_content not found in '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
@@ -2901,107 +3233,78 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 "file_path": None
             }
 
-    # 8. multi_replace_string_in_file
     elif normalized_target == "mcp:filesystem:multi_replace_string_in_file":
         try:
             args = safe_parse_tool_args(payload_data, "path")
-            file_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
+            raw_path = (args.get("path") or args.get("file") or args.get("filepath") or args.get("target_file")) if isinstance(args, dict) else None
             replacements = args.get("replacements", []) if isinstance(args, dict) else []
-            if isinstance(replacements, dict):
-                replacements = [replacements]
-
-            if not file_path or not is_path_allowed(file_path):
+            file_path = resolve_workspace_path(raw_path, workspace_dir)
+            if not file_path or not is_path_allowed(file_path, workspace_dir):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Access to '{file_path}' is restricted or missing.]\n",
-                    "raw_output": f"Error: Path restricted or missing: '{file_path}'",
+                    "tool_context": f"\n\n[System Tool Error: Access to '{raw_path}' is restricted for security.]\n",
+                    "raw_output": f"Error: Path access restricted: '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "Access restricted",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
             if not os.path.exists(file_path):
                 return {
-                    "tool_context": f"\n\n[System Tool Error: File '{file_path}' not found.]\n",
-                    "raw_output": f"Error: File not found: '{file_path}'",
+                    "tool_context": f"\n\n[System Tool Error: File '{raw_path}' not found.]\n",
+                    "raw_output": f"Error: File not found: '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
                     "details": "File not found",
                     "target_norm": normalized_target,
-                    "file_path": file_path
+                    "file_path": raw_path
                 }
-            if not replacements or not isinstance(replacements, list):
+            b_id, old_c = create_edit_backup(file_path)
+            modified = old_c
+            applied = 0
+            for r in replacements:
+                if isinstance(r, dict):
+                    t = r.get("target_content") or r.get("search_string") or r.get("old_content") or ""
+                    n = r.get("new_content") or r.get("new_string") or r.get("replace_string") or ""
+                    if t and t in modified:
+                        modified = modified.replace(t, n, 1)
+                        applied += 1
+            if applied > 0:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(modified)
+                dels, adds = calculate_diff_counts(old_c, modified)
+                rel_name = os.path.basename(file_path)
+                proof_tag = f"edited:{rel_name}-{dels}+{adds}"
+                tool_ctx = f"\n\n[System Tool Response: Successfully applied {applied} replacements in '{raw_path}']\nPROOF: {proof_tag} (backup:{b_id})\n"
+                log_message(f"[Tool Success] Multi-replaced in: {file_path} ({proof_tag})")
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Replacements list empty or invalid.]\n",
-                    "raw_output": "Error: Replacements list empty or invalid",
-                    "is_error": True,
-                    "proof_tag": None,
-                    "backup_id": None,
-                    "status": "error",
-                    "details": "Replacements empty",
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Successfully applied {applied} replacements in '{raw_path}'",
+                    "is_error": False,
+                    "proof_tag": proof_tag,
+                    "backup_id": b_id,
+                    "status": "success",
+                    "details": f"{proof_tag} (backup:{b_id})",
                     "target_norm": normalized_target,
                     "file_path": file_path
                 }
-
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-
-            modified_content = content
-            applied_count = 0
-            not_found = []
-
-            for idx, r in enumerate(replacements):
-                if not isinstance(r, dict):
-                    continue
-                target_str = r.get("target") or r.get("target_content") or r.get("search_string") or r.get("old") or r.get("find")
-                replacement_str = r.get("replacement") or r.get("new_content") or r.get("replace_string") or r.get("new")
-                if target_str is None or replacement_str is None:
-                    continue
-                occurrences = modified_content.count(target_str)
-                if occurrences == 0:
-                    not_found.append(f"Replacement {idx+1}: Target string not found (target: {repr(target_str[:50])})")
-                else:
-                    modified_content = modified_content.replace(target_str, replacement_str)
-                    applied_count += occurrences
-
-            if not_found and applied_count == 0:
-                tool_ctx = f"\n\n[System Tool Error: None of the target strings were found in '{file_path}'. No changes were made.]\n"
+            else:
+                tool_ctx = f"\n\n[System Tool Error: No replacement targets found in '{raw_path}']\n"
                 return {
                     "tool_context": tool_ctx,
-                    "raw_output": f"Error: None of the targets were found in '{file_path}'",
+                    "raw_output": f"Error: No replacement targets found in '{raw_path}'",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "warning",
-                    "details": "No targets found",
+                    "details": "No targets matched",
                     "target_norm": normalized_target,
                     "file_path": file_path
                 }
-
-            b_id, old_c = create_edit_backup(file_path)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(modified_content)
-            dels, adds = calculate_diff_counts(old_c, modified_content)
-            rel_name = os.path.basename(file_path)
-            proof_tag = f"edited:{rel_name}-{dels}+{adds}"
-            status_msg = f"Successfully applied {applied_count} replacements to '{file_path}'."
-            tool_ctx = f"\n\n[System Tool Response: {status_msg}]\nPROOF: {proof_tag} (backup:{b_id})\n"
-            log_message(f"[Tool Success] Multi-replaced {applied_count} occurrences in {file_path} ({proof_tag})")
-            return {
-                "tool_context": tool_ctx,
-                "raw_output": status_msg,
-                "is_error": False,
-                "proof_tag": proof_tag,
-                "backup_id": b_id,
-                "status": "success",
-                "details": f"{proof_tag} (backup:{b_id})",
-                "target_norm": normalized_target,
-                "file_path": file_path
-            }
         except Exception as e:
             return {
                 "tool_context": f"\n\n[System Tool Error: Multi-replace failed: {e}]\n",
@@ -3015,117 +3318,198 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
                 "file_path": None
             }
 
-    # 9. grep_search
-    elif normalized_target == "mcp:filesystem:grep_search":
+    elif normalized_target == "mcp:memory:store_memory":
         try:
-            args = safe_parse_tool_args(payload_data, "query")
-            query = ""
-            search_path = "."
-            if isinstance(args, dict):
-                query = args.get("query") or args.get("search_term") or args.get("term") or args.get("pattern") or args.get("text") or args.get("search_string") or args.get("grep") or ""
-                search_path = args.get("path") or args.get("directory") or args.get("dir") or args.get("file") or args.get("filepath") or "."
-            elif isinstance(args, str):
-                query = args.strip()
-
-            if not search_path or not is_path_allowed(search_path):
+            args = safe_parse_tool_args(payload_data, "content")
+            key = args.get("key") or f"mem_{int(time.time()*1000)}"
+            category = args.get("category") or "general"
+            content = args.get("content") or (payload_data if isinstance(payload_data, str) else "")
+            if not content:
                 return {
-                    "tool_context": f"\n\n[System Tool Error: Access to '{search_path}' is restricted for security.]\n",
-                    "raw_output": f"Error: Path access restricted: '{search_path}'",
+                    "tool_context": "\n\n[System Tool Error: Missing content to store in memory]\n",
+                    "raw_output": "Error: Missing content",
                     "is_error": True,
                     "proof_tag": None,
                     "backup_id": None,
                     "status": "error",
-                    "details": "Access restricted",
+                    "details": "Missing content",
                     "target_norm": normalized_target,
-                    "file_path": search_path
+                    "file_path": None
                 }
-
-            matches = []
-            re_pattern = None
-            if query:
-                try:
-                    re_pattern = re.compile(query, re.IGNORECASE)
-                except re.error:
-                    re_pattern = None
-
-            ignore_dirs = {".git", "node_modules", "out", "dist", "build", ".vscode", "__pycache__", ".serenity_cache"}
-            if query and os.path.exists(search_path):
-                files_to_search = []
-                if os.path.isfile(search_path):
-                    files_to_search = [search_path]
-                elif os.path.isdir(search_path):
-                    for root, dirs, files in os.walk(search_path):
-                        dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
-                        for file in files:
-                            if file.startswith(".env") or not is_path_allowed(file):
-                                continue
-                            if file.endswith((".py", ".ts", ".js", ".kt", ".txt", ".json", ".md", ".java", ".cpp", ".h", ".c", ".cs", ".go", ".rs", ".html", ".css")):
-                                files_to_search.append(os.path.join(root, file))
-                            if len(files_to_search) >= 500:
-                                break
-                        if len(files_to_search) >= 500:
-                            break
-
-                for path in files_to_search:
-                    try:
-                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                            for line_num, line in enumerate(f, 1):
-                                is_match = False
-                                if re_pattern:
-                                    try:
-                                        is_match = bool(re_pattern.search(line))
-                                    except Exception:
-                                        is_match = False
-                                if not is_match:
-                                    is_match = query.lower() in line.lower()
-                                if is_match:
-                                    matches.append(f"{path}:{line_num}: {line.strip()}")
-                                    if len(matches) >= 100:
-                                        break
-                    except Exception:
-                        pass
-                    if len(matches) >= 100:
-                        break
-
-            if matches:
-                total = len(matches)
-                sliced = matches[:20]
-                tool_ctx = f"\n\n[System Tool Response: Found {total} matches for grep query '{query}']\n" + "\n".join(sliced) + ("\n... [Truncated context] ...\n" if total > 20 else "\n")
-                log_message(f"[Tool Success] Grep found {total} matches for '{query}'.")
-                return {
-                    "tool_context": tool_ctx,
-                    "raw_output": "\n".join(matches),
-                    "is_error": False,
-                    "proof_tag": None,
-                    "backup_id": None,
-                    "status": "success",
-                    "details": f"Found {total} matches",
-                    "target_norm": normalized_target,
-                    "file_path": search_path
-                }
-            else:
-                tool_ctx = f"\n\n[System Tool Response: No occurrences of '{query}' were found in '{search_path}'.]\n"
-                log_message(f"[Tool Warning] Grep found 0 matches for '{query}'.")
-                return {
-                    "tool_context": tool_ctx,
-                    "raw_output": f"No matches found for '{query}'",
-                    "is_error": False,
-                    "proof_tag": None,
-                    "backup_id": None,
-                    "status": "warning",
-                    "details": "0 matches found",
-                    "target_norm": normalized_target,
-                    "file_path": search_path
-                }
+            entry = LongTermMemoryManager.store(key, category, content)
+            tool_ctx = f"\n\n[System Tool Response: Stored persistent long-term memory under key '{entry['key']}' ({entry['category']})]\n"
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": f"Memory stored: {entry['key']}",
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"Stored '{entry['key']}' ({entry['category']})",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
         except Exception as e:
             return {
-                "tool_context": f"\n\n[System Tool Error: Grep search failed: {e}]\n",
-                "raw_output": f"Error: Grep search failed: {e}",
+                "tool_context": f"\n\n[System Tool Error: Failed to store memory: {e}]\n",
+                "raw_output": f"Error: {e}",
                 "is_error": True,
                 "proof_tag": None,
                 "backup_id": None,
                 "status": "error",
-                "details": "Grep search failed",
+                "details": f"Error: {e}",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    elif normalized_target == "mcp:memory:query_memory":
+        try:
+            args = safe_parse_tool_args(payload_data, "query")
+            query_text = (args.get("query") or args.get("search") or "") if isinstance(args, dict) else (payload_data if isinstance(payload_data, str) else "")
+            category = args.get("category") if isinstance(args, dict) else None
+            results = LongTermMemoryManager.query(query_text, category)
+            if not results:
+                tool_ctx = f"\n\n[System Tool Response: No long-term memory entries found matching '{query_text}']\n"
+                out_str = "No matching memories found."
+            else:
+                lines = [f"Found {len(results)} long-term memory entries:"]
+                for it in results:
+                    lines.append(f"• [{it.get('category','').upper()}] {it.get('key')}: {it.get('content')}")
+                out_str = "\n".join(lines)
+                tool_ctx = f"\n\n[System Tool Response: {out_str}]\n"
+            return {
+                "tool_context": tool_ctx,
+                "raw_output": out_str,
+                "is_error": False,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "success",
+                "details": f"{len(results)} memories found",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Failed to query memory: {e}]\n",
+                "raw_output": f"Error: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": f"Error: {e}",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    elif normalized_target == "mcp:memory:update_memory":
+        try:
+            args = safe_parse_tool_args(payload_data, "content")
+            key = args.get("key") or ""
+            content = args.get("content") or ""
+            if not key or not content:
+                return {
+                    "tool_context": "\n\n[System Tool Error: Both 'key' and 'content' are required to update memory]\n",
+                    "raw_output": "Error: Missing key or content",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Missing key or content",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            res = LongTermMemoryManager.update(key, content)
+            if res:
+                tool_ctx = f"\n\n[System Tool Response: Successfully updated memory '{key}']\n"
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Updated memory: {key}",
+                    "is_error": False,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "success",
+                    "details": f"Updated '{key}'",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            else:
+                tool_ctx = f"\n\n[System Tool Error: Memory key '{key}' not found to update]\n"
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Memory key not found: {key}",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "warning",
+                    "details": "Key not found",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Update memory failed: {e}]\n",
+                "raw_output": f"Error: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": f"Error: {e}",
+                "target_norm": normalized_target,
+                "file_path": None
+            }
+
+    elif normalized_target == "mcp:memory:delete_memory":
+        try:
+            args = safe_parse_tool_args(payload_data, "key")
+            key = (args.get("key") or (payload_data if isinstance(payload_data, str) else "")).strip()
+            if not key:
+                return {
+                    "tool_context": "\n\n[System Tool Error: Key required to delete memory]\n",
+                    "raw_output": "Error: Missing key",
+                    "is_error": True,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "error",
+                    "details": "Missing key",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            deleted = LongTermMemoryManager.delete(key)
+            if deleted:
+                tool_ctx = f"\n\n[System Tool Response: Deleted memory entry '{key}']\n"
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Deleted memory: {key}",
+                    "is_error": False,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "success",
+                    "details": f"Deleted '{key}'",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+            else:
+                tool_ctx = f"\n\n[System Tool Response: Memory entry '{key}' was not found]\n"
+                return {
+                    "tool_context": tool_ctx,
+                    "raw_output": f"Not found: {key}",
+                    "is_error": False,
+                    "proof_tag": None,
+                    "backup_id": None,
+                    "status": "warning",
+                    "details": "Key not found",
+                    "target_norm": normalized_target,
+                    "file_path": None
+                }
+        except Exception as e:
+            return {
+                "tool_context": f"\n\n[System Tool Error: Delete memory failed: {e}]\n",
+                "raw_output": f"Error: {e}",
+                "is_error": True,
+                "proof_tag": None,
+                "backup_id": None,
+                "status": "error",
+                "details": f"Error: {e}",
                 "target_norm": normalized_target,
                 "file_path": None
             }
@@ -3144,9 +3528,47 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
             "file_path": None
         }
 
+def verify_mcp_auth(request: Request, optional: bool = False):
+    """Verifies PQC Bearer token if ENFORCE_MCP_AUTH is enabled."""
+    if os.environ.get("ENFORCE_MCP_AUTH", "false").lower() in ("true", "1", "yes"):
+        expected_token = os.environ.get("SERENITY_MCP_TOKEN")
+        if not expected_token:
+            expected_token = SerenityKeyVault.get_machine_entropy().hex()[:32]
+        
+        auth_header = request.headers.get("authorization", "").strip()
+        bearer_header = request.headers.get("bearer", "").strip()
+        api_key_header = request.headers.get("x-api-key", "").strip()
+        token_param = request.query_params.get("token", "").strip()
+        
+        provided_token = ""
+        if auth_header.lower().startswith("bearer "):
+            provided_token = auth_header[7:].strip()
+        elif auth_header:
+            provided_token = auth_header
+        elif bearer_header:
+            provided_token = bearer_header
+        elif api_key_header:
+            provided_token = api_key_header
+        elif token_param:
+            provided_token = token_param
+            
+        if not provided_token and optional:
+            return
+
+        valid_tokens = [expected_token]
+        if LOCAL_API_KEY:
+            valid_tokens.append(LOCAL_API_KEY)
+        if raw_env_key:
+            valid_tokens.append(raw_env_key)
+
+        matched = any(hmac.compare_digest(provided_token, v) for v in valid_tokens if v)
+        if not provided_token or not matched:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing MCP Bearer Token")
+
 def execute_mcp_tool_call(tool_name: str, args: dict) -> tuple[str, bool]:
     """Executes MCP tool call securely via central dispatch engine, returning (result_text, is_error)."""
-    res = dispatch_tool_call(tool_name, args, mode="agent", step_num=1)
+    ws = args.get("workspace_dir") or args.get("workspace") if isinstance(args, dict) else None
+    res = dispatch_tool_call(tool_name, args, mode="agent", step_num=1, workspace_dir=ws)
     return res["raw_output"] or res["tool_context"].strip(), res["is_error"]
 
 @app.api_route("/mcp", methods=["GET", "POST"])
@@ -3161,14 +3583,7 @@ async def mcp_streamable_http_endpoint(request: Request):
         raise HTTPException(status_code=403, detail="HTTPS required for MCP endpoints. Request must use https:// or proxy header X-Forwarded-Proto: https")
 
     # Optional Bearer / API Key header check
-    auth_header = request.headers.get("authorization", "")
-    api_key_header = request.headers.get("x-api-key", "")
-    enforce_auth = os.environ.get("ENFORCE_MCP_AUTH", "false").lower() in ("true", "1", "yes")
-
-    if enforce_auth:
-        token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else (api_key_header or auth_header)
-        if not token or (token != LOCAL_API_KEY and token != raw_env_key):
-            raise HTTPException(status_code=401, detail="Unauthorized MCP request: Invalid API Key")
+    verify_mcp_auth(request, optional=(request.method == "GET"))
 
     if request.method == "GET":
         return JSONResponse({
@@ -3245,6 +3660,13 @@ async def mcp_streamable_http_endpoint(request: Request):
             }
         })
 
+SSE_HEADERS = {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Transfer-Encoding": "chunked",
+    "X-Accel-Buffering": "no"
+}
 
 class OpenAIChatCompletionRequest(BaseModel):
     model: Optional[str] = None
@@ -3256,70 +3678,79 @@ class OpenAIChatCompletionRequest(BaseModel):
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def openai_chat_completions(req: OpenAIChatCompletionRequest, http_request: Request):
-    """OpenAI standard chat completion endpoint compatibility adapter."""
-    prompt_parts = []
+    target_model = req.model or SUPERVISOR_MODEL
+    resolved_model = await resolve_model(target_model)
+    
+    # Build prompt directly from multi-turn messages
+    formatted_prompt = ""
     for msg in req.messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-            content = " ".join(text_parts) if text_parts else str(content)
-        if content:
-            prompt_parts.append(f"{role.capitalize()}: {content}")
-    
-    full_prompt = "\n".join(prompt_parts) if prompt_parts else "Hello"
-    target_model = req.model or SUPERVISOR_MODEL
-    
-    query_req = QueryRequest(
-        prompt=full_prompt,
-        model=target_model,
-        session_id="openai_compat_session"
-    )
+            content = " ".join([c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"])
+        formatted_prompt += f"<|turn>{role}\n{content}\n<turn|>\n"
+    formatted_prompt += "<|turn>model\n<|channel>thought\n"
 
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_ts = int(time.time())
 
     if req.stream:
-        async def openai_stream_generator():
+        async def openai_direct_stream():
+            thought_filter = StreamingThoughtFilter()
             try:
-                async for event in run_orchestration(query_req, http_request):
-                    if isinstance(event, dict):
-                        if event.get("type") == "content":
-                            chunk = {
+                async for chunk in generate_completion_stream(
+                    resolved_model, formatted_prompt,
+                    temperature=req.temperature if req.temperature is not None else 0.2,
+                    num_ctx=CONTEXT_WINDOW,
+                    max_tokens=req.max_tokens if req.max_tokens is not None else -1,
+                ):
+                    if await http_request.is_disconnected():
+                        log_message("[OpenAI Stream] Client disconnected.")
+                        break
+
+                    for item in thought_filter.feed(chunk):
+                        delta_text = item.get("content", "")
+                        if delta_text:
+                            payload = {
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
                                 "created": created_ts,
                                 "model": target_model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": event.get("content", "")},
-                                    "finish_reason": None
-                                }]
+                                "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]
                             }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                        elif event.get("type") == "done":
-                            finish_chunk = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": created_ts,
-                                "model": target_model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield f"data: {json.dumps(finish_chunk)}\n\n"
+                            yield f"data: {json.dumps(payload)}\n\n"
+
+                for item in thought_filter.flush():
+                    delta_text = item.get("content", "")
+                    if delta_text:
+                        payload = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": target_model,
+                            "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': created_ts, 'model': target_model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
             except asyncio.CancelledError:
-                log_message("[OpenAI Stream] Request cancelled by client disconnect.")
+                log_message("[OpenAI Stream] Client aborted request.")
                 return
-            except Exception as e:
-                log_message(f"[OpenAI Stream Error] {e}")
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(openai_stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(openai_direct_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     else:
+        last_user_msg = ""
+        for m in reversed(req.messages):
+            if m.get("role") == "user":
+                c = m.get("content", "")
+                last_user_msg = c if isinstance(c, str) else str(c)
+                break
+        if not last_user_msg:
+            last_user_msg = "Hello"
+
+        query_req = QueryRequest(prompt=last_user_msg, model=target_model, session_id="openai_chat_sync")
         answer_parts = []
         try:
             async for event in run_orchestration(query_req, http_request):
@@ -3343,9 +3774,9 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest, http_request
                 "finish_reason": "stop"
             }],
             "usage": {
-                "prompt_tokens": max(1, len(full_prompt) // 4),
+                "prompt_tokens": max(1, len(formatted_prompt) // 4),
                 "completion_tokens": max(1, len(full_answer) // 4),
-                "total_tokens": max(2, (len(full_prompt) + len(full_answer)) // 4)
+                "total_tokens": max(2, (len(formatted_prompt) + len(full_answer)) // 4)
             }
         }
 
@@ -3445,7 +3876,7 @@ async def openai_responses_endpoint(http_request: Request):
                 log_message(f"[Responses Stream Error] {e}")
                 yield "data: [DONE]\n\n"
 
-        return StreamingResponse(responses_stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(responses_stream_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     else:
         answer_parts = []
@@ -3535,9 +3966,10 @@ async def openai_text_completions(http_request: Request):
                 return
             except Exception as e:
                 log_message(f"[Text Stream Error] {e}")
+            yield f"data: {json.dumps({'id': req_id, 'object': 'text_completion', 'created': created_ts, 'model': target_model, 'choices': [{'text': '', 'index': 0, 'finish_reason': 'stop'}]})}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(text_stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(text_stream_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
 
     else:
         answer_parts = []
@@ -3655,6 +4087,7 @@ COMMAND_RULES = [
     (r"^docker\s+(container|image|network|volume|context|system)\s+(ls|ps|inspect|history|show|df|info)\b", True),
     (r"^docker\s+compose\s+(ps|ls|top|logs|images|config|version|port|events)\b", True),
     (r"^Get-ChildItem(\s+|$)", True),
+    (r"^type(\s+|$)", True),
     (r"^Get-Content(\s+|$)", True),
     (r"^Get-Date(\s+|$)", True),
     (r"^Get-Random(\s+|$)", True),
@@ -3745,23 +4178,10 @@ def is_command_allowed(command_line: str) -> bool:
             return False
     return True
 
-def is_path_allowed(file_path: Optional[str]) -> bool:
-    """Restricts server process and agent tools from accessing sensitive .env files."""
-    if not file_path or not isinstance(file_path, str):
-        return False
-    try:
-        abs_path = os.path.abspath(file_path)
-        base_name = os.path.basename(abs_path).lower()
-        if base_name == ".env" or base_name.startswith(".env.") or ".env" in base_name:
-            return False
-        return True
-    except Exception:
-        return False
 
 file_edit_backups: Dict[str, Dict[str, Any]] = {}
 
 def create_edit_backup(file_path: str) -> tuple:
-    """Reads current file content before edit and returns (backup_id, old_content)."""
     old_content = ""
     if os.path.exists(file_path):
         try:
@@ -3778,7 +4198,6 @@ def create_edit_backup(file_path: str) -> tuple:
     return backup_id, old_content
 
 def calculate_diff_counts(old_content: str, new_content: str) -> tuple:
-    """Calculates lines removed and added using difflib unified_diff."""
     old_lines = old_content.splitlines()
     new_lines = new_content.splitlines()
     diff = list(difflib.unified_diff(old_lines, new_lines, lineterm=""))
@@ -3806,13 +4225,11 @@ class StreamingThoughtFilter:
         self.lookahead_tags = [
             "<|channel", "<channel", "<think", "<thought", "</think", "</thought", "<|turn", "<turn", "<|tool_call", "<tool_call", "call:", "<tool_call|>", "<|tool_call|>", "</tool_call>"
         ]
-        self.has_seen_explicit_thought_tag = False
+        self.has_seen_explicit_thought_tag = False        
 
     def _is_incomplete_tool_call(self, text: str) -> bool:
-        """Detects if text contains a tool call prefix whose arguments brace/paren has not closed yet, or trailing partial tags."""
         if not text:
             return False
-        # Avoid false positives on words ending in 'call' (e.g. recall, system call)
         if re.search(r'(?:<\|?tool_call\|?>?|<\|?channel\|?>*|<tool_call\b|\bcall:\s*[a-zA-Z0-9_:]*|\bcall:[^\s{\(]*)$', text.strip(), re.DOTALL):
             return True
         if "<tool_call>" in text and "</tool_call>" not in text:
@@ -3842,7 +4259,6 @@ class StreamingThoughtFilter:
         return True
 
     def _has_trailing_partial_tag(self, text: str) -> bool:
-        """Checks if text ends in a partial tag that could become an end or start tag in the next chunk."""
         stripped = text.rstrip()
         if not stripped:
             return False
@@ -3852,17 +4268,17 @@ class StreamingThoughtFilter:
                     return True
         return False
 
-    def feed(self, chunk: str) -> str:
+    def feed(self, chunk: str) -> List[Dict[str, Any]]:
         thought_chunk, content_chunk = self.feed_demux(chunk)
-        return content_chunk
+        if content_chunk:
+            return [{"type": "content", "content": content_chunk}]
+        return []        
 
     def feed_demux(self, chunk: str) -> tuple[str, str]:
-        """Demuxes incoming stream into (thought_chunk, content_chunk) with zero tag bleed."""
         self.buffer += chunk
         thought_out = ""
         content_out = ""
 
-        # Special pass-through: explicit errors, markdown headers, or JSON error responses should never be swallowed as thoughts
         if self.in_thought and not self.has_seen_explicit_thought_tag:
             stripped_buf = self.buffer.lstrip()
             if (stripped_buf.startswith("❌") or 
@@ -3931,13 +4347,20 @@ class StreamingThoughtFilter:
         if self.in_thought:
             cleaned = self.clean_tool_tags(self.buffer).strip()
             self.buffer = ""
-            # If started in thought without explicit start tags, return cleaned output
             if not self.has_seen_explicit_thought_tag:
                 return cleaned
-            return ""
+            # If the model finished without closing <channel|>, strip thought markers and return valid text
+            synthesized = strip_thought_blocks(cleaned).strip()
+            return synthesized if synthesized else cleaned
         flushed = self.clean_tool_tags(self.buffer)
-        self.buffer = ""
+        self.buffer = ""   
         return flushed
+    
+    def flush(self) -> List[Dict[str, Any]]:
+        rem= self.flush_remaining()
+        if rem:
+            return [{"type": "content", "content": rem}]
+        return[]
 
 # --- Custom Model Mapping Helpers ---
 MAX_HISTORY_TURNS = 10
@@ -3967,988 +4390,231 @@ def validate_workspace_path(path_value: str) -> str:
 
     return normalized
 
-async def run_orchestration(request: QueryRequest, http_request: Request):
-    """
-    Unified Orchestrator pipeline generator.
-    Handles both standalone direct execution and full multi-agent supervisor routing.
-    """
-    global autoswap_timer_task, model_consolidation, CURRENT_MODEL, sessions_history, active_system_plan
+async def run_orchestration(request: QueryRequest, http_request: Request) -> AsyncGenerator[Dict[str, Any], None]:
+    session_id = request.session_id or "default_session"
+    requested_model = request.model or CURRENT_MODEL or SUPERVISOR_MODEL
+    mapped_model = await resolve_model(requested_model)
+    resolved_model = resolve_gguf_path(mapped_model) or mapped_model
     
-    if autoswap_timer_task and not autoswap_timer_task.done():
-        autoswap_timer_task.cancel()
-
-    session_id = request.session_id
-    if not session_id:
-        client_host = http_request.client.host if http_request.client else "unknown"
-        session_id = f"session_{client_host.replace('.', '_')}"
-
-    is_programmatic = (session_id == 'native_lm_picker')
-
-    if not is_programmatic:
-        yield {"type": "progress", "text": "Initializing SerenityDev routing pipeline..."}
-        await asyncio.sleep(0.01)
-
-    async with inference_lock:
-        if request.workspace_dir:
-            try:
-                validated_path = validate_workspace_path(request.workspace_dir)
-                if os.path.isabs(validated_path):
-                    resolved_workspace = os.path.realpath(validated_path)
-                else:
-                    safe_root = os.path.realpath(workspace_dir)
-                    requested_path = os.path.join(safe_root, validated_path)
-                    resolved_workspace = os.path.realpath(requested_path)
-
-                if os.path.isdir(resolved_workspace):
-                    os.chdir(resolved_workspace)
-                    log_message(f"[Orchestrator] Changed working directory to: {resolved_workspace}")
-                else:
-                    log_message(f"[Orchestrator Error] Workspace directory does not exist or is not a directory: {resolved_workspace}")
-            except Exception as e:
-                log_message(f"[Orchestrator Error] Failed to change directory: {e}")
-
-        # --- Path A: Standalone Execution ---
-        if is_standalone_model(request.model):
-            mapped_model = map_custom_model_id(request.model)
-            resolved_model = await resolve_model(mapped_model)
-            log_message(f"[Orchestrator] Standalone execution requested for model: {request.model} ({resolved_model})")
+    if session_id not in sessions_history:
+        sessions_history[session_id] = []
             
-            if not is_programmatic:
-                yield {"type": "progress", "text": f"Pre-loading standalone model weights..."}
-                await asyncio.sleep(0.01)
+    # Format conversation history fitting dynamically within context budget
+    history_str = "\n".join(
+        f"User: {h.get('prompt', '')}\nAssistant: {h.get('answer', '')}"
+        for h in sessions_history[session_id]
+    )
 
-            # Session history
-            session_context = ""
-            if session_id not in sessions_history:
-                sessions_history[session_id] = []
-            history = sessions_history[session_id]
-            if history:
-                session_context = "\n--- CONVERSATION HISTORY ---\n" + "\n".join(
-                    f"User: {turn['prompt']}\nSerenityDev Suggestion: {turn['answer']}"
-                    for turn in history
-                ) + "\n-----------------------------\n"
+    # 1. Reasoning Strength Directives
+    reasoning_directives = {
+        "low": "Keep internal reasoning minimal and ultra-concise. Focus directly on execution.",
+        "medium": "Perform methodical step-by-step reasoning before tool calls or final output.",
+        "high": "Conduct deep, rigorous architectural reasoning, verifying all edge cases and dependencies.",
+        "xhigh": "Exhaustively analyze multi-perspective architecture, edge cases, safety boundaries, and validation steps."
+    }
+    active_reasoning_prompt = reasoning_directives.get(reasoning_strength, reasoning_directives["medium"])
 
-            reasoning_injection = "\nReasoning strength: xhigh.\n" if "glimmer" in request.model.lower() else ""
-            standalone_prompt = f"""<|turn>system
-<|think|>{reasoning_injection}
-You are SerenityDev running in standalone mode for model {request.model}.
-Provide a clean, direct, production-ready response in Markdown format. Avoid system markers.
+    # 2. Limit Tier Bounds
+    limit_tier_caps = {
+        "low": 8,
+        "default": 16,
+        "medium": 25,
+        "high": 50,
+        "autonomy": 1000
+    }
+    is_autonomy = (limit_tier == "autonomy") or auto_continue_enabled
+    max_loops = 1000 if is_autonomy else limit_tier_caps.get(limit_tier, 16)
 
+    # 3. Persistent Long-Term Memory Injection
+    ltm_summary = LongTermMemoryManager.get_context_summary(max_items=5)
+    ltm_section = f"\n{ltm_summary}\n" if ltm_summary else ""
+
+    current_prompt = f"""<|turn>system
+<|think|>
+You are SerenityDev Orchestrator. You solve coding queries autonomously using tools.
+Reasoning Guidance: {active_reasoning_prompt}
+{ltm_section}
 {PYTHON_TOOL_STUBS}
-
-PONYTAIL LAZINESS LADDER:
-Before writing code, stop at the first rung that holds:
-1. Does this need to exist? (YAGNI) -> skip it.
-2. Already in codebase? -> reuse it, don't rewrite.
-3. Stdlib does it? -> use it.
-4. Native platform feature? -> use it.
-5. Installed dependency? -> use it.
-6. One line? -> one line.
-7. Only then: minimum that works (without compromising safety or validation).
-Never compromise on security, input validation, or error handling.
+When calling a tool, execute Python function call syntax in a ```python block or JSON object.
 <turn|>
 <|turn>user
-<context>
-{session_context}{request.context}
-</context>
+History:
+{history_str}
 
-<user_request>
-{request.prompt}
-</user_request>
-<turn|>
-<|turn>model
-<|channel>thought
-"""
-            if not is_programmatic:
-                yield {"type": "progress", "text": f"Worker generating response..."}
-                await asyncio.sleep(0.01)
-
-            # Stream direct completion — mini agentic loop to handle native tool calls
-            MAX_STANDALONE_TOOL_LOOPS = 8
-            standalone_loop_count = 0
-            standalone_executed_calls = set()
-            standalone_context_accum = ""
-            current_standalone_prompt = standalone_prompt
-            clean_answer = ""
-            try:
-                while standalone_loop_count < MAX_STANDALONE_TOOL_LOOPS:
-                    full_text_accumulated = []
-                    thought_filter = StreamingThoughtFilter(start_in_thought=True)
-                    async for chunk in generate_completion_stream(resolved_model, current_standalone_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
-                        full_text_accumulated.append(chunk)
-                        filtered = thought_filter.feed(chunk)
-                        if filtered:
-                            yield {"type": "content", "content": filtered}
-
-                    remaining = thought_filter.flush_remaining()
-                    if remaining:
-                        yield {"type": "content", "content": remaining}
-
-                    raw_output = "".join(full_text_accumulated)
-                    clean_answer = clean_thought_and_whitespace(raw_output)
-
-                    # Detect native tool call in output
-                    parsed_tool = extract_json(raw_output)
-                    if parsed_tool and parsed_tool.get("action") == "call_tool":
-                        sa_target_raw = parsed_tool.get("target", "")
-                        sa_payload = parsed_tool.get("arguments_or_instructions", {})
-
-                        # Normalize target alias (same logic as Path B)
-                        sa_target_norm = sa_target_raw.lower().strip()
-                        sa_core = sa_target_norm.split(":")[-1].strip()
-                        if sa_core in ["read_file", "read", "view_file", "cat"]:
-                            sa_target = "mcp:filesystem:read_file"
-                        elif sa_core in ["grep_search", "grep", "search", "search_files"]:
-                            sa_target = "mcp:filesystem:grep_search"
-                        elif sa_core in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
-                            sa_target = "mcp:filesystem:list_directory"
-                        elif sa_core in ["write_file", "write", "create_file"]:
-                            sa_target = "mcp:filesystem:write_file"
-                        elif sa_core in ["insert_edit_into_file", "insert_edit"]:
-                            sa_target = "mcp:filesystem:insert_edit_into_file"
-                        elif sa_core in ["replace_string_in_file", "replace_string"]:
-                            sa_target = "mcp:filesystem:replace_string_in_file"
-                        elif sa_core in ["multi_replace_string_in_file", "multi_replace"]:
-                            sa_target = "mcp:filesystem:multi_replace_string_in_file"
-                        elif sa_core in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
-                            sa_target = "mcp:terminal:run_command"
-                        else:
-                            sa_target = sa_target_raw  # pass-through unknown
-
-                        # Duplicate call guard
-                        sa_sig = (sa_target, str(sa_payload))
-                        if sa_sig in standalone_executed_calls:
-                            log_message(f"[Standalone] Duplicate tool call blocked: {sa_target}")
-                            break
-                        standalone_executed_calls.add(sa_sig)
-
-                        if not is_programmatic:
-                            yield {"type": "progress", "text": f"⚙️ Standalone executing tool {sa_target}..."}
-                            await asyncio.sleep(0.01)
-
-                        # Dispatch — execute via unified tool engine
-                        sa_step = standalone_loop_count + 1
-                        res = dispatch_tool_call(sa_target, sa_payload, mode="agent", step_num=sa_step)
-                        tool_result = res["tool_context"]
-                        sa_target = res["target_norm"]
-
-                        # Yield collapsible tool execution block to content stream for VSCode visibility
-                        if not is_programmatic and tool_result:
-                            is_err = res["is_error"]
-                            open_attr = " open" if is_err else ""
-                            details_md = f"<details{open_attr}>\n<summary><strong>🛠️ Standalone Tool (Step {sa_step}):</strong> <code>{sa_target}</code></summary>\n\n```text\n{tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
-                            yield {"type": "content", "content": details_md}
-                            await asyncio.sleep(0.01)
-
-                        # Append result to prompt for next iteration
-                        standalone_context_accum += tool_result
-                        current_standalone_prompt = (
-                            standalone_prompt.rstrip()
-                            + f"\n{standalone_context_accum}\n<|turn|>\n<|turn>model\n<|channel>thought\n"
-                        )
-                        standalone_loop_count += 1
-                    else:
-                        # No tool call — plain response, we're done
-                        break
-
-                if session_id:
-                    sessions_history[session_id].append({
-                        "prompt": request.prompt,
-                        "answer": clean_answer
-                    })
-                    if len(sessions_history[session_id]) > MAX_HISTORY_TURNS:
-                        sessions_history[session_id].pop(0)
-
-                yield {
-                    "type": "done",
-                    "routing": {
-                        "supervisor": "N/A",
-                        "worker": request.model,
-                        "worker_model": resolved_model,
-                        "reason": "Standalone model selected",
-                        "review_badge": "N/A",
-                        "steps": [{"step": i+1, "tool": t, "status": "success"} for i, (t, _) in enumerate(standalone_executed_calls)]
-                    }
-                }
-            except Exception:
-                logging.exception("Standalone execution failed")
-                yield {"type": "error", "detail": "Standalone execution failed due to an internal error."}
-            return
-
-        # --- Path B: Multi-Agent Supervisor Routing Pipeline ---
-        # Parse slash commands if present
-        mode = "agent"
-        raw_prompt = request.prompt.strip()
-        matched_cmd = None
-        if raw_prompt.startswith(("/explore", "/exolore")):
-            mode = "explore"
-            matched_cmd = "/explore" if raw_prompt.startswith("/explore") else "/exolore"
-        elif raw_prompt.startswith("/plan"):
-            mode = "plan"
-            matched_cmd = "/plan"
-        elif raw_prompt.startswith("/execute"):
-            mode = "execute"
-            matched_cmd = "/execute"
-        elif raw_prompt.startswith("/agent"):
-            mode = "agent"
-            matched_cmd = "/agent"
-
-        if matched_cmd:
-            cleaned_prompt = raw_prompt[len(matched_cmd):].strip()
-            request.prompt = cleaned_prompt if cleaned_prompt else "List or summarize the codebase structures"
-            log_message(f"[Orchestrator] Slash Command Detected: {matched_cmd}. Mode: {mode}. Cleaned Prompt: {request.prompt}")
-
-        mode_instructions = ""
-        if mode == "explore":
-            mode_instructions = (
-                "\nCRITICAL EXPLORE MODE CONSTRAINT:\n"
-                "- You are running in read-only EXPLORE mode. You are restricted to read-only tools: "
-                "mcp:filesystem:list_directory, mcp:filesystem:read_file, and mcp:filesystem:grep_search.\n"
-                "- Do NOT modify any files. Do NOT use write_file, insert_edit_into_file, replace_string_in_file, multi_replace_string_in_file.\n"
-                "- You must NOT make any changes. Explore the codebase to understand the query, then delegate to W1 to summarize the findings.\n"
-            )
-        elif mode == "plan":
-            mode_instructions = (
-                "\nCRITICAL PLAN MODE CONSTRAINT:\n"
-                "- You are running in PLAN mode. Your sole objective is to formulate a plan to address the prompt.\n"
-                "- You may read files to understand context, but you must NOT write, edit, or modify any files.\n"
-                "- Once the plan is ready, delegate to W1 to present the details of the plan to the user.\n"
-            )
-        elif mode == "execute":
-            mode_instructions = (
-                "\nCRITICAL EXECUTE MODE:\n"
-                "- You are running in EXECUTE mode. Your objective is to implement changes to the codebase.\n"
-                "- You have full, direct access to compile/test via 'mcp:terminal:run_command', modify files using edit/write tools directly, or delegate code generation tasks to specialist workers as needed.\n"
-            )
-        elif mode == "agent":
-            mode_instructions = (
-                "\nCRITICAL AGENT MODE:\n"
-                "- You are running in AGENT mode. Act as an autonomous coordinator.\n"
-                "- You can execute any tools directly (compiling, file edits, etc.) or delegate tasks to specialized worker agents on an as-needed basis.\n"
-            )
-
-        if not is_programmatic:
-            yield {"type": "progress", "text": "Resolving active model weights..."}
-            await asyncio.sleep(0.01)
-
-        session_context = ""
-        if session_id not in sessions_history:
-            sessions_history[session_id] = []
-        
-        history = sessions_history[session_id]
-        if history:
-            session_context = "\n--- CONVERSATION HISTORY ---\n" + "\n".join(
-                f"User: {turn['prompt']}\nSerenityDev Suggestion: {turn['answer']}"
-                for turn in history
-            ) + "\n-----------------------------\n"
-        
-        request.context = f"{session_context}{request.context}"
-
-        # Determine Execution Mode (Low / High / Turbo-Orchestrator)
-        is_low_mode = (request.model == "serenity-supervisor-low")
-        is_high_mode = (request.model == "serenity-supervisor-high")
-
-        # Resolve models based on role and effort level
-        if model_consolidation:
-            supervisor_res = await resolve_model(str(CURRENT_MODEL))
-            w1_res = supervisor_res
-            w2_res = supervisor_res
-            w3_res = supervisor_res
-            w4_res = supervisor_res
-            log_message(f"[Orchestrator] Consolidated Models Enabled -> Using '{supervisor_res}' for all phases.")
-        else:
-            if is_low_mode:
-                supervisor_res = await resolve_model(SUPERVISOR_LOW_MODEL)
-            elif is_high_mode:
-                supervisor_res = await resolve_model(SUPERVISOR_HIGH_MODEL)
-            else:
-                supervisor_res = await resolve_model(ORCHESTRATOR_TURBO_MODEL or SUPERVISOR_MODEL)
-
-            w1_res = await resolve_model(W1_MODEL)
-            w2_res = await resolve_model(W2_MODEL)
-            w3_res = await resolve_model(W3_MODEL)
-            w4_res = await resolve_model(W4_MODEL)
-            log_message(f"[Orchestrator] Resolved Roles -> Supervisor ({'Low' if is_low_mode else ('High' if is_high_mode else 'Turbo')}): {supervisor_res}, W1: {w1_res}, W2: {w2_res}, W3: {w3_res}, W4: {w4_res}")
-
-        # Check Auto-Continue (unlimited iteration)
-        effective_auto_continue = request.auto_continue if request.auto_continue is not None else auto_continue_enabled
-
-        if effective_auto_continue:
-            max_tool_loops = 500
-            log_message("[Orchestrator] Auto-Continue Active -> Unlimited iteration enabled (up to 500 loops).")
-        elif isinstance(request.max_steps, int) and request.max_steps > 0:
-            max_tool_loops = request.max_steps
-        elif is_low_mode:
-            max_tool_loops = 8
-        elif is_high_mode:
-            max_tool_loops = 25
-        else:  # Turbo Mode / Orchestrator: Autonomous, nigh-indefinite execution
-            max_tool_loops = 100
-
-        supervisor_temp = 0.1 if is_low_mode else 0.4
-        if is_low_mode:
-            mode_explanation_prompt = "- You are running in Low-Resource Efficiency Mode. Output minimal explanations. Keep 'reason' and 'step_summary' fields short, concise, and direct. Focus on token savings and speed.\n"
-        elif is_high_mode:
-            mode_explanation_prompt = "- You are running in High-Capacity Reasoning Mode. Detail your plan, rationale, and validation checks in 'reason' and 'step_summary' to ensure maximum accuracy.\n"
-        else:
-            mode_explanation_prompt = "- You are running in Autonomous Turbo Orchestrator Mode. Iterate through multi-step plans, spawn Worker sub-agents, execute tools, and oversee planning until full task completion.\n"
-
-        # Phase 1: Autonomous Multi-Turn Tool Loop
-        tool_loop_count = 0
-        agent_steps = []
-        worker_id = "W1"
-        instructions = ""
-        reason = "Standard delegation flow"
-        
-        supervisor_context = request.context
-        worker_context = ""
-        worker_tool_responses = []
-        executed_tool_calls = set()
-        duplicate_tool_counts = {}
-        delegation_count = 0
-        # Orchestrator: unlimited delegations; High: 5; Low: 3
-        max_delegations = 3 if is_low_mode else (5 if is_high_mode else None)
-
-        while tool_loop_count < max_tool_loops:
-            routing_prompt = f"""<|turn>system
-<|think|>
-You are the SerenityDev Hierarchical Supervisor (Gemma-4 Core). You are the Planner & Architect of the multi-agent system.
-Your role: High-level reasoning, intent analysis, multi-step plan formulation (`create_or_update_plan`), file discovery, and delegating execution steps to Worker agents.
-
-CRITICAL CONTEXT RULES:
-- Always establish or update a clear execution plan (`create_or_update_plan`) before dispatching tasks.
-- Workers do NOT re-plan or converse; they execute assigned tools precisely and report a terse execution summary back to you.
-- Search for or inspect required files using 'read_file', 'grep_search', or 'list_directory'.
-- Do NOT re-read or search for files you have ALREADY inspected in previous turns.
-- Minimize context bloat. Only read files directly related to the user request.
-- Enforce the Ponytail Laziness Ladder on all Worker agents (YAGNI, reuse codebase, stdlib, native platform, installed dependency, one line, minimum works).
-{mode_instructions}
-{mode_explanation_prompt}
-
-{PYTHON_TOOL_STUBS}
-
-DECISION RULE:
-1. If you haven't formulated a plan or need to look up file locations, call 'create_or_update_plan' or 'list_directory'.
-2. If the request involves modifying or checking files, call 'read_file' or 'grep_search' to inspect the files if not already inspected.
-3. Do NOT re-read or search for files you have already inspected. Once files are inspected, IMMEDIATELY execute file edits (replace_string_in_file / insert_edit_into_file / write_file) or delegate to W1.
-4. You have full direct access to all execution tools. You can choose to:
-   - Edit, write, or modify code directly using file editing tools (write_file, insert_edit_into_file, replace_string_in_file, multi_replace_string_in_file).
-   - Compile, build, lint, or run tests directly using 'mcp:terminal:run_command'.
-   - Delegate any part of the task to a specialist worker agent (W1, W2, W3, W4) with clear instructions.
-5. Choose the path (direct tool usage vs worker delegation) that is most accurate, safe, and efficient for the current task.
-
-Workers:
-- W1 (Gemma 26B MOE): Complex architecture, multi-step debugging.
-- W2 (CodeGemma 7b): Direct code synthesis and precise file edits.
-- W3 (Qwen 35B): Fast explanations and shell scripts.
-- W4 (Qwen 27B): Specialized coding routines.
-
-You must respond with a JSON object or Programmatic Tool Call (PTC) matching this schema:
-{{
-  "action": "call_tool" | "delegate_worker",
-  "target": "mcp:filesystem:create_or_update_plan" | "mcp:filesystem:list_directory" | "mcp:filesystem:read_file" | "mcp:filesystem:write_file" | "mcp:filesystem:insert_edit_into_file" | "mcp:filesystem:replace_string_in_file" | "mcp:filesystem:multi_replace_string_in_file" | "mcp:filesystem:grep_search" | "mcp:terminal:run_command" | "W1" | "W2" | "W3" | "W4",
-  "arguments_or_instructions": {{"key": "value"}} or "string_instructions",
-  "step_summary": "A short summary of what was learned or done in this step, to be added to the timeline.",
-  "reason": "Explain your tactical thinking."
-}}
-CRITICAL: Respond ONLY with raw JSON or Python function call syntax. Do NOT use <|tool_call> tags. No markdown wrappers.
-<turn|>
-<|turn>user
-<context>
-{supervisor_context}
-</context>
-
-<user_request>
-{request.prompt}
-</user_request>
-<turn|>
-<|turn>model
-<|channel>thought
-"""
-            if not is_programmatic:
-                yield {"type": "progress", "text": f"Supervisor routing phase (turn {tool_loop_count + 1})..."}
-                await asyncio.sleep(0.01)
-
-            decision = None
-            retry_count = 0
-            max_retries = 2
-            current_routing_prompt = routing_prompt
-            routing_raw = ""
-
-            while retry_count <= max_retries:
-                try:
-                    res = await generate_completion(supervisor_res, current_routing_prompt, supervisor_temp + (0.05 * retry_count), CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05)
-                    routing_raw = res.get('response', '')
-                    decision = extract_json(routing_raw)
-                    if decision and "action" in decision and "target" in decision:
-                        break
-                    else:
-                        raise ValueError("Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.")
-                except asyncio.CancelledError:
-                    log_message("[Supervisor] Orchestration cancelled by client request.")
-                    raise
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        log_message(f"[Supervisor Self-Healing] Failed after {max_retries} retries. Falling back to W1. Error: {e}")
-                        break
-                    log_message(f"[Supervisor Self-Healing] Attempt {retry_count} failed: {e}. Retrying with error details...")
-                    current_routing_prompt = routing_prompt + f"\n\n[SYSTEM ERROR: Your previous response was invalid and could not be parsed. Error: {str(e)}.\nYour previous raw response was:\n{routing_raw}\n\nPlease correct this and output ONLY a valid JSON object matching the schema exactly. Do not wrap in markdown or add text before/after.]\n"
-
-            if not decision or "action" not in decision:
-                decision = {
-                    "action": "delegate_worker",
-                    "target": "W1",
-                    "arguments_or_instructions": "Provide direct code solutions.",
-                    "reason": "Default fallback triggered due to routing or parsing failure after retries."
-                }
-
-            action = decision.get("action", "delegate_worker")
-            target = decision.get("target", "W1")
-            payload_data = decision.get("arguments_or_instructions", "")
-            reason = decision.get("reason", "Standard execution flow")
-            step_summary = decision.get("step_summary", reason)
-
-            # Normalize tool target aliases and strip prefixes (e.g. google:mcp:code_interpreter:read_file -> read_file)
-            if isinstance(target, str):
-                target_norm = target.lower().strip()
-                core_target = target_norm.split(":")[-1].strip()
-                
-                if core_target in ["read_file", "read", "view_file", "cat"]:
-                    target = "mcp:filesystem:read_file"
-                elif core_target in ["grep_search", "grep", "search", "search_files"]:
-                    target = "mcp:filesystem:grep_search"
-                elif core_target in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
-                    target = "mcp:filesystem:list_directory"
-                elif core_target in ["write_file", "write", "create_file"]:
-                    target = "mcp:filesystem:write_file"
-                elif core_target in ["insert_edit_into_file", "insert_edit"]:
-                    target = "mcp:filesystem:insert_edit_into_file"
-                elif core_target in ["replace_string_in_file", "replace_string"]:
-                    target = "mcp:filesystem:replace_string_in_file"
-                elif core_target in ["multi_replace_string_in_file", "multi_replace"]:
-                    target = "mcp:filesystem:multi_replace_string_in_file"
-                elif core_target in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
-                    target = "mcp:terminal:run_command"
-                elif core_target in ["create_or_update_plan", "plan"]:
-                    target = "mcp:filesystem:create_or_update_plan"
-
-
-            if action == "delegate_worker":
-                worker_id = target if target in ["W1", "W2", "W3", "W4"] else "W1"
-                instructions = extract_instructions(payload_data)
-                if mode == "explore":
-                    instructions = f"[EXPLORE MODE - READ ONLY] {instructions}"
-                elif mode == "plan":
-                    instructions = f"[PLAN MODE - DO NOT MODIFY FILES] {instructions}"
-                delegation_count += 1
-                if max_delegations is not None and delegation_count >= max_delegations:
-                    log_message(f"[Supervisor] Delegation cap ({max_delegations}) reached. Proceeding to worker.")
-                break
-
-            # Duplicate tool call guard to prevent infinite re-reading loops
-            tool_sig = (target, str(payload_data))
-            if tool_sig in executed_tool_calls:
-                dup_count = duplicate_tool_counts.get(tool_sig, 0) + 1
-                duplicate_tool_counts[tool_sig] = dup_count
-                max_allowed_dups = 5 if target == "mcp:terminal:run_command" else 3
-                log_message(f"[Duplicate Tool Intercepted] Redundant tool call '{target}' with args {payload_data} (Attempt {dup_count}/{max_allowed_dups})")
-                if dup_count >= max_allowed_dups:
-                    log_message(f"[Supervisor Loop Guard] Duplicate limit reached for '{target}'. Forcibly breaking loop & routing to W1.")
-                    worker_id = "W1"
-                    instructions = f"Fulfill request using gathered context. Redundant tool call blocked for {target}."
-                    break
-                tool_context = f"\n\n[System Tool Warning: You ALREADY executed {target} with identical arguments in a previous turn. Do NOT call this tool again with identical arguments. Proceed to modify files using edit/write tools or delegate to W1 now.]\n"
-                supervisor_context = f"{supervisor_context}{tool_context}"
-                tool_loop_count += 1
-                continue
-            executed_tool_calls.add(tool_sig)
-
-            if not is_programmatic:
-                yield {"type": "progress", "text": f"⚙️ Supervisor executing tool {target}..."}
-                await asyncio.sleep(0.01)
-
-            # Execute tool code via unified dispatch engine
-            step_num = tool_loop_count + 1
-            res = dispatch_tool_call(target, payload_data, mode=mode, step_num=step_num)
-            tool_context = res["tool_context"]
-            full_tool_context = tool_context
-            target = res["target_norm"]
-
-            agent_steps.append({
-                "step": step_num,
-                "tool": f"{target.split(':')[-1]}: {res['file_path'] or ''}".strip(": "),
-                "status": res["status"],
-                "details": res["details"]
-            })
-
-            supervisor_context = f"{supervisor_context}{tool_context}"
-            if len(supervisor_context) > 15000:
-                supervisor_context = "...\n[Earlier tool responses truncated for speed & context limits]\n..." + supervisor_context[-12000:]
-            
-            worker_tool_responses.append(full_tool_context)
-            total_worker_len = sum(len(r) for r in worker_tool_responses)
-            if total_worker_len > 30000:
-                rebuilt_responses = []
-                for idx, r in enumerate(worker_tool_responses):
-                    # Keep the last 2 tool responses in full, truncate older ones to just headers/first line
-                    if idx >= len(worker_tool_responses) - 2:
-                        rebuilt_responses.append(r)
-                    else:
-                        first_line = r.splitlines()[0] if r.strip() else "[Empty Tool Response]"
-                        rebuilt_responses.append(f"\n\n{first_line}\n... [Early tool response contents truncated to preserve worker context window] ...\n")
-                worker_context = "".join(rebuilt_responses)
-            else:
-                worker_context = "".join(worker_tool_responses)
-
-            if not is_programmatic and tool_context:
-                step_num = tool_loop_count + 1
-                is_err = "error" in tool_context.lower() or "blocked" in tool_context.lower() or "failed" in tool_context.lower()
-                step_icon = "🔴" if is_err else "🟢"
-                tool_args_str = str(payload_data)
-                if len(tool_args_str) > 120:
-                    tool_args_str = tool_args_str[:120] + "..."
-                
-                # Emit tool execution as a progress update rather than polluting the markdown content stream
-                yield {"type": "progress", "text": f"⚙️ {step_icon} Step {step_num}: {target} ({tool_args_str})"}
-                await asyncio.sleep(0.01)
-
-            tool_loop_count += 1
-
-        if tool_loop_count >= max_tool_loops:
-            worker_id = "W1"
-            instructions = "Fulfill this request using fully enriched context."
-            log_message("[Supervisor Warning] Reached max loop depth. Routing to W1.")
-
-        # --- Phase 2: Worker Synthesis ---
-        if not is_programmatic:
-            yield {"type": "progress", "text": f"Worker {worker_id} is generating response..."}
-            await asyncio.sleep(0.01)
-
-        worker_model = w1_res if worker_id == "W1" else (w2_res if worker_id == "W2" else (w3_res if worker_id == "W3" else w4_res))
-        
-        if (llama_server_process is not None and llama_server_process.poll() is None) and worker_model != supervisor_res and not (llama_cpp_available and resolve_gguf_path(worker_model)):
-            log_message(f"[Orchestrator] VRAM Swap: Unloading Supervisor '{supervisor_res}' to free VRAM for '{worker_model}'...")
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    await client.post(LLAMA_SERVER_URL, json={"model": supervisor_res, "keep_alive": 0})
-            except Exception:
-                pass
-
-        worker_mode_constraint = ""
-        if mode == "explore":
-            worker_mode_constraint = "\nCRITICAL: You are running in read-only EXPLORE mode. Do NOT generate file edits, writes, or modifications. Only analyze and explain structures."
-        elif mode == "plan":
-            worker_mode_constraint = "\nCRITICAL: You are running in PLAN mode. Do NOT generate file edits or modifications. Only output a structured, complete plan."
-
-        worker_prompt = f"""<|turn>system
-<|think|>
-You are SerenityDev {worker_id}, the Executor. You execute tasks assigned by the Supervisor.{worker_mode_constraint}
-ROLE & BEHAVIOR RULES:
-- You are a pure Executor. Do NOT re-plan, ask open-ended questions, or write conversational fluff.
-- Execute tool instructions directly via Python function calls and output clean, production-ready code.
-- Never state intent to call tools in plain prose; execute the tool call directly.
-- At the end of your response, provide an ultra-terse, caveman-style summary of executed changes for the Supervisor.
-Instructions: {instructions}
-
-{PYTHON_TOOL_STUBS}
-
-PONYTAIL LAZINESS LADDER:
-Before writing code, stop at the first rung that holds:
-1. Does this need to exist? (YAGNI) -> skip it.
-2. Already in codebase? -> reuse it, don't rewrite.
-3. Stdlib does it? -> use it.
-4. Native platform feature? -> use it.
-5. Installed dependency? -> use it.
-6. One line? -> one line.
-7. Only then: minimum that works (without compromising safety or validation).
-Never compromise on security, input validation, or error handling.
-<turn|>
-<|turn>user
-<context>
-{request.context}
-{worker_context}
-</context>
-
-<user_request>
-{request.prompt}
-</user_request>
-<turn|>
-<|turn>model
-<|channel>thought
-"""
-
-        log_message(f"[Orchestrator] Running Worker {worker_id} ({worker_model.split(':')[0]})...")
-        if not is_programmatic:
-            timeline_md = ""
-            if agent_steps:
-                timeline_md = f"<details open>\n<summary><b>🛠️ Agentic Tools Executed ({len(agent_steps)})</b></summary>\n\n"
-                for step in agent_steps:
-                    icon = "🟢" if step["status"] == "success" else "🟡"
-                    timeline_md += f"{step['step']}. {icon} `{step['tool']}` — *{step['details']}*\n"
-                timeline_md += "</details>\n\n"
-
-            prelim_header = f"### 🤖 SerenityDev Orchestration Report\n\n- **Routing**: `Supervisor ({supervisor_res.split(':')[0]})` ➡️ `Agent: {worker_id} ({worker_model.split(':')[0]})`\n- **Mode**: `{mode.upper()}`\n- **Reason**: *{reason}*\n\n{timeline_md}---\n\n"
-            yield {"type": "content", "content": prelim_header}
-            await asyncio.sleep(0.01)
-
-        try:
-            MAX_WORKER_TOOL_LOOPS = 8
-            worker_tool_loop_count = 0
-            worker_executed_calls = set()
-            worker_tool_accum = ""
-            current_worker_prompt = worker_prompt
-            worker_draft_raw = ""
-            final_answer = ""
-
-            while worker_tool_loop_count < MAX_WORKER_TOOL_LOOPS:
-                worker_draft_parts = []
-                thought_filter = StreamingThoughtFilter(start_in_thought=True)
-                async for chunk in generate_completion_stream(worker_model, current_worker_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
-                    worker_draft_parts.append(chunk)
-                    filtered = thought_filter.feed(chunk)
-                    if filtered:
-                        yield {"type": "content", "content": filtered}
-
-                remaining = thought_filter.flush_remaining()
-                if remaining:
-                    yield {"type": "content", "content": remaining}
-
-                worker_draft_raw = "".join(worker_draft_parts)
-                final_answer = clean_thought_and_whitespace(worker_draft_raw)
-
-                # Detect native tool call in worker output
-                w_parsed = extract_json(worker_draft_raw)
-                if w_parsed and w_parsed.get("action") == "call_tool":
-                    w_target_raw = w_parsed.get("target", "")
-                    w_payload = w_parsed.get("arguments_or_instructions", {})
-
-                    # Normalize alias
-                    w_core = w_target_raw.lower().strip().split(":")[-1].strip()
-                    if w_core in ["read_file", "read", "view_file", "cat"]:
-                        w_target = "mcp:filesystem:read_file"
-                    elif w_core in ["grep_search", "grep", "search", "search_files"]:
-                        w_target = "mcp:filesystem:grep_search"
-                    elif w_core in ["list_directory", "list_files", "ls", "dir", "list_dir"]:
-                        w_target = "mcp:filesystem:list_directory"
-                    elif w_core in ["write_file", "write", "create_file"]:
-                        w_target = "mcp:filesystem:write_file"
-                    elif w_core in ["insert_edit_into_file", "insert_edit"]:
-                        w_target = "mcp:filesystem:insert_edit_into_file"
-                    elif w_core in ["replace_string_in_file", "replace_string"]:
-                        w_target = "mcp:filesystem:replace_string_in_file"
-                    elif w_core in ["multi_replace_string_in_file", "multi_replace"]:
-                        w_target = "mcp:filesystem:multi_replace_string_in_file"
-                    elif w_core in ["run_command", "exec", "terminal", "execute", "bash", "sh", "shell", "run"]:
-                        w_target = "mcp:terminal:run_command"
-                    else:
-                        w_target = w_target_raw
-
-                    w_sig = (w_target, str(w_payload))
-                    if w_sig in worker_executed_calls:
-                        log_message(f"[Worker {worker_id}] Duplicate tool call blocked: {w_target}")
-                        break
-                    worker_executed_calls.add(w_sig)
-
-                    if not is_programmatic:
-                        yield {"type": "progress", "text": f"⚙️ Worker {worker_id} executing tool {w_target}..."}
-                        await asyncio.sleep(0.01)
-
-                    # Dispatch — execute via central tool engine
-                    w_step = tool_loop_count + worker_tool_loop_count + 1
-                    res = dispatch_tool_call(w_target, w_payload, mode=mode, step_num=w_step)
-                    w_tool_result = res["tool_context"]
-                    w_target = res["target_norm"]
-
-                    agent_steps.append({
-                        "step": w_step,
-                        "tool": f"{w_target.split(':')[-1]}: {res['file_path'] or ''}".strip(": "),
-                        "status": res["status"],
-                        "details": res["details"]
-                    })
-
-                    if not is_programmatic and w_tool_result:
-                        is_err = res["is_error"]
-                        open_attr = " open" if is_err else ""
-                        details_md = f"<details{open_attr}>\n<summary><strong>Worker Tool (Step {w_step}):</strong> <code>{w_target}</code></summary>\n\n```text\n{w_tool_result.strip()[:1000]}\n```\n\n</details>\n\n"
-                        yield {"type": "content", "content": details_md}
-                        await asyncio.sleep(0.01)
-
-                    worker_tool_accum += w_tool_result
-                    current_worker_prompt = (
-                        worker_prompt.rstrip()
-                        + f"\n{worker_tool_accum}\n<|turn|>\n<|turn>model\n<|channel>thought\n"
-                    )
-                    worker_tool_loop_count += 1
-                else:
-                    break  # no tool call — worker is done
-
-        except Exception:
-            logging.exception("Worker failure during synthesis")
-            yield {"type": "error", "detail": "Worker failure during synthesis due to an internal error."}
-            return
-
-        # --- Phase 3: Supervisor Review ---
-        if not is_programmatic:
-            yield {"type": "progress", "text": "Supervisor is reviewing draft quality..."}
-            await asyncio.sleep(0.01)
-
-        if (llama_server_process is not None and llama_server_process.poll() is None) and worker_model != supervisor_res and not (llama_cpp_available and resolve_gguf_path(worker_model)):
-            log_message(f"[Orchestrator] VRAM Swap: Unloading Worker '{worker_model}' to free VRAM for Supervisor Review...")
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    await client.post(LLAMA_SERVER_URL, json={"model": worker_model, "keep_alive": 0})
-            except Exception:
-                pass
-
-        log_message(f"[Orchestrator] Requesting Supervisor review of draft answer...")
-        review_prompt = f"""<|turn>system
-<|think|>
-You are the SerenityDev Hierarchical Supervisor. Your task is to review the draft answer generated by the worker and determine if it fully and accurately addresses the user's request.
-
-You must respond with a JSON object matching this schema exactly:
-{{
-  "approved": true | false,
-  "feedback": "Detail feedback or corrections if rejected, otherwise empty string."
-}}
-Respond ONLY with the raw JSON object. Do not wrap it in markdown code blocks or other text.
-<turn|>
-<|turn>user
-<user_request>
-{request.prompt}
-</user_request>
-
-<draft_answer>
-{final_answer}
-</draft_answer>
-<turn|>
-<|turn>model
-<|channel>thought
-"""
-
-        approved = True
-        feedback = ""
-        try:
-            res = await generate_completion(supervisor_res, review_prompt, 0.2, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05)
-            review_raw = res.get('response', '')
-            review_decision = extract_json(review_raw)
-            if review_decision:
-                approved = review_decision.get("approved", True)
-                feedback = review_decision.get("feedback", "")
-        except Exception as e:
-            log_message(f"[Supervisor Error] Review phase failed: {e}")
-
-        # --- Phase 4: Re-routing (On rejection) ---
-        if not approved:
-            if not is_programmatic:
-                w1_name = w1_res.split(':')[0]
-                yield {"type": "progress", "text": f"Supervisor rejected draft. Refinement model rewriting ({w1_name})..."}
-                await asyncio.sleep(0.01)
-                
-                rejection_msg = f"\n\n---\n> 🔍 **Review:** `❌ Rejected -> Re-routed (Reason: {feedback[:100]}...)`\n> 🔄 **Refinement Model Rewriting ({w1_name})...**\n\n"
-                yield {"type": "content", "content": rejection_msg}
-                await asyncio.sleep(0.01)
-
-            if (llama_server_process is not None and llama_server_process.poll() is None) and w1_res != supervisor_res and not (llama_cpp_available and resolve_gguf_path(w1_res)):
-                log_message(f"[Orchestrator] VRAM Swap: Unloading Supervisor '{supervisor_res}' for W1 Refinement...")
-                try:
-                    async with httpx.AsyncClient(timeout=5) as client:
-                        await client.post(LLAMA_SERVER_URL, json={"model": supervisor_res, "keep_alive": 0})
-                except Exception:
-                    pass
-
-            log_message(f"[Supervisor Rejection] Draft failed quality check. Feedback: {feedback}")
-            log_message(f"[Orchestrator] Re-routing task to high-capacity reasoning model {w1_res}...")
-            
-            refine_mode_constraint = ""
-            if mode == "explore":
-                refine_mode_constraint = "\nCRITICAL: You are running in read-only EXPLORE mode. Do NOT generate file edits, writes, or modifications. Only analyze and explain."
-            elif mode == "plan":
-                refine_mode_constraint = "\nCRITICAL: You are running in PLAN mode. Do NOT generate file edits or modifications. Only output a structured, complete plan."
-
-            refine_prompt = f"""<|turn>system
-<|think|>
-You are a SerenityDev Worker. You have been assigned to revise and correct a draft answer based on feedback from the Hierarchical Supervisor.{refine_mode_constraint}
-Please rewrite the answer, ensuring all feedback is fully addressed, code is perfectly correct, and formatting is clean. Provide a direct, professional markdown solution.
-Do NOT issue tool calls (<|tool_call>). Output ONLY your final, complete response in Markdown.
-
-PONYTAIL LAZINESS LADDER:
-Before writing code, stop at the first rung that holds:
-1. Does this need to exist? (YAGNI) -> skip it.
-2. Already in codebase? -> reuse it, don't rewrite.
-3. Stdlib does it? -> use it.
-4. Native platform feature? -> use it.
-5. Installed dependency? -> use it.
-6. One line? -> one line.
-7. Only then: minimum that works (without compromising safety or validation).
-Never compromise on security, input validation, or error handling.
-<turn|>
-<|turn>user
 User Request: {request.prompt}
-Context: {request.context}
-Supervisor Feedback: {feedback}
-Previous Draft:
-{final_answer}
 <turn|>
 <|turn>model
 <|channel>thought
 """
 
-            try:
-                refined_parts = []
-                thought_filter = StreamingThoughtFilter(start_in_thought=True)
-                async for chunk in generate_completion_stream(w1_res, refine_prompt, 0.3, CONTEXT_WINDOW, min_p=0.05, repeat_penalty=1.05):
-                    refined_parts.append(chunk)
-                    filtered = thought_filter.feed(chunk)
-                    if filtered:
-                        yield {"type": "content", "content": filtered}
+    loop_count = 0
+    executed_calls = set()
+    accumulated_answer = []
+    routing_steps: List[Dict[str, Any]] = []
+
+    while loop_count < max_loops:
+        if await http_request.is_disconnected():
+            log_message("[Supervisor] Orchestration cancelled by client disconnect.")
+            break
+
+        thought_filter = StreamingThoughtFilter()
+        raw_chunks = []
+        model_content = []
+
+        async for chunk in generate_completion_stream(resolved_model, current_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
+            if await http_request.is_disconnected():
+                log_message("[Supervisor] Stream aborted by client connection drop.")
+                break
+            raw_chunks.append(chunk)
+            content = thought_filter.feed(chunk)
+            if content:
+                model_content.extend(event.get("content", "") for event in content)
+
+        model_content.extend(
+            event.get("content", "") for event in thought_filter.flush()
+            if event.get("type") == "content"
+        )
+
+        raw_output = "".join(raw_chunks)
+        accumulated_answer.append(raw_output)
+        
+        parsed_tool = extract_json(raw_output)
+        if parsed_tool and isinstance(parsed_tool, dict):
+            action = parsed_tool.get("action")
+            target = parsed_tool.get("target", "")
+
+            # 1. Subagent Delegation Pathway ("Offload then load")
+            if action == "delegate_worker" or target in ["W1", "W2", "W3", "W4"]:
+                worker_map = {
+                    "W1": W1_MODEL,  # Reasoning & Architecture
+                    "W2": W2_MODEL,  # Heavy Code Synthesis
+                    "W3": W3_MODEL,  # Fast Utilities / Scripting / Explanations
+                    "W4": W4_MODEL   # Specialized worker
+                }
                 
-                remaining = thought_filter.flush_remaining()
-                if remaining:
-                    yield {"type": "content", "content": remaining}
+                subagent_model = worker_map.get(target, target)
+                subagent_instructions = extract_instructions(parsed_tool.get("arguments_or_instructions", ""))
+                
+                yield {"type": "progress", "text": f"🤖 Delegating subtask to `{target}` ({subagent_model}) [Offload context -> Execute]..."}
+                
+                # Subagents receive independent execution budget (bypass parent limit)
+                subagent_max_loops = 100 if is_autonomy else 15
+                sub_loop = 0
+                subagent_prompt = f"<|turn>system\nYou are a specialized Serenity subagent ({target}). Accomplish the task directly:\n{PYTHON_TOOL_STUBS}\n<turn|>\n<|turn>user\nTask: {subagent_instructions}\n<turn|>\n<|turn>model\n<|channel>thought\n"
+                sub_accumulated = []
+
+                while sub_loop < subagent_max_loops:
+                    sub_chunks = []
+                    sub_tf = StreamingThoughtFilter()
+                    async for sub_chunk in generate_completion_stream(subagent_model, subagent_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
+                        if await http_request.is_disconnected():
+                            break
+                        sub_chunks.append(sub_chunk)
+                        c = sub_tf.feed(sub_chunk)
+                        if c:
+                            for ev in c:
+                                yield ev
                     
-                refined_raw = "".join(refined_parts)
-                final_answer = clean_thought_and_whitespace(refined_raw)
-                log_message(f"[Orchestrator] Refined solution successfully synthesized.")
-            except Exception as e:
-                log_message(f"[Orchestrator Error] Refinement loop failed, falling back to worker draft: {e}")
+                    for ev in sub_tf.flush():
+                        if ev.get("type") == "content":
+                            yield ev
+
+                    sub_raw = "".join(sub_chunks)
+                    sub_accumulated.append(sub_raw)
+
+                    sub_tool = extract_json(sub_raw)
+                    if sub_tool and isinstance(sub_tool, dict) and isinstance(sub_tool.get("target"), str) and sub_tool.get("target") not in ["W1", "W2", "W3", "W4"]:
+                        s_target: str = sub_tool["target"]
+                        s_payload = sub_tool.get("arguments_or_instructions", {})
+                        s_res = dispatch_tool_call(s_target, s_payload, step_num=sub_loop + 1, workspace_dir=request.workspace_dir)
+                        subagent_prompt += f"\n{sub_raw}\n<|turn|>\n<|turn>user\n[Tool Response]\n{s_res['tool_context']}\n<turn|>\n<|turn>model\n<|channel>thought\n"
+                        sub_loop += 1
+                    else:
+                        break
+
+                handoff_report = clean_thought_and_whitespace("".join(sub_accumulated)).strip() or strip_thought_blocks("".join(sub_accumulated)).strip()
+                yield {"type": "progress", "text": f"📥 Subagent `{target}` completed. Loading HandoffReport to Supervisor..."}
+                
+                # Load handoff report back into supervisor context
+                current_prompt += f"\n{raw_output}\n<|turn|>\n<|turn>user\n[HandoffReport from {target}]\n{handoff_report}\n<turn|>\n<|turn>model\n<|channel>thought\n"
+                loop_count += 1
+                continue
+
+            # 2. Tool Calling Pathway
+            elif target:
+                payload = parsed_tool.get("arguments_or_instructions", {})
+                yield {"type": "progress", "text": f"⚙️ Executing tool `{target}`..."}
+                res = dispatch_tool_call(target, payload, step_num=loop_count + 1, workspace_dir=request.workspace_dir)
+                tool_context = res["tool_context"]
+                routing_steps.append({
+                    "step": loop_count + 1,
+                    "tool": target,
+                    "details": res.get("details", ""),
+                    "proof": res.get("proof_tag")
+                })
+                progress_detail = res.get("details", res.get("status", "completed"))
+                yield {"type": "progress", "text": f"✅ Tool `{target}` completed: {progress_detail}"}
+
+                current_prompt += f"\n{raw_output}\n<|turn|>\n<|turn>user\n[System Tool Response]\n{tool_context}\n<|turn|>\n<|turn>model\n<|channel>thought\n"
+                loop_count += 1
+            else:
+                yielded_any = False
+                for content in model_content:
+                    if content:
+                        yield {"type": "content", "content": content}
+                        yielded_any = True
+                if not yielded_any:
+                    fallback_text = clean_thought_and_whitespace(raw_output).strip()
+                    if fallback_text:
+                        yield {"type": "content", "content": fallback_text}
+                    else:
+                        stripped_thought = strip_thought_blocks(raw_output).strip()
+                        yield {"type": "content", "content": stripped_thought or raw_output}
+                break
         else:
-            if not is_programmatic:
-                yield {"type": "content", "content": "\n\n---\n> 🔍 **Review:** `✅ Approved by Supervisor`"}
-
-        # Assemble the report
-        clean_answer = clean_thought_and_whitespace(final_answer)
-
-        # Warm-load/preload supervisor back in background
-        async def run_preload():
-            try:
-                if llama_cpp_available and resolve_gguf_path(supervisor_res):
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, get_llama_model, supervisor_res, CONTEXT_WINDOW)
+            yielded_any = False
+            for content in model_content:
+                if content:
+                    yield {"type": "content", "content": content}
+                    yielded_any = True
+            if not yielded_any:
+                fallback_text = clean_thought_and_whitespace(raw_output).strip()
+                if fallback_text:
+                    yield {"type": "content", "content": fallback_text}
                 else:
-                    if llama_server_process is None or active_llama_server_model_name != supervisor_res:
-                        await start_llama_server(supervisor_res, CONTEXT_WINDOW)
-                    async with httpx.AsyncClient(timeout=20) as client:
-                        await client.post(LLAMA_SERVER_URL, json={"model": supervisor_res, "prompt": "", "stream": False, "keep_alive": -1})
-            except Exception:
-                pass
-        BackgroundTasks().add_task(run_preload)
+                    stripped_thought = strip_thought_blocks(raw_output).strip()
+                    yield {"type": "content", "content": stripped_thought or raw_output}
+            break
 
-        if session_id:
-            sessions_history[session_id].append({
-                "prompt": request.prompt,
-                "answer": clean_answer
-            })
-            if len(sessions_history[session_id]) > MAX_HISTORY_TURNS:
-                sessions_history[session_id].pop(0)
-
-        review_badge = "✅ Approved by Supervisor" if approved else f"❌ Rejected -> Re-routed (Reason: {feedback[:60]}...)"
-
-        yield {
-            "type": "done",
-            "routing": {
-                "supervisor": supervisor_res,
-                "worker": worker_id,
-                "worker_model": worker_model,
-                "reason": reason,
-                "review_badge": review_badge if not is_programmatic else "OK",
-                "steps": agent_steps
-            }
-        }
+    final_text = "".join(accumulated_answer)
+    sessions_history[session_id].append({"prompt": request.prompt, "answer": final_text})
+    yield {"type": "done", "routing": {
+        "worker": mapped_model,
+        "steps": routing_steps,
+        "step_count": loop_count
+    }}
 
 @app.post("/ask_stream")
 async def ask_serenity_stream(request: QueryRequest, http_request: Request):
-    """
-    Hierarchical Supervisor Endpoint with Autonomous Multi-turn Tool-calling loop, returning a stream of chunks.
-    """
-    global server_paused
     if server_paused:
-        raise HTTPException(status_code=503, detail="SerenityDev Server is currently paused. Please resume from the editor status bar or control panel.")
+        raise HTTPException(status_code=503, detail="Server is paused.")
 
     async def event_generator():
-        try:
-            async for event in run_orchestration(request, http_request):
-                if isinstance(event, dict) and event.get("type") == "error":
-                    safe_event = dict(event)
-                    safe_event["detail"] = "An internal error occurred."
-                    yield f"data: {json.dumps(safe_event)}\n\n"
-                else:
-                    yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            log_message(f"[Stream Error] ask_serenity_stream failed: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'detail': 'An internal error occurred.'})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        async for event in run_orchestration(request, http_request):
+            yield f"data: {json.dumps(event)}\n\n"
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 @app.post("/ask")
 async def ask_serenity(request: QueryRequest, http_request: Request):
-    """
-    Hierarchical Supervisor Endpoint with Autonomous Multi-turn Tool-calling loop.
-    """
-    global server_paused
-    if server_paused:
-        raise HTTPException(status_code=503, detail="SerenityDev Server is currently paused. Please resume from the editor status bar or control panel.")
+    answer_parts: List[str] = []
+    routing_info: Dict[str, Any] = {}
+    async for event in run_orchestration(request, http_request):
+        if event.get("type") == "content":
+            answer_parts.append(event.get("content", ""))
+        elif event.get("type") == "done":
+            routing_info = event.get("routing", {})
 
-    answer_parts = []
-    routing_info = {}
-    error_detail = None
-
-    try:
-        async for event in run_orchestration(request, http_request):
-            if event.get("type") == "content":
-                answer_parts.append(event.get("content", ""))
-            elif event.get("type") == "done":
-                routing_info = event.get("routing", {})
-            elif event.get("type") == "error":
-                error_detail = event.get("detail")
-    except Exception as e:
-        error_detail = str(e)
-
-    if error_detail:
-        raise HTTPException(status_code=500, detail=error_detail)
-
-    full_answer = "".join(answer_parts).strip()
-    if not full_answer:
-        if isinstance(routing_info, dict):
-            steps = routing_info.get("steps", [])
-            if steps and isinstance(steps, list):
-                step_summary_lines = []
-                for s in steps:
-                    if isinstance(s, dict):
-                        tool_name = s.get("tool", "tool")
-                        details = s.get("details", "")
-                        step_summary_lines.append(f"- `[{tool_name}]`: {details}")
-                full_answer = f"### Execution Summary\n" + "\n".join(step_summary_lines)
-            else:
-                worker_name = routing_info.get("worker_model") or routing_info.get("worker") or "SerenityDev"
-                full_answer = f"Task completed by {worker_name}."
-        else:
-            full_answer = "Task completed by SerenityDev."
-
-    # Max response length truncation logic for Copilot Chat compatibility
-
-    if len(full_answer) > MAX_RESPONSE_LENGTH:
-        # If too long, try stripping the report header and keeping just the answer
-        # Locate the divider block
-        divider = "\n\n---\n\n"
-        divider_idx = full_answer.find(divider)
-        clean_ans = full_answer[divider_idx + len(divider):] if divider_idx != -1 else full_answer
-        
-        if len(clean_ans) <= MAX_RESPONSE_LENGTH:
-            full_answer = clean_ans
-            log_message(f"[Orchestrator] Header stripped to fit Copilot Chat limit. Answer {len(clean_ans)} chars.")
-        else:
-            truncated_answer = clean_ans[:MAX_RESPONSE_LENGTH]
-            last_newline = truncated_answer.rfind('\n')
-            if last_newline > MAX_RESPONSE_LENGTH * 0.75:
-                truncated_answer = truncated_answer[:last_newline]
-            full_answer = truncated_answer + "\n\n*[Truncated for Copilot Chat. Full response in server logs.]*"
-            log_message(f"[Orchestrator] Response truncated to {len(full_answer)} characters for Copilot Chat compatibility.")
-
-    return {
-        "answer": full_answer,
-        "routing": routing_info
-    }
+    return {"answer": "".join(answer_parts), "routing": routing_info}
 
 @app.post("/fim")
 async def autocomplete_fim(request: FimRequest):
@@ -4969,8 +4635,9 @@ async def autocomplete_fim(request: FimRequest):
         if autoswap_timer_task and not autoswap_timer_task.done():
             autoswap_timer_task.cancel()
 
-        resolved_fim_model = await resolve_model(request.model) 
-        fim_prompt = f"<pre>{request.prefix}<suf>{request.suffix}<mid>"
+        resolved_fim_model = await resolve_model(request.model or FIM_MODEL)
+        prefix, suffix = fit_fim_context(request.prefix, request.suffix)
+        fim_prompt = f"<pre>{prefix}<suf>{suffix}<mid>"
 
         res = await generate_completion(
             model_name=resolved_fim_model,
@@ -5013,20 +4680,20 @@ async def resume_server():
 async def unload_models_endpoint():
     """Explicitly unloads active llama-server and direct llama-cpp-python models to immediately free VRAM."""
     log_message("[Control] Unload models command received. Clearing VRAM...")
-    unload_llama_server()
-    unload_llama_model()
+    unload_all_models()
     return {"status": "unloaded", "message": "Active model offloaded. VRAM freed successfully."}
 
 # --- Config Management ---
 
 class ConfigUpdate(BaseModel):
-    model_consolidation: Optional[bool] = None
     current_model: Optional[str] = None
     cache_type_k: Optional[str] = None
     cache_type_v: Optional[str] = None
     context_window: Optional[int] = None
     gpu_layers: Optional[int] = None
     auto_continue: Optional[bool] = None
+    reasoning_strength: Optional[str] = None
+    limit_tier: Optional[str] = None
     custom_models_dir: Optional[str] = None
     custom_models_dirs: Optional[List[str]] = None
     roles: Optional[Dict[str, str]] = None
@@ -5044,7 +4711,6 @@ class ConfigUpdate(BaseModel):
 async def get_config():
     installed = get_installed_models()
     return {
-        "model_consolidation": model_consolidation,
         "current_model": CURRENT_MODEL,
         "supervisor_model": SUPERVISOR_MODEL,
         "supervisor_low_model": SUPERVISOR_LOW_MODEL,
@@ -5056,6 +4722,8 @@ async def get_config():
         "w4_model": W4_MODEL,
         "fim_model": FIM_MODEL,
         "auto_continue": auto_continue_enabled,
+        "reasoning_strength": reasoning_strength,
+        "limit_tier": limit_tier,
         "roles": {
             "supervisor_low": SUPERVISOR_LOW_MODEL,
             "supervisor_high": SUPERVISOR_HIGH_MODEL,
@@ -5076,8 +4744,9 @@ async def get_config():
 
 @app.post("/api/config")
 async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks):
-    global model_consolidation, CURRENT_MODEL, cache_type_k, cache_type_v, CONTEXT_WINDOW, gpu_layers_override, auto_continue_enabled
+    global CURRENT_MODEL, cache_type_k, cache_type_v, CONTEXT_WINDOW, gpu_layers_override, auto_continue_enabled
     global SUPERVISOR_LOW_MODEL, SUPERVISOR_HIGH_MODEL, ORCHESTRATOR_TURBO_MODEL, SUPERVISOR_MODEL, W1_MODEL, W2_MODEL, W3_MODEL, W4_MODEL, FIM_MODEL
+    global reasoning_strength, limit_tier
     
     if config.custom_models_dir is not None:
         if add_custom_model_dir(config.custom_models_dir):
@@ -5088,12 +4757,21 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
         for d in config.custom_models_dirs:
             add_custom_model_dir(d)
         log_message(f"[Config] Updated custom model folders: {config.custom_models_dirs}")
-    if config.model_consolidation is not None:
-        model_consolidation = config.model_consolidation
-        log_message(f"[Config] Model consolidation set to: {model_consolidation}")
     if config.auto_continue is not None:
         auto_continue_enabled = config.auto_continue
-        log_message(f"[Config] Auto-continue unlimited iteration set to: {auto_continue_enabled}")
+        log_message(f"[Config] Auto-continue set to: {auto_continue_enabled}")
+    if config.reasoning_strength is not None:
+        rs = config.reasoning_strength.lower().strip()
+        if rs in ["low", "medium", "high", "xhigh"]:
+            reasoning_strength = rs
+            log_message(f"[Config] Reasoning strength set to: {reasoning_strength}")
+    if config.limit_tier is not None:
+        lt = config.limit_tier.lower().strip()
+        if lt in ["default", "low", "medium", "high", "autonomy"]:
+            limit_tier = lt
+            if limit_tier == "autonomy":
+                auto_continue_enabled = True
+            log_message(f"[Config] Limit tier set to: {limit_tier} (auto_continue={auto_continue_enabled})")
     if config.cache_type_k is not None:
         cache_type_k = config.cache_type_k
         log_message(f"[Config] Key cache type (K) set to: {cache_type_k}")
@@ -5119,7 +4797,6 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
                 SUPERVISOR_HIGH_MODEL = model_v
             elif r_k in ["orchestrator_turbo", "turbo", "orchestrator"]:
                 ORCHESTRATOR_TURBO_MODEL = model_v
-                SUPERVISOR_MODEL = model_v
             elif r_k in ["w1_reasoning", "w1", "reasoning"]:
                 W1_MODEL = model_v
             elif r_k in ["w2_code", "w2", "code"]:
@@ -5138,7 +4815,6 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
         SUPERVISOR_HIGH_MODEL = config.supervisor_high_model
     if config.orchestrator_turbo_model is not None:
         ORCHESTRATOR_TURBO_MODEL = config.orchestrator_turbo_model
-        SUPERVISOR_MODEL = config.orchestrator_turbo_model
     if config.supervisor_model is not None:
         SUPERVISOR_MODEL = config.supervisor_model
     if config.w1_model is not None:
@@ -5163,19 +4839,19 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
         resolved = await resolve_model(config.current_model if config.current_model is not None else CURRENT_MODEL)
         if config.current_model is not None:
             CURRENT_MODEL = resolved
-            log_message(f"[Config] Current consolidated model set to: {CURRENT_MODEL}")
+            log_message(f"[Config] Current active model set to: {CURRENT_MODEL}")
         
-        # Warm-load/preload the consolidated model in background to apply cache and context settings
+        # Warm-load/preload the model in background to apply cache and context settings
         async def run_preload():
             async with inference_lock:
                 log_message(f"[Config] Warm-loading model '{resolved}' (ctx={CONTEXT_WINDOW}, gpu_layers={gpu_layers_override}, K={cache_type_k}, V={cache_type_v})...")
                 try:
                     if llama_cpp_available and resolve_gguf_path(resolved):
                         loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW)
+                        await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW, needs_reload)
                     else:
                         if llama_server_process is None or active_llama_server_model_name != resolved or needs_reload:
-                            await start_llama_server(resolved, CONTEXT_WINDOW)
+                            await start_llama_server(resolved, CONTEXT_WINDOW, force_reload=needs_reload)
                         payload = {"model": resolved, "prompt": "", "stream": False, "keep_alive": -1}
                         async with httpx.AsyncClient(timeout=25) as client:
                             await client.post(LLAMA_SERVER_URL, json=payload)
@@ -5189,9 +4865,10 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
         
     return {
         "status": "success",
-        "model_consolidation": model_consolidation,
         "current_model": CURRENT_MODEL,
         "auto_continue": auto_continue_enabled,
+        "reasoning_strength": reasoning_strength,
+        "limit_tier": limit_tier,
         "roles": {
             "supervisor_low": SUPERVISOR_LOW_MODEL,
             "supervisor_high": SUPERVISOR_HIGH_MODEL,
@@ -5208,35 +4885,67 @@ async def update_config(config: ConfigUpdate, background_tasks: BackgroundTasks)
         "gpu_layers": gpu_layers_override
     }
 
+# --- Long-Term Memory API Endpoints ---
+
+class MemoryStoreRequest(BaseModel):
+    key: str
+    category: Optional[str] = "general"
+    content: str
+
+@app.get("/api/memory")
+async def get_all_memories(category: Optional[str] = None):
+    """Returns all stored long-term memories with optional category filtering."""
+    memories = LongTermMemoryManager.query("", category)
+    return {
+        "memories": memories,
+        "count": len(memories)
+    }
+
+@app.post("/api/memory")
+async def store_memory_endpoint(req: MemoryStoreRequest):
+    """Stores or updates a long-term memory entry."""
+    entry = LongTermMemoryManager.store(req.key, req.category or "general", req.content, source="user")
+    return {"status": "stored", "memory": entry}
+
+@app.delete("/api/memory/{key}")
+async def delete_memory_endpoint(key: str):
+    """Deletes a specific long-term memory entry by key."""
+    success = LongTermMemoryManager.delete(key)
+    return {"status": "deleted" if success else "not_found", "key": key}
+
+@app.delete("/api/memory")
+async def purge_all_memories_endpoint():
+    """Purges the entire long-term memory database."""
+    count = LongTermMemoryManager.purge_all()
+    return {"status": "purged", "purged_count": count}
+
+@app.delete("/api/session/clear")
+@app.post("/api/session/clear")
+async def clear_all_sessions():
+    """Purges ephemeral current session memories across all sessions."""
+    global sessions_history
+    sessions_history.clear()
+    log_message("[Session] Purged all ephemeral session memories.")
+    return {"status": "cleared", "message": "All session memories purged."}
+
 class RevertEditRequest(BaseModel):
     backup_id: str
 
 @app.post("/api/edit/revert")
 async def revert_file_edit(req: RevertEditRequest):
-    b_id = req.backup_id
-    if b_id not in file_edit_backups:
-        raise HTTPException(status_code=404, detail="Backup ID not found or edit already processed.")
-    backup = file_edit_backups.pop(b_id)
-    file_path = backup["file_path"]
-    old_content = backup["content"]
-    try:
-        if old_content == "" and os.path.exists(file_path):
-            os.remove(file_path)
-        else:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(old_content)
-        log_message(f"[Edit Revert] Reverted '{file_path}' to pre-edit state.")
-        return {"status": "reverted", "file": file_path, "backup_id": b_id}
-    except Exception as e:
-        log_message(f"[Edit Revert Error] Failed to revert '{file_path}': {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to revert file: {e}")
+    if req.backup_id not in file_edit_backups:
+        raise HTTPException(status_code=404, detail="Backup ID not found.")
+    b = file_edit_backups.pop(req.backup_id)
+    with open(b["file_path"], "w", encoding="utf-8") as f:
+        f.write(b["content"])
+    log_message(f"[Revert] File '{b['file_path']}' reverted successfully.")
+    return {"status": "reverted", "backup_id": req.backup_id}
 
 @app.post("/api/edit/keep")
 async def keep_file_edit(req: RevertEditRequest):
-    b_id = req.backup_id
-    if b_id in file_edit_backups:
-        file_edit_backups.pop(b_id)
-    return {"status": "kept", "backup_id": b_id}
+    if req.backup_id not in file_edit_backups:
+        file_edit_backups.pop(req.backup_id)
+    return {"status": "kept", "backup_id": req.backup_id}
 
 # --- Web UI & Dashboard Endpoints ---
 
@@ -5245,20 +4954,23 @@ cached_gpu_memory = None
 
 def query_nvidia_smi_sync():
     global cached_gpu_memory
-    if pynvml_available:
-        try:
-            device_count = nvmlDeviceGetCount()
-            if device_count > 0:
-                handle = nvmlDeviceGetHandleByIndex(0)
-                mem_info = nvmlDeviceGetMemoryInfo(handle)
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            import pynvml # type: ignore
+            pynvml.nvmlInit()
+            if pynvml.nvmlDeviceGetCount() > 0:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
                 cached_gpu_memory = {
-                    "used": round(mem_info.used / (1024.0 * 1024.0 * 1024.0), 2),
-                    "total": round(mem_info.total / (1024.0 * 1024.0 * 1024.0), 2),
+                    "used": round(int(mem_info.used) / (1024.0 * 1024.0 * 1024.0), 2),
+                    "total": round(int(mem_info.total) / (1024.0 * 1024.0 * 1024.0), 2),
                     "unit": "GiB"
                 }
                 return cached_gpu_memory
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     try:
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -5270,7 +4982,7 @@ def query_nvidia_smi_sync():
             parts = res.stdout.strip().split(",")
             if len(parts) == 2:
                 cached_gpu_memory = {
-                    "used": round(float(parts[0].strip()) / 1024.0, 2), # convert MiB to GiB
+                    "used": round(float(parts[0].strip()) / 1024.0, 2), 
                     "total": round(float(parts[1].strip()) / 1024.0, 2),
                     "unit": "GiB"
                 }
@@ -5281,12 +4993,10 @@ def query_nvidia_smi_sync():
 
 @app.get("/api/status")
 async def get_status():
-    """Returns real-time status of the orchestrator, installed models, and GPU memory metrics."""
     installed = get_installed_models()
     loaded_vram = []
     if llama_server_process is not None and llama_server_process.poll() is None:
         try:
-            # Assuming llama-server provides /v1/models
             async with httpx.AsyncClient(timeout=1.5) as client:
                 res = await client.get(f"{LLAMA_SERVER_BASE}/v1/models")
                 if res.status_code == 200:
@@ -5294,16 +5004,35 @@ async def get_status():
         except Exception:
             pass
 
-    # Windows non-blocking GPU memory parser with cached fallback
+    gpu_memory = None
     try:
-        gpu_memory = await asyncio.wait_for(asyncio.to_thread(query_nvidia_smi_sync), timeout=1.5)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=FutureWarning)
+            import pynvml
+            pynvml.nvmlInit()
+            if pynvml.nvmlDeviceGetCount() > 0:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                gpu_memory = {
+                    "used": round(int(mem_info.used) / (1024.0 * 1024.0 * 1024.0), 2),
+                    "total": round(int(mem_info.total) / (1024.0 * 1024.0 * 1024.0), 2),
+                    "unit": "GiB"
+                }
     except Exception:
+        pass
+
+    if gpu_memory is None:
         gpu_memory = cached_gpu_memory
 
     targets = [
-        {"name": SUPERVISOR_MODEL, "gguf": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf", "dir": None},
-        {"name": W3_MODEL, "gguf": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "dir": None},
+        {"name": ORCHESTRATOR_TURBO_MODEL, "gguf": "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf", "dir": None},
+        {"name": SUPERVISOR_HIGH_MODEL, "gguf": "gemma-4-26B_q4_0-it.gguf", "dir": None},
+        {"name": SUPERVISOR_LOW_MODEL, "gguf": "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", "dir": None},
+        {"name": W1_MODEL, "gguf": "Qwen3.8-27B-UD-Q4_K_XL.gguf", "dir": None},
         {"name": W2_MODEL, "gguf": "codegemma-7b-it-f16.gguf", "dir": None},
+        {"name": W3_MODEL, "gguf": "gemma-4-E4B-it-Coder.Q4_K_M.gguf", "dir": None},
+        {"name": W4_MODEL, "gguf": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf", "dir": None},
         {"name": FIM_MODEL, "gguf": "codegemma-2b-f16.gguf", "dir": None}
     ]
 
@@ -5311,10 +5040,11 @@ async def get_status():
     for t in targets:
         name = t["name"]
         registered = any(m.startswith(name) or name.startswith(m) for m in installed)
-        
+
         source_present = False
         source_type = "Missing"
-        if t["gguf"] and os.path.exists(t["gguf"]):
+        resolved_path = resolve_gguf_path(name)
+        if resolved_path and os.path.exists(resolved_path):
             source_present = True
             source_type = "GGUF File"
         elif t["dir"] and os.path.exists(t["dir"]):
@@ -5336,10 +5066,15 @@ async def get_status():
         "registry": registry_status,
         "logs": orchestrator_logs[-50:],
         "gpu_memory": gpu_memory,
-        "model_consolidation": model_consolidation,
         "current_model": CURRENT_MODEL,
         "cache_type_k": cache_type_k,
-        "cache_type_v": cache_type_v
+        "cache_type_v": cache_type_v,
+        "context_window": CONTEXT_WINDOW,
+        "gpu_layers": gpu_layers_override,
+        "auto_continue": auto_continue_enabled,
+        "reasoning_strength": reasoning_strength,
+        "limit_tier": limit_tier,
+        "memory_count": len(LongTermMemoryManager._load_data())
     }
 
 @app.post("/api/register")
@@ -5502,24 +5237,16 @@ async def serve_dashboard():
                 <div class="flex flex-wrap items-center justify-between gap-4 mb-4">
                     <div>
                         <h2 class="text-sm font-bold font-mono tracking-wider text-purple-300 uppercase">Routing & Model Configuration</h2>
-                        <p class="text-xs text-slate-400">Manage VRAM consolidation and pre-swapping controls dynamically</p>
-                    </div>
-                    
-                    <div class="flex items-center gap-3">
-                        <span class="text-xs text-slate-400 font-mono">Model Consolidation</span>
-                        <label class="relative inline-flex items-center cursor-pointer">
-                            <input type="checkbox" id="consolidationToggle" onchange="toggleConsolidation()" class="sr-only peer">
-                            <div class="w-11 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-400 after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-purple-600 peer-checked:after:bg-cyan-300"></div>
-                        </label>
+                        <p class="text-xs text-slate-400">Manage active inference engine and dynamic VRAM caching</p>
                     </div>
                 </div>
 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-white/5">
                     <div>
-                        <label class="block text-xs font-mono text-slate-400 mb-1.5">Consolidated Active Model</label>
-                        <select id="consolidatedModelSelect" onchange="updateConsolidatedModel()" class="w-full bg-slate-950/80 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-purple-500">
+                        <label class="block text-xs font-mono text-slate-400 mb-1.5">Active Target Model</label>
+                        <select id="activeModelSelect" onchange="updateActiveModel()" class="w-full bg-slate-950/80 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-purple-500">
+                            <option value="gemma-4-E4B-it-Coder.Q4_K_M">Gemma-4 (E4B-it-Coder) [Active Coder]</option>
                             <option value="gemma-4-26B-A4B">Gemma-4 (26B-A4B) [Supervisor / W1]</option>
-                            <option value="qwen3.6-35B-A3B">Qwen-3.6 (35B-A3B) [W3 Tier]</option>
                             <option value="codegemma-7b-it">CodeGemma (7B-it) [W2 Synthesizer]</option>
                         </select>
                     </div>
@@ -5737,8 +5464,9 @@ async def serve_dashboard():
                 } else {
                     // Fallback to active loaded VRAM sum
                     let activeVramGb = 0;
-                    if (data.loaded_vram && data.loaded_vram.length > 0) {
-                        data.loaded_vram.forEach(m => {
+                    const loadedVram = Array.isArray(data.loaded_vram) ? data.loaded_vram : [];
+                    if (loadedVram.length > 0) {
+                        loadedVram.forEach(m => {
                             activeVramGb += (m.size_vram / 1024 / 1024 / 1024);
                         });
                     }
@@ -5764,11 +5492,12 @@ async def serve_dashboard():
                     lockSub.textContent = "Ready for immediate pipeline execution.";
                 }
 
-                // 3. Consolidated UI Switch Sync (prevent infinite triggers)
+                // 3. Model & Cache UI Switch Sync (prevent infinite triggers)
                 if (!isConsolidationUpdating) {
-                    document.getElementById("consolidationToggle").checked = data.model_consolidation;
-                    document.getElementById("consolidatedModelSelect").value = data.current_model;
-                    document.getElementById("consolidatedModelSelect").disabled = !data.model_consolidation;
+                    const modelSel = document.getElementById("activeModelSelect");
+                    if (modelSel && data.current_model) {
+                        modelSel.value = data.current_model;
+                    }
                     
                     if (data.cache_type_k) {
                         document.getElementById("cacheTypeKSelect").value = data.cache_type_k;
@@ -5953,6 +5682,7 @@ async def serve_dashboard():
             const chatLog = document.getElementById("chatLog");
             const bubble = document.createElement("div");
             bubble.className = "flex gap-3";
+            const messageText = typeof text === "string" ? text : "No response was returned by the model.";
             
             const isUser = (sender === "User");
             const avatar = isUser ? "👤" : "🤖";
@@ -5960,12 +5690,13 @@ async def serve_dashboard():
             const nameColor = isUser ? "text-cyan-400" : "text-purple-300";
 
             let routingBox = "";
-            if (routing) {
-                const stepCount = routing.steps ? routing.steps.length : 0;
+            if (routing && typeof routing === "object") {
+                const steps = Array.isArray(routing.steps) ? routing.steps : [];
+                const stepCount = steps.length;
                 let stepDetails = "";
-                if (routing.steps && routing.steps.length > 0) {
+                if (steps.length > 0) {
                     stepDetails = `<div class="mt-2 pl-4 border-l border-white/5 space-y-1 text-[10px] font-mono text-slate-400">`;
-                    routing.steps.forEach(s => {
+                    steps.forEach(s => {
                         stepDetails += `<div>🛠️ Step ${s.step}: <code>${s.tool}</code> ➡️ <em>${s.details}</em></div>`;
                     });
                     stepDetails += `</div>`;
@@ -5977,15 +5708,15 @@ async def serve_dashboard():
                             <span>🗺️ System Routing Details</span>
                             <span class="text-[9px] text-cyan-400">${routing.review_badge}</span>
                         </div>
-                        <div>Target Worker: <span class="text-cyan-400 font-semibold">${routing.worker}</span> (${routing.worker_model.split(':')[0]})</div>
-                        <div>Reasoning: <span class="italic">"${routing.reason}"</span></div>
+                        <div>Target Worker: <span class="text-cyan-400 font-semibold">${routing.worker || "unknown"}</span> (${typeof routing.worker_model === "string" ? routing.worker_model.split(':')[0] : "unknown"})</div>
+                        <div>Reasoning: <span class="italic">"${routing.reason || "No routing explanation was returned."}"</span></div>
                         ${stepDetails}
                     </div>
                 `;
             }
 
             // HTML content with basic markdown rendering for premium markdown answers
-            const formattedText = marked.parse ? marked.parse(text) : text.replace(/\n/g, "<br/>");
+            const formattedText = marked.parse ? marked.parse(messageText) : messageText.replace(/\n/g, "<br/>");
 
             bubble.innerHTML = `
                 <div class="w-8 h-8 rounded-lg ${isUser ? 'bg-cyan-600' : 'bg-purple-600'} flex items-center justify-center text-xs font-bold shrink-0">${avatar}</div>
@@ -6005,27 +5736,10 @@ async def serve_dashboard():
             }
         }
 
-        // Toggle Consolidation Setting API
-        async function toggleConsolidation() {
+        // Update Active Model API
+        async function updateActiveModel() {
             isConsolidationUpdating = true;
-            const toggleVal = document.getElementById("consolidationToggle").checked;
-            const activeSel = document.getElementById("consolidatedModelSelect");
-            activeSel.disabled = !toggleVal;
-            
-            try {
-                await fetch("/api/config", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ model_consolidation: toggleVal })
-                });
-            } catch (err) {}
-            isConsolidationUpdating = false;
-        }
-
-        // Update Consolidated model API
-        async function updateConsolidatedModel() {
-            isConsolidationUpdating = true;
-            const selectVal = document.getElementById("consolidatedModelSelect").value;
+            const selectVal = document.getElementById("activeModelSelect").value;
             try {
                 await fetch("/api/config", {
                     method: "POST",
@@ -6099,23 +5813,15 @@ async def serve_dashboard():
 def free_port(port: int = 8002):
     """Checks if the target port is occupied on Windows or Linux/macOS and terminates stale occupying processes to prevent WinError 10048."""
     print(f"[Port Initializer] Scanning port {port}...")
-    # First check if the port is already actively responding to SerenityDev /api/status
-    try:
-        import urllib.request
-        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/status", headers={"User-Agent": "SerenityDev-Port-Check"})
-        with urllib.request.urlopen(req, timeout=1.0) as resp:
-            if resp.status == 200:
-                print(f"[Port Initializer] Port {port} is already actively serving SerenityDev. Skipping termination.")
-                return
-    except Exception:
-        pass
 
     if os.name == 'nt':  # Windows
         try:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             cmd = f"netstat -ano | findstr LISTENING | findstr :{port}"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, creationflags=flags)
             if res.returncode == 0 and res.stdout:
                 lines = res.stdout.strip().split('\n')
+                killed_any = False
                 for line in lines:
                     parts = line.strip().split()
                     if len(parts) >= 5:
@@ -6123,9 +5829,12 @@ def free_port(port: int = 8002):
                             pid = int(parts[-1])
                             if pid != os.getpid() and pid > 0:
                                 print(f"[Port Initializer] Port {port} is occupied by PID {pid}. Terminating stale process...")
-                                subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
+                                subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True, creationflags=flags)
+                                killed_any = True
                         except Exception:
                             pass
+                if killed_any:
+                    time.sleep(1.0)
         except Exception as e:
             print(f"[Port Initializer] Failed to free port on Windows: {e}")
     else:  # Linux / macOS
@@ -6147,12 +5856,11 @@ def free_port(port: int = 8002):
 
 class RestartRequest(BaseModel):
     model: Optional[str] = None
-    model_consolidation: Optional[bool] = None
 
 @app.post("/api/restart")
 async def restart_server(background_tasks: BackgroundTasks, request: Optional[RestartRequest] = None):
-    """Soft reset: clears logs and resets internal counters. Optionally changes consolidated model."""
-    global orchestrator_logs, independenttask_count, CURRENT_MODEL, model_consolidation, sessions_history
+    """Soft reset: clears logs and resets internal counters. Optionally changes active model."""
+    global orchestrator_logs, independenttask_count, CURRENT_MODEL, sessions_history
     log_message("[Server] Soft restart initiated. Clearing state...")
     orchestrator_logs = []
     independenttask_count = 0
@@ -6172,13 +5880,12 @@ async def restart_server(background_tasks: BackgroundTasks, request: Optional[Re
             log_message(f"[Server] Error unloading Llama-Server models: {e}")
             
     await loop.run_in_executor(None, unload_all_models)
-    unload_llama_model()
     
     if request:
         if request.model is not None:
             resolved = await resolve_model(request.model)
             CURRENT_MODEL = resolved
-            log_message(f"[Server] Active consolidated model changed to: {resolved}")
+            log_message(f"[Server] Active model changed to: {resolved}")
             if background_tasks:
                 async def run_preload():
                     async with inference_lock:
@@ -6186,7 +5893,7 @@ async def restart_server(background_tasks: BackgroundTasks, request: Optional[Re
                         try:
                             if llama_cpp_available and resolve_gguf_path(resolved):
                                 loop = asyncio.get_event_loop()
-                                await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW)
+                                await loop.run_in_executor(None, get_llama_model, resolved, CONTEXT_WINDOW, True)
                             else:
                                 if llama_server_process is None or active_llama_server_model_name != resolved:
                                     await start_llama_server(resolved, CONTEXT_WINDOW)
@@ -6196,15 +5903,11 @@ async def restart_server(background_tasks: BackgroundTasks, request: Optional[Re
                         except Exception as e:
                             log_message(f"[Server Preload] Preload failed for '{resolved}': {e}")
                 background_tasks.add_task(run_preload)
-        if request.model_consolidation is not None:
-            model_consolidation = request.model_consolidation
-            log_message(f"[Server] Model consolidation set to: {model_consolidation}")
 
     log_message("[Server] State reset complete. Ready for new requests.")
     return {
         "status": "soft reset complete",
-        "current_model": CURRENT_MODEL,
-        "model_consolidation": model_consolidation
+        "current_model": CURRENT_MODEL
     }
 
 @app.post("/api/clear_logs")
@@ -6231,128 +5934,7 @@ async def get_session_status():
     """Returns security health, multi-factor hardware binding state, rotation epoch, and downtime timer metrics."""
     return JSONResponse(content=SessionRotationManager.get_status())
 
-def verify_mcp_auth(request: Request, optional: bool = False):
-    """Verifies PQC Bearer token if ENFORCE_MCP_AUTH is enabled."""
-    if os.environ.get("ENFORCE_MCP_AUTH", "false").lower() == "true":
-        expected_token = os.environ.get("SERENITY_MCP_TOKEN")
-        if not expected_token:
-            expected_token = SerenityKeyVault.get_machine_entropy().hex()[:32]
-        
-        auth_header = request.headers.get("Authorization", "").strip()
-        bearer_header = request.headers.get("Bearer", "").strip()
-        token_param = request.query_params.get("token", "").strip()
-        
-        provided_token = ""
-        if auth_header.startswith("Bearer "):
-            provided_token = auth_header[7:].strip()
-        elif auth_header:
-            provided_token = auth_header
-        elif bearer_header:
-            provided_token = bearer_header
-        elif token_param:
-            provided_token = token_param
-            
-        if not provided_token and optional:
-            return
 
-        if not provided_token or not hmac.compare_digest(provided_token, expected_token):
-            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing MCP Bearer Token")
-
-@app.get("/mcp")
-async def mcp_get_handler(request: Request):
-    """MCP handshake / GET endpoint for Edge Gallery initialization & SSE."""
-    verify_mcp_auth(request, optional=True)
-    return JSONResponse(content={
-        "status": "online",
-        "server": "SerenityDev PQC MCP Server",
-        "version": "1.0.0",
-        "protocolVersion": "2024-11-05",
-        "capabilities": {"tools": {}, "prompts": {}, "resources": {}}
-    })
-
-@app.post("/mcp")
-async def mcp_post_handler(request: Request):
-    """Streamable HTTP MCP JSON-RPC 2.0 endpoint for Google AI Edge Gallery."""
-    verify_mcp_auth(request)
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    req_id = body.get("id")
-    method = body.get("method")
-    params = body.get("params", {})
-
-    if method == "initialize":
-        return JSONResponse(content={
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {},
-                    "prompts": {},
-                    "resources": {}
-                },
-                "serverInfo": {
-                    "name": "SerenityDev MCP Server",
-                    "version": "1.0.0"
-                }
-            }
-        })
-    elif method in ["notifications/initialized", "initialized"]:
-        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
-    elif method == "ping":
-        return JSONResponse(content={"jsonrpc": "2.0", "id": req_id, "result": {}})
-    elif method == "tools/list":
-        return JSONResponse(content={
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "tools": [
-                    {
-                        "name": "serenity_generate",
-                        "description": "Generate completion or run code via SerenityDev Orchestrator",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "prompt": {"type": "string", "description": "User prompt or command"}
-                            },
-                            "required": ["prompt"]
-                        }
-                    }
-                ]
-            }
-        })
-    elif method == "tools/call":
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-        if tool_name == "serenity_generate":
-            prompt = arguments.get("prompt", "")
-            return JSONResponse(content={
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"SerenityDev Orchestrator processed: {prompt[:100]}"
-                        }
-                    ]
-                }
-            })
-        else:
-            return JSONResponse(content={
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32601, "message": f"Tool '{tool_name}' not found"}
-            })
-
-    return JSONResponse(content={
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {}
-    })
 
 @app.post("/shutdown")
 async def shutdown():
@@ -6374,5 +5956,5 @@ if __name__ == "__main__":
     logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
     load_server_config()
     free_port(8002)
-    print("[Server] Starting SerenityDev Orchestrator...")
-    uvicorn.run("serenitydevserver:app", host="127.0.0.1", port=8002, reload=False)
+    print("[DevServer] Startng SerenityDev...")
+    uvicorn.run(app, host="127.0.0.1", port=8002, reload=False)
