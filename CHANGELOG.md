@@ -1,7 +1,6 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
-- **Repository Sanitization & Complete Git History Purge**: Wiped all tracked build artifacts (`out/`, `dist/`, `*.vsix`), JetBrains IDE metadata (`.idea/`), cache directories (`.pytest_cache/`, `System/`), and unneeded text scratch files (`chat templates.txt`, `gemma-4 locally run.txt`) across current tracking and the entire Git history using `git-filter-repo`. Updated `.gitignore` with comprehensive exclusions to prevent re-tracking.
 - **Direct Model GPU Offload & GGML Split Inputs Fix**: Resolved `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` crash during hybrid CPU/GPU layer offload in `get_llama_model()` by conditionally setting `flash_attn` to match `offload_kqv`. Enabled active in-memory model loading and inference execution directly utilizing VRAM (4.62 / 6.0 GiB active).
 - **Online/Offline Server Toggle & Process Lifecycle Control**: Added `serenity.stopServer` and `serenity.toggleServer` commands with clean child process termination. Upgraded the SerenityDev webview status badge so clicking while online stops the server and clicking while offline starts it, with hover state and click feedback.
 - **Active Model Dispatch & Config Corruption Fix**: Fixed `load_server_config()` and `update_config()` in `serenitydevserver.py` where `SUPERVISOR_MODEL` was inadvertently overwritten by `roles["orchestrator_turbo"]` (Nemotron). Updated `run_orchestration()` to respect `request.model` and fall back to `CURRENT_MODEL` before `SUPERVISOR_MODEL`. Updated webview `sendQuery` to pass the user's actively selected model directly in the query payload.
@@ -91,7 +90,7 @@ All notable changes to the "SerenityDev" extension will be documented in this fi
 
 ## Version 1.5.8
 - Restored CUDA acceleration and VRAM offloading in local Python environment (`.venv`): deployed CUDA-compiled `llama_cpp_python` binaries with `ggml-cuda.dll`, enabled dynamic GPU layer allocation and Flash Attention on NVIDIA GeForce RTX 3050. [Done]
-- Integrated `nvidia-ml-py` in [requirements.txt](file:///c:/Users/ccrg6/SerenityDev/requirements.txt) for direct NVML VRAM hardware metrics queries. [Done]
+- Integrated `nvidia-ml-py` in [requirements.txt](requirements.txt) for direct NVML VRAM hardware metrics queries. [Done]
 
 ## Version 1.5.7
 - Added Windows 11 CIM/PowerShell fallback to `SerenityKeyVault.get_machine_entropy()` in `serenitydevserver.py` and `seal_secrets.py` for environments where `wmic` is deprecated or uninstalled. [Done]
