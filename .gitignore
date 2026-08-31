@@ -9,13 +9,18 @@ venv/
 
 # Build & Test output
 out/
+dist/
 .vscode-test/
 .serenity_cache/
+.pytest_cache/
 
 # Data & Models
 models/
 scratch/
+System/
 Edge Gallery/
+chat templates.txt
+gemma-4 locally run.txt
 
 # Environment & Logs
 *.env
@@ -33,7 +38,8 @@ cert.key
 # Build Artifacts
 *.vsix
 
-# Local Config
+# Local Config & IDE
+.idea/
 models_dirs.json
 serenity_config.json
 
