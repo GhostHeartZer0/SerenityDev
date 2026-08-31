@@ -40,6 +40,7 @@ cert.key
 
 # Local Config & IDE
 .idea/
+models.json
 models_dirs.json
 serenity_config.json
 

@@ -780,7 +780,8 @@ async def start_llama_server(model_name: str, n_ctx: int, force_reload: bool = F
     if not llama_bin:
         for p in [
             r"C:\Program Files\Android\Android Studio\plugins\gemini\resources\llamacpp\llama-server.exe",
-            r"C:\Users\ccrg6\Desktop\Desktop\Hub\SerenityPC\temp_zip\llama-server.exe"
+            os.path.expanduser(r"~\Desktop\Desktop\Hub\SerenityPC\temp_zip\llama-server.exe"),
+            os.path.expanduser(r"~\llama-server.exe")
         ]:
             if os.path.exists(p):
                 llama_bin = p

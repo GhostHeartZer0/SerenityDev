@@ -20,12 +20,19 @@ class TestMCPLogic(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         LongTermMemoryManager.purge_all()
+        self.workspace_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.orig_workspace_dir = os.environ.get("SERENITY_WORKSPACE_DIR")
+        os.environ["SERENITY_WORKSPACE_DIR"] = self.workspace_dir
         # Reset environment auth/https flags to defaults
         os.environ["ENFORCE_MCP_AUTH"] = "false"
         os.environ["ENFORCE_MCP_HTTPS"] = "false"
 
     def tearDown(self):
         LongTermMemoryManager.purge_all()
+        if self.orig_workspace_dir is not None:
+            os.environ["SERENITY_WORKSPACE_DIR"] = self.orig_workspace_dir
+        else:
+            os.environ.pop("SERENITY_WORKSPACE_DIR", None)
         os.environ["ENFORCE_MCP_AUTH"] = "false"
         os.environ["ENFORCE_MCP_HTTPS"] = "false"
 

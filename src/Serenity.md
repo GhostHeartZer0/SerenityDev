@@ -6,7 +6,7 @@
 
 ## 1. Core Operating Principles & Rules
 
-> 📌 **Systemic Agent Rules**: Active agent execution constraints (Sacred Rules, The Caveman Principle, Ponytail Laziness Ladder, and Quality Guarantees) are maintained in [.agents/AGENTS.md](file:///c:/Users/ccrg6/SerenityDev/.agents/AGENTS.md) and automatically enforced by the IDE framework.
+> 📌 **Systemic Agent Rules**: Active agent execution constraints (Sacred Rules, The Caveman Principle, Ponytail Laziness Ladder, and Quality Guarantees) are maintained in [.agents/AGENTS.md](../.agents/AGENTS.md) and automatically enforced by the IDE framework.
 
 ### VRAM & RAM Memory Constraint Workaround
 - When running tests with heavy VRAM/RAM footprint (e.g. testing LLM generation or code agent output), execute tests via a standalone script, unload/re-wake model, and parse results to bypass memory saturation limits.
