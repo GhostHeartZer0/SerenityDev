@@ -30,8 +30,10 @@ gemma-4 locally run.txt
 # TLS & Security Credentials
 *.pem
 *.key
+*.crt
 rootCA.pem
 rootCA.key
+rootCA.crt
 cert.pem
 cert.key
 

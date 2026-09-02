@@ -1,268 +1,61 @@
 Created At: 2026-07-17T20:37:54Z
-Last Updated: 2026-08-07T09:51:00Z
-File Path: `file:///c:/Users/ccrg6/SerenityDev/TODO.txt`
+Last Updated: 2026-09-02T11:45:00Z
+File Path: `file:///F:/SerenityDev/TODO.txt`
 
 =========================================
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
-[2026-08-27] Done: Fixed Webview Regex Syntax Error & Restored UI Button Handlers:
-- Fixed `parseProofBadges` and `renderMemories` in `src/extension.ts` where template literal evaluation in Node stripped backslashes from `\'`, emitting broken JS string concatenations (`'' + safeBId + ''`) and invalid regex quantifiers into the webview `<script>` block, causing `Uncaught SyntaxError: Unexpected string` that prevented `sendCmd`, `onModelChange`, `submitQuery`, and all buttons from initializing (`ReferenceError: sendCmd is not defined`).
-- Recompiled and repackaged `SerenityDev-1.6.0.vsix`.
+[DONE] MCP JSON-RPC Spec Alignment (tools/call & Notifications):
+- Aligned `@app.api_route("/mcp", ...)` in `serenitydevserver.py` with JSON-RPC 2.0 and MCP 2024-2026 specification.
+- Notifications (`notifications/initialized`, `initialized`, `ping`) return HTTP 200/204 with empty result body or omitted/null id as required by spec.
+- Enhanced `tools/call` parameter parsing to handle arguments wrapped in `arguments`, `parameters`, or raw dictionary/JSON string inputs.
+- Verified fallback method handler returns spec-compliant `-32601` JSON-RPC error. [Done]
 
-[2026-08-27] Done: Verified & Unified MCP StreamableHTTP JSON-RPC Engine:
-- Standardized Model Context Protocol (MCP) StreamableHTTP `/mcp` endpoint in `serenitydevserver.py` with timing-safe PQC Bearer token validation (`ENFORCE_MCP_AUTH`), HTTPS scheme checking (`ENFORCE_MCP_HTTPS`), and full tool dispatch across 11 workspace & memory tools.
-- Removed duplicate unmounted legacy handlers.
-- Created `src/test/test_mcp.py` covering handshake, initialization, ping, notifications, tools list, tools call, memory lifecycle, error codes (`-32601`, `-32700`), auth enforcement, and HTTPS enforcement. 100% test pass rate.
+[DONE] Streamline start_native_mcp.py Root CA & Network Binding:
+- Bound CA download `SimpleHTTPRequestHandler` cleanly on `0.0.0.0` with `allow_reuse_address = True` on `ReusableHTTPServer`.
+- Set MIME content type to `application/x-x509-ca-cert` for immediate Android certificate installation.
+- Included all detected local IP addresses and hostname entries in leaf certificate `SubjectAlternativeName` to eliminate TLS handshake SAN mismatch errors for external devices/phones over Wi-Fi.
+- Added `*.crt` and `rootCA.crt` to `.gitignore` to prevent certificate tracking in git. [Done]
 
-[2026-08-27] Done: SerenityDev Agent Console Overhaul, Decoupled Reasoning & Limits, Subagent Budgeting, LTM & GPU Layer Text Input:
-- Decoupled `reasoning_strength` (`low`, `medium`, `high`, `xhigh`) from `limit_tier` (`default`, `low`, `medium`, `high`, `autonomy`).
-- Implemented `LongTermMemoryManager` with persistent storage in `.serenity_cache/long_term_memory.json` and agent tools (`store_memory`, `query_memory`, `update_memory`, `delete_memory`).
-- Added subagent independent execution budgets with "Offload then load" pattern, allowing workers to bypass parent loop caps.
-- Overhauled GPU layer offloading to direct text box / integer input (`Auto (-1)` or any custom layer number), removing fixed dropdown limits.
-- Fully overhauled VS Code Webview console: offline status requiring boot (`🔴 Offline (Click to Start)`), model/reasoning/limits dropdowns, KV cache quant, context size, GPU layers text box, Auto-Cont toggle, Long-Term Memory modal with search/delete/purge, thought accordions, subagent delegation cards, and Keep/Reject proof badges.
-- Verified test suite passes cleanly via `src/test/test_all_features.py` and `src/test/test_controls.py`.
-- Fixed `WinError 10048` port 8002 debug collision: removed `/api/status` bypass in `free_port()` so debugging cleanly terminates stale background servers, and fixed Pylance type narrowing on `dispatch_tool_call(s_target, ...)` in `serenitydevserver.py`.
+[DONE] VS Code Client Auth Token Synchronization:
+- Updated `serenityHttp` in `src/extension.ts` to attach `Authorization: Bearer <token>` when `process.env.SERENITY_MCP_TOKEN` or configured `serenitydev.mcpToken` is present.
+- Contributed `serenitydev.mcpToken` configuration property in `package.json`. [Done]
 
-Overhaul repeat handling / detection, make it a toggle [hyper, lazy, off] so that coding and repeat tool calling [eg. search hi, search low, search windows] can go forward.
-[2026-08-25] Done: Fixed llama-server startup pipe deadlock & test suite compatibility:
-- Fixed `start_llama_server()` in `serenitydevserver.py` to drain `stdout`/`stderr` pipes continuously in background threads, eliminating OS pipe buffer saturation hangs on Windows.
-- Added `@pytest.mark.asyncio` to `src/test/test_agent.py` and verified all unit/integration tests passing.
-[2026-08-25] Done: Adaptive Thought Channel Closure, Zero-Response Fallback & Subprocess Window Fix:
-- Fixed `StreamingThoughtFilter.flush_remaining()` in `serenitydevserver.py` to synthesize and preserve unclosed thought/response buffers when model generation completes without explicit `<channel|>` tags.
-- Added safety text fallback in `run_orchestration` preventing 0-token empty returns to VS Code Copilot/Chat.
-- Broadened part value extraction in `src/extension.ts` (`provideLanguageModelChatResponse`) to support all part types and reference attachments.
-- Added `creationflags=subprocess.CREATE_NO_WINDOW` across all `start_llama_server` and `free_port` Windows commands (`netstat`, `taskkill`).
-- Rebuilt and packaged `SerenityDev-1.6.0.vsix`.
-[2026-08-25] Done: SerenityDev Renaming, Standalone Server, Model Reporting & Direct Llama-CPP Streaming Fixes:
-- Renamed planning & orchestration library view and command manifests to "SerenityDev" across package.json and src/extension.ts.
-- Nuked model consolidation entirely across server state, config persistence (serenity_config.json), extension UI, and orchestration loops.
-- Overhauled resolve_model with token intersection and substring fuzzy matching, ensuring exact models (e.g. gemma-4-e2b-q2 -> gemma-4-E2B-it-qat-UD-Q2_K_XL) load with quantized KV cache (q8_0/q5_1) and ultra-low VRAM usage without falling back to heavy supervisor models.
-- Fixed direct Llama-CPP streaming (fixed llm.n_ctx() typo, strict SSE event-stream formatting, dynamic headroom clamping, client disconnect cancellation).
-- Cleaned up /api/models and standard OpenAI /v1/models endpoints to dynamically report all 25+ installed GGUF models and role aliases to VS Code Copilot Chat and local clients.
-- Verified standalone server execution (serenitydevserver.py), direct model streaming, and MCP tool execution (list_directory) passing cleanly via src/test/verify_fixes.py.
-- Rebuilt extension package (SerenityDev-1.6.0.vsix).
-[2026-08-22] Done: Eliminated Windows Terminal Window Flashing — Switched `/api/status` GPU telemetry to in-process `pynvml` (zero subprocesses), cached machine entropy in `SerenityKeyVault`, added `subprocess.CREATE_NO_WINDOW` across all Python subprocess calls (`wmic`, `powershell`, `nvidia-smi`, `mcp:terminal`), and added `windowsHide: true` on Node.js `cp.spawn` in `src/extension.ts`.
-[2026-08-22] Done: Server Auto-Start, Model Selection Dropdown & Detection Scanner — Implemented `ensureServerStarted()` with multi-path virtualenv detection, health polling loop, and auto-sealing hardware key fallback in `startup.py`. Added active Model Selector dropdown directly inside the Planning & Orchestration sidebar webview, plus `serenity.startServer`, `serenity.selectModel` (one-click model switching across all detected GGUFs), and `serenity.scanModels` (dynamic directory rescan and detection reporting).
-[2026-08-22] Done: Role-Based Effort Levels, Model Mapping & Auto-Continue Toggle — Configured Supervisor effort tiers as first-class roles (`supervisor_low`, `supervisor_high`, `orchestrator_turbo`, `w1_reasoning`, `w2_code`, `w3_fast`, `w4_specialized`, `fim`), enabled dynamic model assignment per role in Planning & Orchestration Library webview and via `serenity.setRoleModel`, and added `auto_continue` toggle (500 max loops) in server and via `serenity.toggleAutoContinue`.
-[2026-08-22] Done: VSIX Model Reporting, Planning Explainer Dialog & Server Control Commands — Implemented dynamic `/api/models` rescanning with accurate `maxInputTokens` from `CONTEXT_WINDOW` and tool calling capabilities, updated `provideLanguageModelChatInformation` in `src/extension.ts`, added Planning & Orchestration Library architecture explainer modal and standalone view (`serenity.explainPlanning`), and implemented VS Code commands + Webview toolbar buttons for `serenity.restartServer`, `serenity.unloadModel` (free VRAM), `serenity.setKVCache` (quantization settings), `serenity.setContextSize` (token context window), and `serenity.setGpuLayers` (layer offload count).
-[2026-08-22] Done: Implemented Shared VRAM Guard & Synced Updated .venv llama_cpp — Added context-scaled guard headroom in `get_vram_info()`, auto-pinned KV cache to system RAM during partial layer offloading / SWA / high context to eliminate `GGML_SCHED_MAX_SPLIT_INPUTS` assertion crashes and Windows Shared GPU Memory paging stalls, added resilient multi-tier recovery fallbacks in `get_llama_model()`, and synced updated CUDA 13.3 `llama_cpp` binaries (258 MB `ggml-cuda.dll`) from `SerenityPC`.
-[2026-08-18] Done: Fixed `grep_search` single-file routing & regex evaluation in `serenitydevserver.py` — added `os.path.isfile` single-file handling alongside workspace recursive scans, compiled regex search queries with case-insensitivity and literal substring fallback, and filtered `pynvml` `FutureWarning` during `nvidia-ml-py` metrics discovery.
-[2026-08-17] Done: Resolved VRAM Offloading & CUDA Acceleration — Replaced CPU-only `llama_cpp_python` binaries in `.venv` with CUDA 12.6 accelerated build (`ggml-cuda.dll`), verified `llama_supports_gpu_offload() == True`, confirmed active dynamic layer offloading into NVIDIA GeForce RTX 3050 VRAM, and integrated `nvidia-ml-py` for hardware metrics.
-[2026-08-17] Done: Fixed PQC Hardware-Bound Key Vault & Sealer — Added Windows 11 CIM/PowerShell fallback to `SerenityKeyVault.get_machine_entropy()` when `wmic` is deprecated, added multi-entropy candidate fallback list to `SerenityKeyVault.unlock()`, decoupled `seal_secrets.py` to prevent circular import crashes, and re-sealed valid hardware key into `.env`.
-[2026-08-17] Done: Virtual environment (.venv) activation across all startup scripts — added `activate_virtualenv()` in `startup.py` to auto-detect and inject `.venv`/`venv` site-packages and PATH, updated `start_native_mcp.py` to initialize environment on boot, updated VSCode extension (`src/extension.ts`) to prioritize `.venv` python interpreters and propagate `VIRTUAL_ENV`/`PATH`, and added cross-platform launch scripts (`start_server.bat`, `start_server.ps1`, `start_server.sh`, `start_mcp.bat`, `start_mcp.ps1`, `start_mcp.sh`).
-[2026-08-17] Done: Implemented Programmatic Tool Calling (PTC) & Clean Stubs (arXiv:2608.06370v1) — transitioned tool declarations from verbose Gemma pseudo-JSON schema tags to typed Python stubs (`def tool_name(...) -> dict: ...`). Enhanced AST-based Python function call parsing in extract_json and dual-mode dispatch.
-[2026-08-17] Done: Ensured tool calling is properly shown in VSCode chat — enabled supportHtml: true and isTrusted: true on MarkdownString in `src/extension.ts`, yielding collapsible `<details>` execution summary cards for all standalone (Path A) and supervisor (Path B) tool executions.
-[2026-08-11] Done: Fixed infinite hang during llama-server process startup in serenitydevserver.py (PIPE stderr/stdout capture, poll() health checks, async httpx health polling).
-[2026-08-07] Done: Fixed TypeScript compilation & parsing errors in extension webview template literal string (`src/extension.ts`).
+[DONE] Dynamic MCP Resource Registration:
+- Added `resources/list` and `resources/read` handlers to `/mcp` router in `serenitydevserver.py`.
+- Exposed `workspace://files` (JSON file tree) and `workspace://git_status` (working tree diff/status) for real-time diffs and file structures to connected MCP clients. [Done]
 
-[2026-07-30] Done: Comprehensive Security Hardening — HTML entity escaping for webview chat & proof badges, createSafeMarkdown helper (isTrusted=false, supportHtml=false), shell=False subprocess execution, validate_path_containment with symlink resolution, robust extract_json parser, and concurrency lock synchronization.
-[2026-07-30] Done: Resolved tool call response leak — tool execution events now route to progress updates instead of polluting the chat answer stream.
-[2026-07-30] Done: Complete Android Studio (IntelliJ.kt) integration with user input dialog, thread-safe WriteCommandAction editor replacement, and error alerts.
-[2026-07-29] Done: Tool edit proof badges (`edited:this.py-1+2`) & inline Keep/Reject UI in VSCode chat.
-[2026-07-29] Done: Plan generation pipeline & task list execution engine (`/plan`).
-[2026-07-29] Done: Android Studio plugin response fix (`IntelliJ.kt` and `/ask` response fallback).
+[ACTIVE] Overhaul Repeat Handling / Tool Call Loop Detection:
+- Implement repeat detection toggle `[hyper, lazy, off]` so repetitive search/tool patterns (e.g. multi-query search, file discovery) proceed without false duplicate interception.
 
-[2026-08-22] Done: Fixed tool call stripping before execution — Separated thought stripping (`strip_thought_blocks`) from tool tag stripping (`clean_thought_and_whitespace`), updated `extract_json` in `serenitydevserver.py` to parse tool calls without premature tag deletion, added support for XML `<tool_call>` wrappers (PTC & JSON), and updated `StreamingThoughtFilter` lookahead & closing tag buffering.
+[ACTIVE] Model Roles & Agent Architecture:
+- Explicitly assign `Agent` role to newly detected/selected models, reserving `Worker` role strictly for Supervisor / Orchestrator delegation.
+- Build / refine new Orchestrator mode ("MiniBoss") with lightweight routing.
 
-[2026-07-27] DEFERRED: Focused subagent spawning architecture — Supervisor/Orchestrator should be able to spawn worker subagents with only the specific tools and instructions they need (tool allowlist scoped per delegation). Workers currently receive all tools from the global list. Implement per-delegation tool scoping in Path B `delegate_worker` branch: pass a `tool_subset` list alongside `instructions` so the spawned worker prompt only advertises the relevant tools. Cap: worker inner loop already at 8; supervisor delegation already capped (Low=3, High=5, Turbo=unlimited).
+[ACTIVE] Streaming & Prompt Queue Optimization:
+- Verify `generate_completion_stream` yields real-time streaming chunks across worker drafts and refinement.
+- Implement workspace-specific buckets for prompt queue decongestion and stale request clearing.
+- Add auto-parameter adjustment mode in `serenitydevserver.py` (temporary dynamic temperature/sampler adjustment per task type without overriding base user persona).
 
-New models and ones displayed should be given Agent role, reserving the Worker role purely for delegation by a Supervisor or Orchestrator.
+[ACTIVE] Model Parameter Tuning & Evaluation:
+- Benchmark Gemma-4 coding performance, context retention, and parameter configurations (`temperature`, `top_p`, `min_p`, sampling headroom) to eliminate response skipping.
+- Review FIM handling and dynamic offloading under high VRAM saturation.
 
-Build a new Orchestrator, MiniBoss, powered by 
-
-1. resolve llm output is massdumping instead of streaming response.
-   [Plan: In serenitydevserver.py, generate_completion_stream is called for worker drafts and refinement to yield chunks directly in real-time, bypassing post-facto chunking.] [Verify] 
-
-2. kv cache compression settings (add to UI and verify it works / changes) [Done] 
-
-3. separate values for k and v: fp16, q8_0, q5_1, q5_0, q4_0, turbo4_tcq, turbo3_tcq, turbo2_tcq [Done] 
-
-4. Adapted gork-build Rust architecture to improve this codebase. Added: 1) Tool-Pair-Safe context trimming, 2) Workspace/Session prompt queue manager & decongestion, 3) Sliding-window CircuitBreaker for API/tool resilience. Annotated Rust-exclusive features (Alacritty PTY handles, Ratatui TUI rendering, D-Bus sleep listeners). [Verify]
-
-5. fix the extension icon not showing up in VSCode.
-
-6. map MOE router sizes
-test and learn gemma-4 params. figure out: what works best for coding? what has the lowest probability of skipping the response/ what parameters provide the most complete and accurate response?
-add git commands to harness
-
-7. review FIM handling and VRAM usage; let it be on unless VRAM is to be saturated especially by a large LLM being loaded. load FIM if there is space, auto-offload for Orchestrator / Supervisor and secondary routing phases.
-
-8. [2026-08-18] Done: Fixed blank window & thought swallowing in VSCode AI window — Refactored `StreamingThoughtFilter` in `serenitydevserver.py` to demux internal reasoning without dropping direct responses or error text, added lookahead tag buffering, implemented dynamic model folder discovery & setting (`serenitydev.modelsPath` and UI folder picker `serenity.addModelFolder`), guarded direct llama_cpp C++ engine with inference lock & cancellation event to prevent Access Violation 0xC0000005 crashes, and fixed fenced JSON tool parsing in `extract_json`.
-
-9. Implement HTTPS-enforced StreamableHTTP MCP server endpoint (`/mcp`) in `serenitydevserver.py` for Google AI Edge Gallery integration. [Done]
-
-10. Hardened SerenityKeyVault multi-factor hardware entropy (OS MAC + Windows MachineGuid + BIOS UUID), SHAKE-256 GCM nonces (zero collision across 10k squeezes), constant-time comparisons, SessionRotationManager with encrypted store-and-resume, and autonomous downtime rotation loop (default 10-minute idle threshold). [Done]
-
-[TBD] make auto-pushing verified updates a thing. 
-
-[TBD] auto-log git changes before pushing.
-
-[TBD] test and learn gemma-4 params. figure out: what works best for coding? what has the lowest probability of skipping the response / what parameters provide the most complete and accurate response?
-
-[TBD] introduce workspace-specific buckets for proper queue decongestion
-
-[TBD] clearing irrelevant queue congestion
-
-[TBD] for main.py (serenitydevserver.py): decide upon relevancy, consider an auto-param adjustment mode that does NOT override settings, but creates a temp state that bases off the persona settings, but adjusts (ie. lowers temp for coding, adjusts for content flow being multimodal, text, analysis and data handling, etc.)
-
-[TBD] add git commands to harness (Note: harness/tests currently exist in SerenityPC workspace)
-
-[Last] update README and create LICENSE.md
+[ACTIVE] Project Maintenance & Releases:
+- Fix VS Code extension icon asset packaging.
+- Add git commands / workspace actions to integration harness.
+- [DONE] Update `README.md` and verify `LICENSE.md`.
+Alow the orchestrator and supervisors to write tools if needed, and always ask user for review.
 
 =========================================
 NOTE ITEMS & EVOLVING CONSIDERATIONS
 =========================================
-N.  Smart App Control & Cache Localization:
-- Ensure all subprocess backends (MSVC, CMake, Pip, PyTorch, Triton) respect the localized variables. [Done] 
-"when running tests, if it involves significant VRAM/RAM usage (such as testing output of a coding agent or running like tests for LLMs), it is acceptable to create a script that runs a test then re-wakes the model for parsing the result, specifically as a workaround for memory constraints." [Evolving] 
 
-N. High and Low modes, split logic in two:
-   - gemma-4-26B-A4B (High) explains everything it does, uses thinking to the max, as many tokens and tool uses as needed to solve the issue with utmost accuracy. Prioritizes self-optimizable pipeline: research - plan - worker selections - permission (if necessary) - execution - test.
-   - gemma-4-26B-A4B (Low) minimal explanations, focus on efficiency and token savings while maintaining accuracy. Prioritizes if-necessary pipeline: research - plan - worker selections - permission - execution - test. [Note] 
+N. Subprocess & Memory Safety:
+- Ensure all subprocess backends respect localized environment variables and paths.
+- During VRAM-intensive tests, use decoupled test runners that re-wake server/models post-test.
 
-N. ensure for each task and worker the temp and such is set properly thruout. [Evolving] 
-
-=========================================
-HISTORICAL REFERENCE & LOGS
-=========================================
-#87: [...] Initiating SerenityDev Secure Boot...
-[+] Environment Validated: Hardware-bound identity confirmed.
-[Port Initializer] Scanning port 8002...
-[Server] Starting SerenityDev Orchestrator...
-[...] Initiating SerenityDev Secure Boot...
-[+] Environment Validated: Hardware-bound identity confirmed.
-INFO:     Started server process [3396]
-INFO:     Waiting for application startup.
-[Startup] Scanning for local model files...
-[Startup] Found models: ['gemma-4-26B-A4B-it-qat-UD-Q4_K_XL', 'codegemma-2b-f16', 'codegemma-7b-it-f16', 'gemma4-v2-Q4_K_M', 'gemma4-coding-Q4_K_M', 'gemma-4-E4B-it-Coder.Q4_K_M']
-[Startup] Auto-Assigned Supervisor: gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-[Startup] Auto-Assigned Agent (Code): gemma-4-E4B-it-Coder.Q4_K_M
-[Startup] Auto-Assigned Agent (FIM): codegemma-2b-f16
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8002 (Press CTRL+C to quit)
-INFO:     127.0.0.1:51799 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:51800 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:51802 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:51803 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53003 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53004 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53005 - "GET /api/models HTTP/1.1" 200 OK
-[Orchestrator] Changed working directory to: C:\Users\ccrg6\Desktop\Desktop\Hub\Serenity Live
-[Orchestrator] Consolidated Models Enabled -> Using 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' for all phases.
-INFO:     127.0.0.1:53007 - "POST /ask_stream HTTP/1.1" 200 OK
---- DYNAMIC VRAM REPORT ---
-Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-Total GPU VRAM:   6144.0 MiB
-Free VRAM:        4961.3 MiB
-Self VRAM:        0.0 MiB
-Total Layers:     30
-File Size:        13589.0 MiB (~453.0 MiB/layer)
-Est. KV Cache:    1050.0 MiB (Offloaded: True)
-Target VRAM:      4661.3 MiB
-Action:           Offloading 7/30 layers to GPU
-----------------------------
-[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=16384, gpu_layers=7) with KV cache compression K=f16, V=f16...
-llama_context: n_ctx_seq (16384) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
-llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-[Llama-CPP] Prompt tokens (24082) + headroom (2048) exceeds loaded context limit (16384). Dynamic reloading to n_ctx=26130...
-[Llama-CPP] Unloading active model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' to reload for 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
-[Llama-CPP] Unloading model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
-[Llama-CPP] Direct model offloaded successfully.
---- DYNAMIC VRAM REPORT ---
-Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-Total GPU VRAM:   6144.0 MiB
-Free VRAM:        4912.8 MiB
-Self VRAM:        0.0 MiB
-Total Layers:     30
-File Size:        13589.0 MiB (~453.0 MiB/layer)
-Est. KV Cache:    1674.6 MiB (Offloaded: True)
-Target VRAM:      4612.8 MiB
-Action:           Offloading 6/30 layers to GPU
-----------------------------
-[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=26130, gpu_layers=6) with KV cache compression K=f16, V=f16...
-llama_context: n_ctx_seq (26368) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
-llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-[Tool Success] Plan state updated locally with 8 steps.
-[Tool Success] Plan state updated locally with 0 steps.
-[Tool Success] Plan state updated locally with 11 steps.
-[Duplicate Tool Intercepted] Prevented redundant tool call 'mcp:filesystem:create_or_update_plan' with args
-
-[Llama-CPP] Direct model offloaded successfully.
---- DYNAMIC VRAM REPORT ---
-Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-Total GPU VRAM:   6144.0 MiB
-Free VRAM:        4652.8 MiB
-Self VRAM:        0.0 MiB
-Total Layers:     30
-File Size:        13589.0 MiB (~453.0 MiB/layer)
-Est. KV Cache:    1691.2 MiB (Offloaded: True)
-Target VRAM:      4352.8 MiB
-Action:           Offloading 5/30 layers to GPU
-----------------------------
-[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=26389, gpu_layers=5) with KV cache compression K=f16, V=f16...
-llama_context: n_ctx_seq (26624) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
-llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-[OpenAI Stream] Request cancelled by client disconnect.
-[Supervisor Self-Healing] Attempt 1 failed: Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.. Retrying with error details...
-[Llama-CPP] Prompt tokens (26444) + headroom (2048) exceeds loaded context limit (26624). Dynamic reloading to n_ctx=28492...
-[Llama-CPP] Unloading active model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' to reload for 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
-[Llama-CPP] Unloading model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
-[Llama-CPP] Direct model offloaded successfully.
---- DYNAMIC VRAM REPORT ---
-Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-Total GPU VRAM:   6144.0 MiB
-Free VRAM:        4705.2 MiB
-Self VRAM:        0.0 MiB
-Total Layers:     30
-File Size:        13589.0 MiB (~453.0 MiB/layer)
-Est. KV Cache:    1826.0 MiB (Offloaded: True)
-Target VRAM:      4405.2 MiB
-Action:           Offloading 5/30 layers to GPU
-----------------------------
-[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=28492, gpu_layers=5) with KV cache compression K=f16, V=f16...
-llama_context: n_ctx_seq (28672) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
-llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-[Supervisor Self-Healing] Attempt 2 failed: Parsed JSON is missing 'action' or 'target' keys, or is not valid JSON.. Retrying with error details...
-.
-[Tool Success] Plan state updated locally with 6 steps.
-[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=30151, gpu_layers=5) with KV cache compression K=f16, V=f16...
-llama_context: n_ctx_seq (30208) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
-llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-[Tool Success] Plan state updated locally with 9 steps.
-INFO:     127.0.0.1:63841 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-[OpenAI Stream] Request cancelled by client disconnect.
-INFO:     127.0.0.1:52410 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:52412 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:52413 - "GET /api/models HTTP/1.1" 200 OK
-INFO:     127.0.0.1:52452 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-[OpenAI Stream] Request cancelled by client disconnect.
-[Tool Success] Plan state updated locally with 8 steps.
-[Llama-CPP] Prompt tokens (28165) + headroom (2048) exceeds loaded context limit (30208). Dynamic reloading to n_ctx=30213...
-[Llama-CPP] Unloading active model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL' to reload for 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
-[Llama-CPP] Unloading model 'gemma-4-26B-A4B-it-qat-UD-Q4_K_XL'...
-[Llama-CPP] Direct model offloaded successfully.
---- DYNAMIC VRAM REPORT ---
-Model:            gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-Total GPU VRAM:   6144.0 MiB
-Free VRAM:        4619.9 MiB
-Self VRAM:        0.0 MiB
-Total Layers:     30
-File Size:        13589.0 MiB (~453.0 MiB/layer)
-Est. KV Cache:    1936.3 MiB (Offloaded: True)
-Target VRAM:      4319.9 MiB
-Action:           Offloading 5/30 layers to GPU
-----------------------------
-[Llama-CPP] Loading gemma-4-26B-A4B-it-qat-UD-Q4_K_XL from C:\Users\ccrg6\SerenityDev\models\26B-A4B\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf (n_ctx=30213, gpu_layers=5) with KV cache compression K=f16, V=f16...
-llama_context: n_ctx_seq (30464) < n_ctx_train (262144) -- the full capacity of the model will not be utilized
-llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
-INFO:     127.0.0.1:53631 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-[OpenAI Stream] Request cancelled by client disconnect.
-INFO:     127.0.0.1:53783 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-[Duplicate Tool Intercepted] Prevented redundant tool call 'mcp:filesystem:create_or_update_plan' with args
-[OpenAI Stream] Request cancelled by client disconnect.
-[Tool Success] Plan state updated locally with 11 steps.
-[Llama-CPP Stream] Stream cancelled by client connection drop.
-[Llama-CPP Stream] Generation cancelled.
-[Completion Cancelled] Task cancelled for model gemma-4-26B-A4B-it-qat-UD-Q4_K_XL
-[Supervisor] Orchestration cancelled by client request.
+N. Supervisor Reasoning Profiles:
+- High Profile (gemma-4-26B-A4B): Full thinking depth, exhaustive self-optimizing pipeline (research -> plan -> worker selection -> execution -> test).
+- Low Profile (gemma-4-26B-A4B): Terse, token-optimized execution pipeline.
