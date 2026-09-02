@@ -1,6 +1,7 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
+## Version 1.6.4
 - **Documentation & Model Architecture Chart Overhaul**:
   - Rewrote `README.md` following decreasing-verbosity structure: concise overview and purpose, 5-step Quick Setup Guide with explicit OS, Python (3.10–3.14), CUDA/GPU, and backend compiler prerequisites, daily usage patterns (Sidebar, Copilot Chat participant `@serenity`, status control panel), feature execution guide, and quick reference tables.
   - Overhauled Model Routing Chart: added Mermaid delegation flowchart linking Supervisors (`supervisor_low`, `supervisor_high`) and Orchestrator (`orchestrator_turbo`) to Workers (`w1_reasoning`, `w2_code`, `w3_fast`, `w4_specialized`, `fim`), accompanied by a comprehensive Role Matrix table detailing default weights, turn caps, and role specializations.
