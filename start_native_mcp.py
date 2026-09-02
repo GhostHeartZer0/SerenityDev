@@ -45,6 +45,29 @@ def get_local_ip() -> str:
         s.close()
     return ip
 
+def get_all_local_ips() -> list[str]:
+    """Finds all detected local network IP addresses."""
+    ips = set()
+    primary = get_local_ip()
+    if primary:
+        ips.add(primary)
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+    valid_ips = []
+    for ip in sorted(list(ips)):
+        try:
+            ipaddress.ip_address(ip)
+            valid_ips.append(ip)
+        except Exception:
+            pass
+    return valid_ips
+
 def ensure_pqc_root_ca_and_cert(
     ca_cert_path: str = "rootCA.pem",
     ca_key_path: str = "rootCA.key",
@@ -52,7 +75,8 @@ def ensure_pqc_root_ca_and_cert(
     key_path: str = "cert.key"
 ):
     """Generates PQC-bound Local Root CA and signed Leaf Certificate for Android trust."""
-    if os.path.exists(ca_cert_path) and os.path.exists(cert_path) and os.path.exists(key_path):
+    force_regen = os.environ.get("REGENERATE_MCP_CERTS", "false").lower() in ("true", "1", "yes")
+    if not force_regen and os.path.exists(ca_cert_path) and os.path.exists(cert_path) and os.path.exists(key_path):
         return ca_cert_path, cert_path, key_path
 
     print("[*] Generating PQC Hardware-Seeded Root CA & Leaf Certificate...")
@@ -115,14 +139,24 @@ def ensure_pqc_root_ca_and_cert(
             x509.NameAttribute(NameOID.COMMON_NAME, local_ip)
         ])
 
+        hostname = socket.gethostname()
         alt_names = [
             x509.DNSName("localhost"),
             x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
         ]
-        try:
-            alt_names.append(x509.IPAddress(ipaddress.ip_address(local_ip)))
-        except Exception:
-            pass
+        if hostname and hostname != "localhost":
+            try:
+                alt_names.append(x509.DNSName(hostname))
+            except Exception:
+                pass
+
+        for ip_str in get_all_local_ips():
+            try:
+                ip_entry = x509.IPAddress(ipaddress.ip_address(ip_str))
+                if ip_entry not in alt_names:
+                    alt_names.append(ip_entry)
+            except Exception:
+                pass
 
         leaf_cert = (
             x509.CertificateBuilder()
@@ -168,12 +202,12 @@ def start_ca_downloader_server(ca_path: str, port: int = 8080):
     """Starts a background HTTP server serving only the rootCA.pem file for Android browser download."""
     class CAHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
-            if self.path in ["/rootCA.pem", "/ca", "/"]:
+            if self.path in ["/rootCA.pem", "/ca", "/", "/rootCA.crt"]:
                 try:
                     with open(ca_path, "rb") as f:
                         content = f.read()
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/x-pem-file")
+                    self.send_header("Content-Type", "application/x-x509-ca-cert")
                     self.send_header("Content-Disposition", 'attachment; filename="rootCA.pem"')
                     self.send_header("Content-Length", str(len(content)))
                     self.end_headers()
@@ -187,11 +221,15 @@ def start_ca_downloader_server(ca_path: str, port: int = 8080):
             pass
 
     try:
-        httpd = HTTPServer(("0.0.0.0", port), CAHandler)
+        class ReusableHTTPServer(HTTPServer):
+            allow_reuse_address = True
+
+        httpd = ReusableHTTPServer(("0.0.0.0", port), CAHandler)
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
         return httpd
-    except Exception:
+    except Exception as e:
+        print(f"[!] Could not start CA server on port {port}: {e}")
         return None
 
 def main():

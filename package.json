@@ -164,6 +164,11 @@
           "type": "string",
           "default": "",
           "description": "Optional absolute path to serenitydevserver.py when the Python server is installed outside the extension or workspace."
+        },
+        "serenitydev.mcpToken": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Bearer authentication token for communicating with secure SerenityDev MCP server."
         }
       }
     }

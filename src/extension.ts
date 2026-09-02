@@ -14,6 +14,7 @@ function serenityHttp<T = any>(method: string, url: string, body?: unknown, time
         let settled = false;
         const u = new URL(url);
         const payload = body === undefined ? undefined : JSON.stringify(body);
+        const authToken = process.env.SERENITY_MCP_TOKEN || vscode.workspace.getConfiguration('serenitydev').get<string>('mcpToken')?.trim();
         const req = http.request({
             hostname: u.hostname,
             port: Number(u.port || 80),
@@ -21,6 +22,7 @@ function serenityHttp<T = any>(method: string, url: string, body?: unknown, time
             method,
             headers: {
                 'Content-Type': 'application/json',
+                ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {}),
                 ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {})
             }
         }, (res) => {

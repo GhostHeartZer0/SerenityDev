@@ -2592,6 +2592,21 @@ MCP_TOOLS_DEFINITIONS = [
     }
 ]
 
+MCP_RESOURCES_DEFINITIONS = [
+    {
+        "uri": "workspace://files",
+        "name": "Workspace Files",
+        "description": "Directory and file structure of the active workspace",
+        "mimeType": "application/json"
+    },
+    {
+        "uri": "workspace://git_status",
+        "name": "Git Status",
+        "description": "Real-time working tree status and diff summary of the active workspace",
+        "mimeType": "text/plain"
+    }
+]
+
 def _extra_workspace_dirs() -> List[str]:
     raw = os.environ.get("SERENITY_WORKSPACE_DIR", "")
     paths = []
@@ -3572,6 +3587,53 @@ def execute_mcp_tool_call(tool_name: str, args: dict) -> tuple[str, bool]:
     res = dispatch_tool_call(tool_name, args, mode="agent", step_num=1, workspace_dir=ws)
     return res["raw_output"] or res["tool_context"].strip(), res["is_error"]
 
+def read_mcp_resource(uri: str, req_workspace: Optional[str] = None) -> tuple[dict, bool]:
+    """Reads dynamic MCP resource content for supported URIs. Returns (content_dict, is_error)."""
+    ws = get_primary_workspace_dir(req_workspace)
+    if uri == "workspace://files":
+        try:
+            entries = []
+            ignore_dirs = {".git", ".venv", "venv", "node_modules", "__pycache__", ".idea", ".vscode-test", "dist", "out", ".serenity_cache", ".pytest_cache"}
+            for root, dirs, files in os.walk(ws):
+                dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+                rel_root = os.path.relpath(root, ws)
+                for f in files:
+                    if f.startswith(".env") or f == ".DS_Store" or f == "Thumbs.db":
+                        continue
+                    rel_path = f if rel_root == "." else os.path.join(rel_root, f).replace("\\", "/")
+                    entries.append(rel_path)
+                    if len(entries) >= 500:
+                        break
+                if len(entries) >= 500:
+                    break
+            return {
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps({"workspace": ws, "files": sorted(entries), "total_listed": len(entries)}, indent=2)
+            }, False
+        except Exception as e:
+            return {"error": f"Failed to list workspace files: {e}"}, True
+
+    elif uri == "workspace://git_status":
+        try:
+            res = subprocess.run(
+                ["git", "status", "-s"],
+                cwd=ws,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            out = res.stdout.strip() if res.returncode == 0 else (res.stderr.strip() or "git status failed")
+            return {
+                "uri": uri,
+                "mimeType": "text/plain",
+                "text": out if out else "(working tree clean)"
+            }, False
+        except Exception as e:
+            return {"error": f"Failed to inspect git status: {e}"}, True
+
+    return {"error": f"Unknown resource URI '{uri}'"}, True
+
 @app.api_route("/mcp", methods=["GET", "POST"])
 async def mcp_streamable_http_endpoint(request: Request):
     """StreamableHTTP Model Context Protocol (MCP) endpoint for Google AI Edge Gallery & external clients."""
@@ -3605,6 +3667,7 @@ async def mcp_streamable_http_endpoint(request: Request):
 
     log_message(f"[MCP Endpoint] Received method '{method}' (id: {req_id})")
 
+    # 1. Initialization
     if method == "initialize":
         return JSONResponse({
             "jsonrpc": "2.0",
@@ -3612,18 +3675,22 @@ async def mcp_streamable_http_endpoint(request: Request):
             "result": {
                 "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                 "capabilities": {
-                    "tools": {}
+                    "tools": {"listChanged": True},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False}
                 },
                 "serverInfo": MCP_SERVER_INFO
             }
         })
 
-    elif method == "notifications/initialized":
-        return JSONResponse({"jsonrpc": "2.0", "result": {}})
+    # 2. Handshake notifications & ping
+    elif method in ["notifications/initialized", "initialized"]:
+        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
     elif method == "ping":
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
+    # 3. Tool Discovery
     elif method == "tools/list":
         return JSONResponse({
             "jsonrpc": "2.0",
@@ -3633,9 +3700,16 @@ async def mcp_streamable_http_endpoint(request: Request):
             }
         })
 
+    # 4. Tool Execution
     elif method == "tools/call":
         tool_name = params.get("name", "")
-        tool_args = params.get("arguments", {})
+        tool_args = params.get("arguments") or params.get("parameters") or {}
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception:
+                tool_args = {"raw_input": tool_args}
+
         result_text, is_error = execute_mcp_tool_call(tool_name, tool_args)
         return JSONResponse({
             "jsonrpc": "2.0",
@@ -3644,13 +3718,44 @@ async def mcp_streamable_http_endpoint(request: Request):
                 "content": [
                     {
                         "type": "text",
-                        "text": result_text
+                        "text": str(result_text)
                     }
                 ],
                 "isError": is_error
             }
         })
 
+    # 5. Dynamic Resources
+    elif method == "resources/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resources": MCP_RESOURCES_DEFINITIONS
+            }
+        })
+
+    elif method == "resources/read":
+        uri = params.get("uri", "")
+        res_data, is_error = read_mcp_resource(uri)
+        if is_error:
+            return JSONResponse(status_code=404, content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": res_data.get("error", "Resource read error")
+                }
+            })
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "contents": [res_data]
+            }
+        })
+
+    # 6. Fallback Method Handler
     else:
         return JSONResponse(status_code=404, content={
             "jsonrpc": "2.0",

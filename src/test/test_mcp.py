@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import unittest
 from fastapi.testclient import TestClient
 
@@ -61,13 +62,20 @@ class TestMCPLogic(unittest.TestCase):
         self.assertEqual(data["id"], 1)
         self.assertEqual(data["result"]["protocolVersion"], "2024-11-05")
         self.assertIn("tools", data["result"]["capabilities"])
+        self.assertTrue(data["result"]["capabilities"]["tools"]["listChanged"])
+        self.assertIn("resources", data["result"]["capabilities"])
+        self.assertIn("prompts", data["result"]["capabilities"])
         self.assertEqual(data["result"]["serverInfo"]["name"], MCP_SERVER_INFO["name"])
 
     def test_mcp_jsonrpc_notifications_and_ping(self):
-        """Verify notifications/initialized and ping methods."""
+        """Verify notifications/initialized, initialized alias, and ping methods."""
         res = self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["result"], {})
+
+        res_alias = self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "initialized"})
+        self.assertEqual(res_alias.status_code, 200)
+        self.assertEqual(res_alias.json()["result"], {})
 
         res = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "ping"})
         self.assertEqual(res.status_code, 200)
@@ -249,6 +257,95 @@ class TestMCPLogic(unittest.TestCase):
             headers={"Host": "192.168.1.50:8002", "X-Forwarded-Proto": "https"}
         )
         self.assertEqual(res.status_code, 200)
+
+    def test_mcp_tools_call_parameters_and_stringified(self):
+        """Verify tools/call handles 'parameters' alias and stringified JSON arguments."""
+        # 1. parameters key
+        req1 = {
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "list_directory",
+                "parameters": {"path": "."}
+            }
+        }
+        res1 = self.client.post("/mcp", json=req1)
+        self.assertEqual(res1.status_code, 200)
+        self.assertFalse(res1.json()["result"]["isError"])
+
+        # 2. stringified JSON arguments
+        req2 = {
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "tools/call",
+            "params": {
+                "name": "list_directory",
+                "arguments": '{"path": "."}'
+            }
+        }
+        res2 = self.client.post("/mcp", json=req2)
+        self.assertEqual(res2.status_code, 200)
+        self.assertFalse(res2.json()["result"]["isError"])
+
+    def test_mcp_resources_list_and_read(self):
+        """Verify resources/list and resources/read endpoints."""
+        # 1. resources/list
+        res = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 201, "method": "resources/list"})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        resources = data["result"]["resources"]
+        uris = [r["uri"] for r in resources]
+        self.assertIn("workspace://files", uris)
+        self.assertIn("workspace://git_status", uris)
+
+        # 2. resources/read for workspace://files
+        res_files = self.client.post("/mcp", json={
+            "jsonrpc": "2.0",
+            "id": 202,
+            "method": "resources/read",
+            "params": {"uri": "workspace://files"}
+        })
+        self.assertEqual(res_files.status_code, 200)
+        files_data = res_files.json()
+        contents = files_data["result"]["contents"]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0]["uri"], "workspace://files")
+        self.assertEqual(contents[0]["mimeType"], "application/json")
+        parsed_files = json.loads(contents[0]["text"])
+        self.assertIn("serenitydevserver.py", parsed_files["files"])
+
+        # 3. resources/read for workspace://git_status
+        res_git = self.client.post("/mcp", json={
+            "jsonrpc": "2.0",
+            "id": 203,
+            "method": "resources/read",
+            "params": {"uri": "workspace://git_status"}
+        })
+        self.assertEqual(res_git.status_code, 200)
+        git_data = res_git.json()
+        contents_git = git_data["result"]["contents"]
+        self.assertEqual(len(contents_git), 1)
+        self.assertEqual(contents_git[0]["uri"], "workspace://git_status")
+        self.assertEqual(contents_git[0]["mimeType"], "text/plain")
+
+        # 4. resources/read for invalid uri
+        res_invalid = self.client.post("/mcp", json={
+            "jsonrpc": "2.0",
+            "id": 204,
+            "method": "resources/read",
+            "params": {"uri": "workspace://unknown_res"}
+        })
+        self.assertEqual(res_invalid.status_code, 404)
+        self.assertEqual(res_invalid.json()["error"]["code"], -32602)
+
+    def test_native_mcp_helpers(self):
+        """Verify get_all_local_ips and start_native_mcp network functions."""
+        from start_native_mcp import get_all_local_ips, get_local_ip
+        local_ip = get_local_ip()
+        self.assertTrue(local_ip)
+        all_ips = get_all_local_ips()
+        self.assertIn(local_ip, all_ips)
 
 if __name__ == "__main__":
     unittest.main()
