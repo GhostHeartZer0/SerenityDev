@@ -1,6 +1,13 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
+## Version 1.6.5
+- **Security Hardening & AI-Accelerated Attack Surface Mitigation**:
+  - **Git History Secret Audit**: Audited repository commit history for private keys, PEM/CRT files, and API key tokens (`sk-`, `ghp_`, `AIzaSy`). Confirmed 0 secrets committed across all branches.
+  - **Automated Pre-Commit Secret Scanner**: Created `pre_commit_secret_check.py` and installed `.git/hooks/pre-commit` to prevent accidental staging and committing of `.env` files, certificates, private keys, high-entropy API tokens, and credentials.
+  - **Dependency Vulnerability Remediation**: Fixed moderate DoS/parsing vulnerability in `qs` via `npm audit fix` (updated `package-lock.json` to `qs@6.16.0`). Audited Python dependencies via `pip-audit` (`0 vulnerabilities` across `requirements.txt`). Upgraded `pydantic-settings` to remediate `GHSA-4xgf-cpjx-pc3j`.
+  - **MCP & Tool Execution Sandboxing Audit**: Verified `is_path_allowed()` and `validate_path_containment()` path traversal barriers, case normalization, symlink resolution, and `.env` isolation. Verified two-tier command execution sandbox in `serenitydevserver.py` (`COMMAND_RULES`) blocking arbitrary shell code evaluation, process kills, destructive file removals, and token leakage.
+
 ## Version 1.6.4
 - **Documentation & Model Architecture Chart Overhaul**:
   - Rewrote `README.md` following decreasing-verbosity structure: concise overview and purpose, 5-step Quick Setup Guide with explicit OS, Python (3.10–3.14), CUDA/GPU, and backend compiler prerequisites, daily usage patterns (Sidebar, Copilot Chat participant `@serenity`, status control panel), feature execution guide, and quick reference tables.
