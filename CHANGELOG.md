@@ -1,6 +1,50 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
+## Version 1.6.8
+- **Extension Server Resolution Fix (`src/extension.ts`)**:
+  - Updated `findServerScript()` to prioritize `vscode.workspace.workspaceFolders` before `context.extensionPath`, preventing booting the bundled stale server over live workspace updates.
+- **Packaging Hygiene (`.vscodeignore`)**:
+  - Excluded `venv/**`, `.idea/**`, `.pytest_cache/**`, `Edge Gallery/**`, and `jetbrains-plugin/**` from VSIX packaging, reducing payload to 2.18 MB.
+- **GGML Assertion Abort Fix (`serenitydevserver.py`)**:
+  - In `get_llama_model()`, guarded quantized `type_k` and `type_v` cache settings with `if offload_kqv`, preventing fatal C++ `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` aborts inside `llama_cpp` during hybrid CPU/GPU layer offloading.
+- **Antigravity MCP SSE Stream & Notification Compliance (`serenitydevserver.py`)**:
+  - In `mcp_streamable_http_endpoint()`, added SSE keepalive stream on `GET /mcp` when `Accept: text/event-stream` is requested.
+  - In `process_mcp_rpc_message()`, returned HTTP 202 Accepted (`Response(status_code=202)`) without JSON body for JSON-RPC notifications (`req_id is None`).
+- **VS Code Copilot Chat & @serenity Command Preservation (`src/extension.ts`)**:
+  - Prepended `/${request.command}` to the prompt in `@serenity` handler, preventing loss of `/plan`, `/explore`, `/execute`, and `/agent`.
+  - Added `Authorization: Bearer ${authToken}` header to `/ask_stream` `http.request` calls.
+- **Streaming Keepalive & OpenAI History Context (`serenitydevserver.py`)**:
+  - Emitted initial `{"type": "progress", "text": "🧠 {mapped_model} thinking (turn {loop_count + 1})..."}` before entering the completion stream loop in `run_orchestration()` to prevent Copilot timeout during warmup.
+  - Passed complete `formatted_prompt` into `QueryRequest` in non-streaming `/v1/chat/completions` instead of discarding conversation history.
+- **Android Studio Context Injection (`serenitydevserver.py`)**:
+  - Injected `request.context` inside ```` ``` ```` code blocks into `current_prompt` in `run_orchestration()`, capturing selected editor code sent by `SerenityDevAction.kt` / `IntelliJ.kt`.
+- **VSIX Packaging & Deployment**:
+  - Rebuilt `SerenityDev-1.6.0.vsix` and force-installed into both VS Code and Antigravity IDE.
+
+## Version 1.6.7
+- **Localhost MCP Exemption & Dedicated SSE/Messages Transport**:
+  - Allowed plain HTTP and bypassed Bearer token authentication in `serenitydevserver.py` `/mcp` route and `verify_mcp_auth()` when `request.client.host in ("127.0.0.1", "::1", "localhost")`.
+  - Added dedicated `GET /mcp/sse` and `POST /mcp/messages` endpoints for local SSE MCP clients.
+- **Antigravity STDIO Bridge & Configuration**:
+  - Implemented `--stdio` flag in `start_native_mcp.py` dispatching JSON-RPC 2.0 lines from `sys.stdin` to `process_mcp_rpc_message()` and writing clean responses to `sys.stdout`.
+  - Configured `~/.gemini/config/mcp_config.json` with `serenitydev` stdio command and args.
+- **Root CA Server Port Relocation**:
+  - Moved temporary `rootCA.pem` HTTP download server in `start_native_mcp.py` from port `8080` to `8089` to eliminate collisions with `llama-server`.
+- **VSCode / Copilot LanguageModelChat Streaming Fallback**:
+  - Added boolean `hasReportedText` tracking in `provideLanguageModelChatResponse` in `src/extension.ts`.
+  - Forwarded `progress` and `edit_proof` events as formatted markdown parts (`vscode.LanguageModelTextPart`).
+  - Added step summary fallback ensuring Copilot never receives an empty completion turn on stream exit.
+- **Thought Channel Isolation & Exit Flush**:
+  - Flushed `StreamingThoughtFilter.flush_remaining()` as `{"type": "content", "content": ...}` chunks before emitting `[DONE]` across direct completion and orchestration streams.
+- **Extension Purge, Rebuild & Multi-IDE Reinstall**:
+  - Purged stale extension directories, rebuilt `SerenityDev-1.6.0.vsix` via `build_extension.py`, and reinstalled fresh package into both VS Code and Antigravity IDE.
+- **Markdown Security Hardening**:
+  - Scoped `createSafeMarkdown()` in `src/extension.ts` with `isTrusted: { enabledCommands: ['serenity.keepChange', 'serenity.rejectChange'] }` and `supportHtml: true`.
+- **JetBrains / Android Studio Plugin Scaffolding**:
+  - Migrated `IntelliJ.kt` to `jetbrains-plugin/src/main/kotlin/SerenityDevAction.kt`, replaced manual string parsing with bundled `com.google.gson.JsonParser`, and forwarded API key headers.
+  - Scaffolded complete `jetbrains-plugin/` project with `build.gradle.kts`, `settings.gradle.kts`, `gradle.properties`, wrapper, and `META-INF/plugin.xml`.
+
 ## Version 1.6.6
 - **MCP Server Discovery, RFC 9728 OAuth & Protocol Compliance Fix**:
   - **Stateless Server Discovery (`server/discover`)**: Added handler for `server/discover` (and `discover` alias) in `serenitydevserver.py` complying with MCP 2026-07-28 stateless discovery specification, eliminating 404 handshake fallback loops.

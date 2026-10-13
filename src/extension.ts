@@ -126,8 +126,8 @@ const ASK_URL = `${SERVER_BASE}/ask`;
 
 function createSafeMarkdown(content: string): vscode.MarkdownString {
     const md = new vscode.MarkdownString(content);
-    md.isTrusted = true;
     md.supportHtml = true;
+    md.isTrusted = { enabledCommands: ['serenity.keepChange', 'serenity.rejectChange'] };
     return md;
 }
 
@@ -425,12 +425,14 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         return new Promise<void>((resolve) => {
+            const effectivePrompt = request.command ? `/${request.command} ${request.prompt}`.trim() : request.prompt;
             const postData = JSON.stringify({
-                prompt: request.prompt,
+                prompt: effectivePrompt,
                 session_id: 'native_chat',
                 workspace_dir: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || ''
             });
 
+            const authToken = process.env.SERENITY_MCP_TOKEN || vscode.workspace.getConfiguration('serenitydev').get<string>('mcpToken')?.trim();
             const req = http.request({
                 hostname: SERVER_HOST,
                 port: SERVER_PORT,
@@ -438,7 +440,8 @@ export function activate(context: vscode.ExtensionContext) {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Content-Length': Buffer.byteLength(postData)
+                    'Content-Length': Buffer.byteLength(postData),
+                    ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
                 }
             }, (res: http.IncomingMessage) => {
                 let buffer = '';
@@ -564,6 +567,7 @@ export function activate(context: vscode.ExtensionContext) {
                     workspace_dir: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || ''
                 });
 
+                const authToken = process.env.SERENITY_MCP_TOKEN || vscode.workspace.getConfiguration('serenitydev').get<string>('mcpToken')?.trim();
                 const req = http.request({
                     hostname: SERVER_HOST,
                     port: SERVER_PORT,
@@ -571,10 +575,33 @@ export function activate(context: vscode.ExtensionContext) {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'Content-Length': Buffer.byteLength(postData)
+                        'Content-Length': Buffer.byteLength(postData),
+                        ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
                     }
                 }, (res: http.IncomingMessage) => {
                     let buffer = '';
+                    let hasReportedText = false;
+                    const stepSummaries: string[] = [];
+
+                    const handleDataEvent = (data: any) => {
+                        if (data.type === 'content' && typeof data.content === 'string') {
+                            progress.report(new vscode.LanguageModelTextPart(data.content));
+                            hasReportedText = true;
+                        } else if (data.type === 'progress' && typeof data.text === 'string') {
+                            progress.report(new vscode.LanguageModelTextPart(`\n_${data.text}_\n\n`));
+                            hasReportedText = true;
+                            stepSummaries.push(data.text);
+                        } else if (data.type === 'edit_proof') {
+                            const proofTag = data.proof ? `\`${data.proof}\`` : (data.details || 'Edit applied');
+                            progress.report(new vscode.LanguageModelTextPart(`\n> 📝 **Edit Proof:** ${proofTag}\n\n`));
+                            hasReportedText = true;
+                            stepSummaries.push(`Applied edit: ${data.proof || data.details || 'Edit applied'}`);
+                        } else if (data.type === 'error' && typeof data.detail === 'string') {
+                            progress.report(new vscode.LanguageModelTextPart(`\n\n❌ **Error:** ${data.detail}\n\n`));
+                            hasReportedText = true;
+                        }
+                    };
+
                     res.on('data', (chunk: any) => {
                         buffer += chunk.toString();
 
@@ -582,30 +609,24 @@ export function activate(context: vscode.ExtensionContext) {
                         buffer = lines.pop() || '';
 
                         for (const line of lines) {
-                            parseSseLine(line, (data) => {
-                                if (data.type === 'content' && typeof data.content === 'string') {
-                                    progress.report(new vscode.LanguageModelTextPart(data.content));
-                                } else if (data.type === 'progress' && typeof data.text === 'string') {
-                                    progress.report(new vscode.LanguageModelTextPart(`\n_${data.text}_\n\n`));
-                                } else if (data.type === 'error' && typeof data.detail === 'string') {
-                                    progress.report(new vscode.LanguageModelTextPart(`\n\n❌ **Error:** ${data.detail}\n\n`));
-                                }
-                            });
+                            parseSseLine(line, handleDataEvent);
                         }
                     });
 
                     res.on('end', () => {
                         if (buffer.trim()) {
-                            parseSseLine(buffer, (data) => {
-                                if (data.type === 'content' && typeof data.content === 'string') {
-                                    progress.report(new vscode.LanguageModelTextPart(data.content));
-                                } else if (data.type === 'progress' && typeof data.text === 'string') {
-                                    progress.report(new vscode.LanguageModelTextPart(`\n_${data.text}_\n\n`));
-                                }
-                            });
+                            parseSseLine(buffer, handleDataEvent);
                         }
                         if (res.statusCode && res.statusCode >= 400) {
                             progress.report(new vscode.LanguageModelTextPart(`❌ SerenityDev server returned HTTP ${res.statusCode}.`));
+                            hasReportedText = true;
+                        }
+                        if (!hasReportedText) {
+                            const fallback = stepSummaries.length > 0
+                                ? `Task completed:\n\n${stepSummaries.map(s => `- ${s}`).join('\n')}`
+                                : 'Task completed successfully.';
+                            progress.report(new vscode.LanguageModelTextPart(fallback));
+                            hasReportedText = true;
                         }
                         resolve();
                     });

@@ -21,6 +21,12 @@ scratch/**
 .git/**
 .agents/**
 .serenity_cache/**
+.pytest_cache/**
+venv/**
+.idea/**
+Edge Gallery/**
+jetbrains-plugin/**
 *.key
 *.pem
 *.crt
+

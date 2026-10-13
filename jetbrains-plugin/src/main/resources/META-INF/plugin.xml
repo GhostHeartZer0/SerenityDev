@@ -1,0 +1,20 @@
+<idea-plugin>
+    <id>com.serenitydev.plugin</id>
+    <name>SerenityDev</name>
+    <version>1.0.0</version>
+    <vendor email="support@serenitydev.local" url="https://github.com/GhostHeartZer0/SerenityDev">GhostHeartZer0</vendor>
+
+    <description><![CDATA[
+    Autonomous assistant integrating SerenityDev local orchestrator into IntelliJ IDEA and Android Studio.
+    Provides fast, context-aware code refactoring and generation powered by local models.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <actions>
+        <action id="SerenityDev.Action" class="com.serenitydev.SerenityDevAction" text="SerenityDev Assistant" description="Invoke SerenityDev local assistant">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt S"/>
+        </action>
+    </actions>
+</idea-plugin>

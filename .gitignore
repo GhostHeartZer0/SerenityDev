@@ -13,6 +13,8 @@ dist/
 .vscode-test/
 .serenity_cache/
 .pytest_cache/
+jetbrains-plugin/.gradle/
+jetbrains-plugin/build/
 
 # Data & Models
 models/

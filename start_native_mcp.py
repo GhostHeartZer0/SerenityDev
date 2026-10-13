@@ -1,10 +1,15 @@
+import sys
+
+is_stdio = "--stdio" in sys.argv
+if is_stdio:
+    sys.stdout = sys.stderr
+
 from startup import initialize_environment
 
 try:
     initialize_environment()
 except RuntimeError as e:
-    import sys
-    print(f"\n{e}")
+    sys.stderr.write(f"\n{e}\n")
     sys.exit(1)
 
 import os
@@ -198,7 +203,7 @@ def ensure_pqc_root_ca_and_cert(
         print(f"[!] Certificate generation failed: {e}")
         sys.exit(1)
 
-def start_ca_downloader_server(ca_path: str, port: int = 8080):
+def start_ca_downloader_server(ca_path: str, port: int = 8089):
     """Starts a background HTTP server serving only the rootCA.pem file for Android browser download."""
     class CAHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
@@ -232,9 +237,35 @@ def start_ca_downloader_server(ca_path: str, port: int = 8080):
         print(f"[!] Could not start CA server on port {port}: {e}")
         return None
 
+def run_stdio():
+    """Reads JSON-RPC lines from sys.stdin, forwards them to execute_mcp_tool_call, writes to sys.__stdout__."""
+    import json
+    from serenitydevserver import process_mcp_rpc_message
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+            sys.__stdout__.write(json.dumps(err_resp) + "\n")
+            sys.__stdout__.flush()
+            continue
+
+        resp_obj, _ = process_mcp_rpc_message(req)
+        if resp_obj is not None:
+            sys.__stdout__.write(json.dumps(resp_obj) + "\n")
+            sys.__stdout__.flush()
+
 def main():
+    if "--stdio" in sys.argv:
+        run_stdio()
+        return
+
     port = int(os.environ.get("NATIVE_MCP_PORT", "8443"))
-    ca_port = 8080
+    ca_port = 8089
 
     # Auto-free ports if held by stale background instances
     free_port(port)
@@ -248,7 +279,7 @@ def main():
         token = SerenityKeyVault.get_machine_entropy().hex()[:32]
         os.environ["SERENITY_MCP_TOKEN"] = token
 
-    # Spin up CA download server on port 8080
+    # Spin up CA download server on port 8089
     start_ca_downloader_server(ca_cert_path, port=ca_port)
 
     print("\n=======================================================")

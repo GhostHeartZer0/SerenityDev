@@ -1,10 +1,50 @@
 Created At: 2026-07-17T20:37:54Z
-Last Updated: 2026-09-02T11:45:00Z
-File Path: `file:///F:/SerenityDev/TODO.txt`
+Last Updated: 2026-10-13T16:00:00Z
+File Path: `file:///c:/Users/ccrg6/Desktop/Hub/Serenities/SerenityDev/TODO.txt`
 
 =========================================
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
+
+[DONE] 4-IDE Interface & Server Crash Bugfixes (v1.6.8):
+- Extension Server Resolution: findServerScript() in src/extension.ts checks workspaceFolders before context.extensionPath.
+- Packaging Cleanup: .vscodeignore excludes venv/**, .idea/**, .pytest_cache/**, Edge Gallery/**, jetbrains-plugin/**.
+- GGML Crash Elimination: get_llama_model() in serenitydevserver.py guards type_k/type_v with if offload_kqv, preventing fatal C++ GGML_ASSERT aborts on partial layer offload.
+- Antigravity MCP Handshake: GET /mcp returns SSE keepalive stream on text/event-stream accept header; notifications (id: None) return HTTP 202; CA server moved to port 8089.
+- Copilot Chat & @serenity: Prepends /${request.command} to prompt, attaches Authorization: Bearer header on /ask_stream calls, emits initial thinking progress event in run_orchestration(), and passes formatted_prompt in non-streaming /v1/chat/completions.
+- Android Studio: Injects request.context into current_prompt in run_orchestration().
+- VSIX Rebuilt & Reinstalled: Built SerenityDev-1.6.0.vsix (2.18 MB) and installed into VS Code and Antigravity IDE. [Done]
+
+[DONE] Localhost MCP Auth Exemption & Local SSE Endpoints:
+- Bypassed Bearer token auth in verify_mcp_auth() and plain HTTP check in /mcp for localhost ("127.0.0.1", "::1", "localhost").
+- Added GET /mcp/sse and POST /mcp/messages pair for local SSE clients. [Done]
+
+[DONE] MCP STDIO Wrapper & Antigravity Configuration:
+- Added --stdio flag to start_native_mcp.py reading JSON-RPC lines from stdin and writing clean responses to stdout.
+- Configured ~/.gemini/config/mcp_config.json with serenitydev stdio command and args. [Done]
+
+[DONE] Native MCP CA Server Port Migration:
+- Migrated temporary rootCA.pem HTTP server in start_native_mcp.py from :8080 to :8089 to prevent collisions with llama-server. [Done]
+
+[DONE] LanguageModelTextPart Fallback & Edit Proof Handling:
+- Tracked hasReportedText in provideLanguageModelChatResponse in src/extension.ts.
+- Forwarded progress and edit_proof events as formatted markdown chunks; emitted step summary fallback on stream close. [Done]
+
+[DONE] Thought Channel Isolation & Stream Exit Flush:
+- Flushed StreamingThoughtFilter before [DONE] and yielded remaining tokens as {"type": "content", "content": ...} chunks. [Done]
+
+[DONE] Stale Extension Purge & Fresh VSIX Reinstall:
+- Cleaned stale extension directories. Built fresh SerenityDev-1.6.0.vsix and installed into both VSCode and Antigravity IDE. [Done]
+
+[DONE] Scoped Trust in createSafeMarkdown:
+- Scoped MarkdownString trust to safe serenity commands ('serenity.keepChange', 'serenity.rejectChange') and enabled HTML support. [Done]
+
+[DONE] JetBrains Plugin Scaffold & Gson Parser:
+- Moved IntelliJ.kt to jetbrains-plugin/src/main/kotlin/SerenityDevAction.kt with Gson response parsing and API key forwarding.
+- Scaffolded build.gradle.kts, settings.gradle.kts, gradle.properties, and META-INF/plugin.xml. [Done]
+
+[HUMAN VERIFICATION] JetBrains Plugin in Android Studio:
+- In Android Studio: Settings -> Plugins -> Install Plugin from Disk, select jetbrains-plugin/build/distributions/serenitydev-jetbrains-plugin-1.0.0.zip.
 
 [DONE] MCP JSON-RPC Spec Alignment (tools/call, server/discover, Prompts, subscriptions/listen & RFC 9728):
 - Aligned `@app.api_route("/mcp", ...)` in `serenitydevserver.py` with JSON-RPC 2.0 and MCP 2024-2026 specification.

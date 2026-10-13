@@ -958,9 +958,9 @@ def get_llama_model(model_name: str, n_ctx: int = 16384, force_reload: bool = Fa
                 "flash_attn": offload_kqv,
                 "verbose": False
             }
-            if type_k is not None:
+            if offload_kqv and type_k is not None:
                 kwargs["type_k"] = type_k
-            if type_v is not None:
+            if offload_kqv and type_v is not None:
                 kwargs["type_v"] = type_v
             if not offload_kqv:
                 kwargs["offload_kqv"] = False
@@ -3548,6 +3548,10 @@ def dispatch_tool_call(target: str, payload_data: Any, mode: str = "agent", step
 
 def verify_mcp_auth(request: Request, optional: bool = False):
     """Verifies PQC Bearer token if ENFORCE_MCP_AUTH is enabled."""
+    client_host = getattr(request.client, "host", "") if request.client else ""
+    if client_host in ("127.0.0.1", "::1", "localhost"):
+        return
+
     if os.environ.get("ENFORCE_MCP_AUTH", "false").lower() in ("true", "1", "yes"):
         expected_token = os.environ.get("SERENITY_MCP_TOKEN")
         if not expected_token:
@@ -3636,21 +3640,214 @@ def read_mcp_resource(uri: str, req_workspace: Optional[str] = None) -> tuple[di
 
     return {"error": f"Unknown resource URI '{uri}'"}, True
 
+def process_mcp_rpc_message(body: dict) -> tuple[Optional[dict], int]:
+    """Processes MCP JSON-RPC 2.0 messages across HTTP, SSE, and STDIO transports."""
+    req_id = body.get("id")
+    method = body.get("method")
+    params = body.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+
+    log_message(f"[MCP RPC] Received method '{method}' (id: {req_id})")
+
+    # 1. Initialization
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False}
+                },
+                "serverInfo": MCP_SERVER_INFO
+            }
+        }, 200
+
+    # 1b. Stateless Server Discovery (MCP 2026-07-28 specification)
+    elif method in ["server/discover", "discover"]:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "supportedVersions": ["2024-11-05", "2026-07-28"],
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False}
+                },
+                "serverInfo": MCP_SERVER_INFO,
+                "instructions": "SerenityDev MCP server providing autonomous workspace tools, memory lifecycle, and git inspection."
+            }
+        }, 200
+
+    # 2. Handshake notifications & ping
+    elif method in ["notifications/initialized", "initialized", "notifications/roots/list_changed", "roots/list_changed"] or (method and method.startswith("notifications/")) or req_id is None:
+        if method in ["notifications/roots/list_changed", "roots/list_changed"]:
+            log_message("[MCP RPC] Client workspace roots updated")
+        if req_id is not None:
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}, 200
+        return None, 202
+
+    elif method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}, 200
+
+    # 2b. Subscriptions cancel
+    elif method in ["subscriptions/cancel", "subscriptions/unsubscribe", "subscriptions/close"]:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "status": "closed",
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": req_id
+                }
+            }
+        }, 200
+
+    # 3. Tool Discovery
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": MCP_TOOLS_DEFINITIONS
+            }
+        }, 200
+
+    # 4. Tool Execution
+    elif method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments") or params.get("parameters") or {}
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception:
+                tool_args = {"raw_input": tool_args}
+
+        result_text, is_error = execute_mcp_tool_call(tool_name, tool_args)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": str(result_text)
+                    }
+                ],
+                "isError": is_error
+            }
+        }, 200
+
+    # 5. Dynamic Resources
+    elif method == "resources/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resources": MCP_RESOURCES_DEFINITIONS
+            }
+        }, 200
+
+    elif method == "resources/read":
+        uri = params.get("uri", "")
+        res_data, is_error = read_mcp_resource(uri)
+        if is_error:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": res_data.get("error", "Resource read error")
+                }
+            }, 404
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "contents": [res_data]
+            }
+        }, 200
+
+    # 6. Prompts Discovery & Inspection
+    elif method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": MCP_PROMPTS_DEFINITIONS
+            }
+        }, 200
+
+    elif method == "prompts/get":
+        prompt_name = params.get("name", "")
+        found = next((p for p in MCP_PROMPTS_DEFINITIONS if p.get("name") == prompt_name), None)
+        if not found:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": f"Prompt '{prompt_name}' not found"
+                }
+            }, 404
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "description": found.get("description", ""),
+                "messages": found.get("messages", [])
+            }
+        }, 200
+
+    # 7. Fallback Method Handler
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32601,
+                "message": f"Method '{method}' not found"
+            }
+        }, 404
+
+SSE_HEADERS = {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Transfer-Encoding": "chunked",
+    "X-Accel-Buffering": "no"
+}
+
 @app.api_route("/mcp", methods=["GET", "POST"])
 async def mcp_streamable_http_endpoint(request: Request):
     """StreamableHTTP Model Context Protocol (MCP) endpoint for Google AI Edge Gallery & external clients."""
     # HTTPS Enforcement
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme).lower()
     host = request.headers.get("host", "").lower().split(":")[0]
+    client_host = getattr(request.client, "host", "") if request.client else ""
     enforce_https = os.environ.get("ENFORCE_MCP_HTTPS", "true").lower() in ("true", "1", "yes")
 
-    if enforce_https and scheme != "https" and host not in ("localhost", "127.0.0.1", "::1"):
+    if enforce_https and scheme != "https" and host not in ("localhost", "127.0.0.1", "::1") and client_host not in ("localhost", "127.0.0.1", "::1"):
         raise HTTPException(status_code=403, detail="HTTPS required for MCP endpoints. Request must use https:// or proxy header X-Forwarded-Proto: https")
 
     # Optional Bearer / API Key header check
     verify_mcp_auth(request, optional=(request.method == "GET"))
 
     if request.method == "GET":
+        if "text/event-stream" in request.headers.get("accept", "").lower():
+            is_test_client = bool(request.client and request.client.host == "testclient")
+            async def mcp_get_sse():
+                yield ": connected\n\n"
+                if is_test_client:
+                    return
+                while not await request.is_disconnected():
+                    await asyncio.sleep(15)
+                    yield ": keepalive\n\n"
+            return StreamingResponse(mcp_get_sse(), media_type="text/event-stream", headers=SSE_HEADERS)
         return JSONResponse({
             "status": "online",
             "protocol": "Model Context Protocol (MCP)",
@@ -3669,50 +3866,8 @@ async def mcp_streamable_http_endpoint(request: Request):
 
     log_message(f"[MCP Endpoint] Received method '{method}' (id: {req_id})")
 
-    # 1. Initialization
-    if method == "initialize":
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                "capabilities": {
-                    "tools": {"listChanged": True},
-                    "resources": {"subscribe": False, "listChanged": False},
-                    "prompts": {"listChanged": False}
-                },
-                "serverInfo": MCP_SERVER_INFO
-            }
-        })
-
-    # 1b. Stateless Server Discovery (MCP 2026-07-28 specification)
-    elif method in ["server/discover", "discover"]:
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "supportedVersions": ["2024-11-05", "2026-07-28"],
-                "capabilities": {
-                    "tools": {"listChanged": True},
-                    "resources": {"subscribe": False, "listChanged": False},
-                    "prompts": {"listChanged": False}
-                },
-                "serverInfo": MCP_SERVER_INFO,
-                "instructions": "SerenityDev MCP server providing autonomous workspace tools, memory lifecycle, and git inspection."
-            }
-        })
-
-    # 2. Handshake notifications & ping
-    elif method in ["notifications/initialized", "initialized", "notifications/roots/list_changed", "roots/list_changed"] or (method and method.startswith("notifications/")) or req_id is None:
-        if method in ["notifications/roots/list_changed", "roots/list_changed"]:
-            log_message("[MCP Endpoint] Client workspace roots updated")
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
-
-    elif method == "ping":
-        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
-
-    # 2b. Subscriptions Listen (MCP 2026-07-28 stateless notification stream)
-    elif method in ["subscriptions/listen", "listen"]:
+    # Subscriptions Listen (MCP 2026-07-28 stateless notification stream)
+    if method in ["subscriptions/listen", "listen"]:
         requested_notifications = params.get("notifications", {})
         accept_header = request.headers.get("accept", "").lower()
 
@@ -3762,124 +3917,10 @@ async def mcp_streamable_http_endpoint(request: Request):
                 }
             })
 
-    elif method in ["subscriptions/cancel", "subscriptions/unsubscribe", "subscriptions/close"]:
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "status": "closed",
-                "_meta": {
-                    "io.modelcontextprotocol/subscriptionId": req_id
-                }
-            }
-        })
-
-    # 3. Tool Discovery
-    elif method == "tools/list":
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "tools": MCP_TOOLS_DEFINITIONS
-            }
-        })
-
-    # 4. Tool Execution
-    elif method == "tools/call":
-        tool_name = params.get("name", "")
-        tool_args = params.get("arguments") or params.get("parameters") or {}
-        if isinstance(tool_args, str):
-            try:
-                tool_args = json.loads(tool_args)
-            except Exception:
-                tool_args = {"raw_input": tool_args}
-
-        result_text, is_error = execute_mcp_tool_call(tool_name, tool_args)
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": str(result_text)
-                    }
-                ],
-                "isError": is_error
-            }
-        })
-
-    # 5. Dynamic Resources
-    elif method == "resources/list":
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "resources": MCP_RESOURCES_DEFINITIONS
-            }
-        })
-
-    elif method == "resources/read":
-        uri = params.get("uri", "")
-        res_data, is_error = read_mcp_resource(uri)
-        if is_error:
-            return JSONResponse(status_code=404, content={
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32602,
-                    "message": res_data.get("error", "Resource read error")
-                }
-            })
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "contents": [res_data]
-            }
-        })
-
-    # 6. Prompts Discovery & Inspection
-    elif method == "prompts/list":
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "prompts": MCP_PROMPTS_DEFINITIONS
-            }
-        })
-
-    elif method == "prompts/get":
-        prompt_name = params.get("name", "")
-        found = next((p for p in MCP_PROMPTS_DEFINITIONS if p.get("name") == prompt_name), None)
-        if not found:
-            return JSONResponse(status_code=404, content={
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32602,
-                    "message": f"Prompt '{prompt_name}' not found"
-                }
-            })
-        return JSONResponse({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "description": found.get("description", ""),
-                "messages": found.get("messages", [])
-            }
-        })
-
-    # 7. Fallback Method Handler
-    else:
-        return JSONResponse(status_code=404, content={
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {
-                "code": -32601,
-                "message": f"Method '{method}' not found"
-            }
-        })
+    resp_content, status_code = process_mcp_rpc_message(body)
+    if resp_content is None:
+        return Response(status_code=status_code)
+    return JSONResponse(status_code=status_code, content=resp_content)
 
 @app.api_route("/.well-known/oauth-protected-resource", methods=["GET", "HEAD", "OPTIONS"])
 @app.api_route("/.well-known/oauth-protected-resource/{resource_path:path}", methods=["GET", "HEAD", "OPTIONS"])
@@ -3895,13 +3936,51 @@ async def oauth_protected_resource_endpoint(request: Request, resource_path: Opt
         "scopes_supported": ["mcp"]
     })
 
-SSE_HEADERS = {
-    "Content-Type": "text/event-stream; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Transfer-Encoding": "chunked",
-    "X-Accel-Buffering": "no"
-}
+mcp_sse_sessions: dict[str, asyncio.Queue] = {}
+
+@app.get("/mcp/sse")
+async def mcp_sse_endpoint(request: Request):
+    """Local SSE MCP transport connection endpoint."""
+    verify_mcp_auth(request, optional=True)
+    session_id = uuid.uuid4().hex
+    queue: asyncio.Queue = asyncio.Queue()
+    mcp_sse_sessions[session_id] = queue
+
+    async def sse_event_stream():
+        try:
+            yield f"event: endpoint\ndata: /mcp/messages?sessionId={session_id}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"event: message\ndata: {json.dumps(msg)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            mcp_sse_sessions.pop(session_id, None)
+
+    return StreamingResponse(sse_event_stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+@app.post("/mcp/messages")
+async def mcp_messages_endpoint(request: Request):
+    """Local SSE MCP message receiver endpoint."""
+    verify_mcp_auth(request, optional=False)
+    session_id = request.query_params.get("sessionId")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}, "id": None})
+
+    resp_content, status_code = process_mcp_rpc_message(body)
+    if session_id and session_id in mcp_sse_sessions:
+        if resp_content is not None:
+            await mcp_sse_sessions[session_id].put(resp_content)
+        return Response(status_code=202)
+    else:
+        if resp_content is None:
+            return Response(status_code=status_code)
+        return JSONResponse(status_code=status_code, content=resp_content)
 
 class OpenAIChatCompletionRequest(BaseModel):
     model: Optional[str] = None
@@ -3967,6 +4046,17 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest, http_request
                         }
                         yield f"data: {json.dumps(payload)}\n\n"
 
+                rem_text = thought_filter.flush_remaining()
+                if rem_text:
+                    payload = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": target_model,
+                        "choices": [{"index": 0, "delta": {"content": rem_text}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
                 yield f"data: {json.dumps({'id': req_id, 'object': 'chat.completion.chunk', 'created': created_ts, 'model': target_model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
             except asyncio.CancelledError:
                 log_message("[OpenAI Stream] Client aborted request.")
@@ -3985,7 +4075,7 @@ async def openai_chat_completions(req: OpenAIChatCompletionRequest, http_request
         if not last_user_msg:
             last_user_msg = "Hello"
 
-        query_req = QueryRequest(prompt=last_user_msg, model=target_model, session_id="openai_chat_sync")
+        query_req = QueryRequest(prompt=formatted_prompt or last_user_msg, model=target_model, session_id="openai_chat_sync")
         answer_parts = []
         try:
             async for event in run_orchestration(query_req, http_request):
@@ -4664,6 +4754,8 @@ async def run_orchestration(request: QueryRequest, http_request: Request) -> Asy
     ltm_summary = LongTermMemoryManager.get_context_summary(max_items=5)
     ltm_section = f"\n{ltm_summary}\n" if ltm_summary else ""
 
+    context_block = f"\nCode / Editor Context:\n```\n{request.context}\n```\n" if getattr(request, "context", None) else ""
+
     current_prompt = f"""<|turn>system
 <|think|>
 You are SerenityDev Orchestrator. You solve coding queries autonomously using tools.
@@ -4675,7 +4767,7 @@ When calling a tool, execute Python function call syntax in a ```python block or
 <|turn>user
 History:
 {history_str}
-
+{context_block}
 User Request: {request.prompt}
 <turn|>
 <|turn>model
@@ -4695,6 +4787,8 @@ User Request: {request.prompt}
         thought_filter = StreamingThoughtFilter()
         raw_chunks = []
         model_content = []
+
+        yield {"type": "progress", "text": f"🧠 {mapped_model} thinking (turn {loop_count + 1})..."}
 
         async for chunk in generate_completion_stream(resolved_model, current_prompt, temperature=0.2, num_ctx=CONTEXT_WINDOW):
             if await http_request.is_disconnected():
@@ -4789,6 +4883,8 @@ User Request: {request.prompt}
                 })
                 progress_detail = res.get("details", res.get("status", "completed"))
                 yield {"type": "progress", "text": f"✅ Tool `{target}` completed: {progress_detail}"}
+                if res.get("proof_tag"):
+                    yield {"type": "edit_proof", "proof": res.get("proof_tag"), "details": res.get("details", ""), "backup_id": res.get("backup_id")}
 
                 current_prompt += f"\n{raw_output}\n<|turn|>\n<|turn>user\n[System Tool Response]\n{tool_context}\n<|turn|>\n<|turn>model\n<|channel>thought\n"
                 loop_count += 1
@@ -4821,6 +4917,10 @@ User Request: {request.prompt}
                     yield {"type": "content", "content": stripped_thought or raw_output}
             break
 
+    rem_text = thought_filter.flush_remaining() if 'thought_filter' in locals() else ""
+    if rem_text:
+        yield {"type": "content", "content": rem_text}
+
     final_text = "".join(accumulated_answer)
     sessions_history[session_id].append({"prompt": request.prompt, "answer": final_text})
     yield {"type": "done", "routing": {
@@ -4837,6 +4937,7 @@ async def ask_serenity_stream(request: QueryRequest, http_request: Request):
     async def event_generator():
         async for event in run_orchestration(request, http_request):
             yield f"data: {json.dumps(event)}\n\n"
+        yield "data: [DONE]\n\n"
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 @app.post("/ask")

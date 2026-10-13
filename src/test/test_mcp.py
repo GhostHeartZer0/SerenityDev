@@ -39,7 +39,8 @@ class TestMCPLogic(unittest.TestCase):
         os.environ["ENFORCE_MCP_HTTPS"] = "false"
 
     def test_mcp_get_handshake(self):
-        """Verify GET /mcp handshake returns valid MCP metadata."""
+        """Verify GET /mcp handshake returns valid MCP metadata or SSE keepalive stream."""
+        # 1. Standard JSON metadata handshake
         res = self.client.get("/mcp")
         self.assertEqual(res.status_code, 200)
         data = res.json()
@@ -47,6 +48,12 @@ class TestMCPLogic(unittest.TestCase):
         self.assertEqual(data["protocol"], "Model Context Protocol (MCP)")
         self.assertEqual(data["transport"], "StreamableHTTP")
         self.assertEqual(data["server"]["name"], MCP_SERVER_INFO["name"])
+
+        # 2. SSE keepalive stream handshake for Antigravity
+        res_sse = self.client.get("/mcp", headers={"Accept": "text/event-stream"})
+        self.assertEqual(res_sse.status_code, 200)
+        self.assertIn("text/event-stream", res_sse.headers.get("content-type", ""))
+        self.assertIn(": connected", res_sse.text)
 
     def test_mcp_jsonrpc_initialize(self):
         """Verify POST /mcp initialize method."""
@@ -71,12 +78,10 @@ class TestMCPLogic(unittest.TestCase):
     def test_mcp_jsonrpc_notifications_and_ping(self):
         """Verify notifications/initialized, initialized alias, and ping methods."""
         res = self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"})
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()["result"], {})
+        self.assertEqual(res.status_code, 202)
 
         res_alias = self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "initialized"})
-        self.assertEqual(res_alias.status_code, 200)
-        self.assertEqual(res_alias.json()["result"], {})
+        self.assertEqual(res_alias.status_code, 202)
 
         res = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "ping"})
         self.assertEqual(res.status_code, 200)
@@ -382,22 +387,20 @@ class TestMCPLogic(unittest.TestCase):
         self.assertEqual(res_get.json()["error"]["code"], -32602)
 
     def test_mcp_notifications_roots_list_changed(self):
-        """Verify notifications/roots/list_changed and generic notifications with id=None return 200."""
+        """Verify notifications/roots/list_changed and generic notifications with id=None return 202."""
         # 1. notifications/roots/list_changed notification
         res1 = self.client.post("/mcp", json={
             "jsonrpc": "2.0",
             "method": "notifications/roots/list_changed"
         })
-        self.assertEqual(res1.status_code, 200)
-        self.assertEqual(res1.json()["result"], {})
+        self.assertEqual(res1.status_code, 202)
 
         # 2. Any client notification where id is omitted/None
         res2 = self.client.post("/mcp", json={
             "jsonrpc": "2.0",
             "method": "notifications/custom_event"
         })
-        self.assertEqual(res2.status_code, 200)
-        self.assertEqual(res2.json()["result"], {})
+        self.assertEqual(res2.status_code, 202)
 
     def test_mcp_oauth_protected_resource(self):
         """Verify RFC 9728 /.well-known/oauth-protected-resource metadata endpoints."""
@@ -453,6 +456,28 @@ class TestMCPLogic(unittest.TestCase):
         self.assertEqual(res_cancel.status_code, 200)
         self.assertEqual(res_cancel.json()["result"]["status"], "closed")
 
+    def test_mcp_localhost_bypass(self):
+        """Verify localhost bypasses ENFORCE_MCP_AUTH."""
+        os.environ["ENFORCE_MCP_AUTH"] = "true"
+        os.environ["SERENITY_MCP_TOKEN"] = "secret_required_token"
+
+        # Client with localhost host bypassing auth
+        client_local = TestClient(app, client=("127.0.0.1", 50000))
+        res = client_local.post("/mcp", json={"jsonrpc": "2.0", "id": 99, "method": "ping"})
+        self.assertEqual(res.status_code, 200)
+
+    def test_mcp_sse_and_messages(self):
+        """Verify GET /mcp/sse and POST /mcp/messages pair."""
+        # 1. Message POST directly
+        res = self.client.post("/mcp/messages", json={"jsonrpc": "2.0", "id": 100, "method": "ping"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["result"], {})
+
+        # 2. Tools list via messages endpoint
+        res = self.client.post("/mcp/messages", json={"jsonrpc": "2.0", "id": 101, "method": "tools/list"})
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(len(res.json()["result"]["tools"]) > 0)
+
     def test_native_mcp_helpers(self):
         """Verify get_all_local_ips and start_native_mcp network functions."""
         from start_native_mcp import get_all_local_ips, get_local_ip
@@ -463,3 +488,4 @@ class TestMCPLogic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
