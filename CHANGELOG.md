@@ -1,12 +1,22 @@
 # Change Log
 All notable changes to the "SerenityDev" extension will be documented in this file.
 
-## Version 1.6.5
+## Version 1.6.6
+- **MCP Server Discovery, RFC 9728 OAuth & Protocol Compliance Fix**:
+  - **Stateless Server Discovery (`server/discover`)**: Added handler for `server/discover` (and `discover` alias) in `serenitydevserver.py` complying with MCP 2026-07-28 stateless discovery specification, eliminating 404 handshake fallback loops.
+  - **MCP Prompts Protocol Support (`prompts/list`, `prompts/get`)**: Added `MCP_PROMPTS_DEFINITIONS` list and handlers for `prompts/list` and `prompts/get` to honor the advertised prompts capability in `initialize`.
+  - **Client Notifications Acceptance**: Extended notification dispatcher to accept `notifications/roots/list_changed`, `roots/list_changed`, and all generic client notifications (`notifications/*` or `id: None`) with HTTP 200 rather than falling through to 404 Method Not Found.
+  - **RFC 9728 OAuth 2.0 Protected Resource Metadata**: Implemented discovery endpoints at `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/{resource_path:path}` returning RFC 9728 metadata for MCP clients without 404 errors.
+  - **Stateless Subscriptions Listen (`subscriptions/listen`, `subscriptions/cancel`)**: Implemented MCP 2026-07-28 notification stream listener returning SSE `StreamingResponse` (`text/event-stream`) with initial `notifications/subscriptions/acknowledged` handshake and keepalives, plus JSON fallback and cancellation routes, resolving 404 on `subscriptions/listen`.
+  - **Automated Test Coverage**: Added tests in `src/test/test_mcp.py` (`test_mcp_server_discover`, `test_mcp_prompts_list_and_get`, `test_mcp_notifications_roots_list_changed`, `test_mcp_oauth_protected_resource`, `test_mcp_subscriptions_listen_and_cancel`). All 34 unit tests pass.
+
+  ## Version 1.6.5
 - **Security Hardening & AI-Accelerated Attack Surface Mitigation**:
   - **Git History Secret Audit**: Audited repository commit history for private keys, PEM/CRT files, and API key tokens (`sk-`, `ghp_`, `AIzaSy`). Confirmed 0 secrets committed across all branches.
   - **Automated Pre-Commit Secret Scanner**: Created `pre_commit_secret_check.py` and installed `.git/hooks/pre-commit` to prevent accidental staging and committing of `.env` files, certificates, private keys, high-entropy API tokens, and credentials.
   - **Dependency Vulnerability Remediation**: Fixed moderate DoS/parsing vulnerability in `qs` via `npm audit fix` (updated `package-lock.json` to `qs@6.16.0`). Audited Python dependencies via `pip-audit` (`0 vulnerabilities` across `requirements.txt`). Upgraded `pydantic-settings` to remediate `GHSA-4xgf-cpjx-pc3j`.
   - **MCP & Tool Execution Sandboxing Audit**: Verified `is_path_allowed()` and `validate_path_containment()` path traversal barriers, case normalization, symlink resolution, and `.env` isolation. Verified two-tier command execution sandbox in `serenitydevserver.py` (`COMMAND_RULES`) blocking arbitrary shell code evaluation, process kills, destructive file removals, and token leakage.
+  - **Git History Optimization**: Filtered historical `node_modules` blobs via `git-filter-repo` and pruned unreferenced objects. Reduced `.git` footprint from ~24 MB to ~2.4 MB (90% reduction).
 
 ## Version 1.6.4
 - **Documentation & Model Architecture Chart Overhaul**:

@@ -6,9 +6,13 @@ File Path: `file:///F:/SerenityDev/TODO.txt`
 ACTIVE TODO ITEMS & PRIORITIES
 =========================================
 
-[DONE] MCP JSON-RPC Spec Alignment (tools/call & Notifications):
+[DONE] MCP JSON-RPC Spec Alignment (tools/call, server/discover, Prompts, subscriptions/listen & RFC 9728):
 - Aligned `@app.api_route("/mcp", ...)` in `serenitydevserver.py` with JSON-RPC 2.0 and MCP 2024-2026 specification.
-- Notifications (`notifications/initialized`, `initialized`, `ping`) return HTTP 200/204 with empty result body or omitted/null id as required by spec.
+- Implemented `server/discover` stateless discovery RPC for modern MCP 2026-07-28 clients.
+- Added `MCP_PROMPTS_DEFINITIONS` and implemented `prompts/list` & `prompts/get` to honor advertised capabilities.
+- Generalized client notification acceptance (`notifications/roots/list_changed`, `roots/list_changed`, `notifications/*`, or `id: None`) returning HTTP 200.
+- Implemented `subscriptions/listen` notification stream with SSE `StreamingResponse`, initial `notifications/subscriptions/acknowledged` handshake, and `subscriptions/cancel`.
+- Implemented RFC 9728 `/.well-known/oauth-protected-resource` discovery endpoints to eliminate 404 client probes.
 - Enhanced `tools/call` parameter parsing to handle arguments wrapped in `arguments`, `parameters`, or raw dictionary/JSON string inputs.
 - Verified fallback method handler returns spec-compliant `-32601` JSON-RPC error. [Done]
 

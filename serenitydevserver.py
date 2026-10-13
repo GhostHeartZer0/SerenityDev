@@ -2607,6 +2607,8 @@ MCP_RESOURCES_DEFINITIONS = [
     }
 ]
 
+MCP_PROMPTS_DEFINITIONS = []
+
 def _extra_workspace_dirs() -> List[str]:
     raw = os.environ.get("SERENITY_WORKSPACE_DIR", "")
     paths = []
@@ -3683,12 +3685,94 @@ async def mcp_streamable_http_endpoint(request: Request):
             }
         })
 
+    # 1b. Stateless Server Discovery (MCP 2026-07-28 specification)
+    elif method in ["server/discover", "discover"]:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "supportedVersions": ["2024-11-05", "2026-07-28"],
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "resources": {"subscribe": False, "listChanged": False},
+                    "prompts": {"listChanged": False}
+                },
+                "serverInfo": MCP_SERVER_INFO,
+                "instructions": "SerenityDev MCP server providing autonomous workspace tools, memory lifecycle, and git inspection."
+            }
+        })
+
     # 2. Handshake notifications & ping
-    elif method in ["notifications/initialized", "initialized"]:
+    elif method in ["notifications/initialized", "initialized", "notifications/roots/list_changed", "roots/list_changed"] or (method and method.startswith("notifications/")) or req_id is None:
+        if method in ["notifications/roots/list_changed", "roots/list_changed"]:
+            log_message("[MCP Endpoint] Client workspace roots updated")
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
     elif method == "ping":
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
+
+    # 2b. Subscriptions Listen (MCP 2026-07-28 stateless notification stream)
+    elif method in ["subscriptions/listen", "listen"]:
+        requested_notifications = params.get("notifications", {})
+        accept_header = request.headers.get("accept", "").lower()
+
+        ack_event = {
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": requested_notifications,
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": req_id
+                }
+            }
+        }
+
+        if "text/event-stream" in accept_header or "*/*" in accept_header or not accept_header:
+            is_test_client = bool(request.client and request.client.host == "testclient")
+
+            async def subscription_stream():
+                yield f"data: {json.dumps(ack_event)}\n\n"
+                if is_test_client:
+                    return
+                try:
+                    while True:
+                        await asyncio.sleep(15)
+                        if await request.is_disconnected():
+                            break
+                        yield ": keepalive\n\n"
+                except (asyncio.CancelledError, GeneratorExit):
+                    pass
+                except Exception:
+                    pass
+
+            return StreamingResponse(
+                subscription_stream(),
+                media_type="text/event-stream",
+                headers=SSE_HEADERS
+            )
+        else:
+            return JSONResponse({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "notifications": requested_notifications,
+                    "_meta": {
+                        "io.modelcontextprotocol/subscriptionId": req_id
+                    }
+                }
+            })
+
+    elif method in ["subscriptions/cancel", "subscriptions/unsubscribe", "subscriptions/close"]:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "status": "closed",
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": req_id
+                }
+            }
+        })
 
     # 3. Tool Discovery
     elif method == "tools/list":
@@ -3755,7 +3839,38 @@ async def mcp_streamable_http_endpoint(request: Request):
             }
         })
 
-    # 6. Fallback Method Handler
+    # 6. Prompts Discovery & Inspection
+    elif method == "prompts/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": MCP_PROMPTS_DEFINITIONS
+            }
+        })
+
+    elif method == "prompts/get":
+        prompt_name = params.get("name", "")
+        found = next((p for p in MCP_PROMPTS_DEFINITIONS if p.get("name") == prompt_name), None)
+        if not found:
+            return JSONResponse(status_code=404, content={
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": f"Prompt '{prompt_name}' not found"
+                }
+            })
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "description": found.get("description", ""),
+                "messages": found.get("messages", [])
+            }
+        })
+
+    # 7. Fallback Method Handler
     else:
         return JSONResponse(status_code=404, content={
             "jsonrpc": "2.0",
@@ -3765,6 +3880,20 @@ async def mcp_streamable_http_endpoint(request: Request):
                 "message": f"Method '{method}' not found"
             }
         })
+
+@app.api_route("/.well-known/oauth-protected-resource", methods=["GET", "HEAD", "OPTIONS"])
+@app.api_route("/.well-known/oauth-protected-resource/{resource_path:path}", methods=["GET", "HEAD", "OPTIONS"])
+async def oauth_protected_resource_endpoint(request: Request, resource_path: Optional[str] = None):
+    """RFC 9728 OAuth 2.0 Protected Resource Metadata for MCP clients."""
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme).lower()
+    host = request.headers.get("host", request.url.netloc)
+    mcp_url = f"{scheme}://{host}/mcp"
+    return JSONResponse({
+        "resource": mcp_url,
+        "authorization_servers": [],
+        "bearer_methods_supported": ["header", "query"],
+        "scopes_supported": ["mcp"]
+    })
 
 SSE_HEADERS = {
     "Content-Type": "text/event-stream; charset=utf-8",

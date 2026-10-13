@@ -13,6 +13,7 @@ from serenitydevserver import (
     LongTermMemoryManager,
     MCP_SERVER_INFO,
     MCP_TOOLS_DEFINITIONS,
+    MCP_PROMPTS_DEFINITIONS,
     SerenityKeyVault,
     LOCAL_API_KEY
 )
@@ -338,6 +339,119 @@ class TestMCPLogic(unittest.TestCase):
         })
         self.assertEqual(res_invalid.status_code, 404)
         self.assertEqual(res_invalid.json()["error"]["code"], -32602)
+
+    def test_mcp_server_discover(self):
+        """Verify POST /mcp server/discover and discover methods return 200 with capabilities and versions."""
+        req = {
+            "jsonrpc": "2.0",
+            "id": 301,
+            "method": "server/discover"
+        }
+        res = self.client.post("/mcp", json=req)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["jsonrpc"], "2.0")
+        self.assertEqual(data["id"], 301)
+        self.assertIn("supportedVersions", data["result"])
+        self.assertIn("2026-07-28", data["result"]["supportedVersions"])
+        self.assertIn("tools", data["result"]["capabilities"])
+        self.assertIn("prompts", data["result"]["capabilities"])
+        self.assertEqual(data["result"]["serverInfo"]["name"], MCP_SERVER_INFO["name"])
+
+        # Alias test: discover
+        res_alias = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 302, "method": "discover"})
+        self.assertEqual(res_alias.status_code, 200)
+        self.assertEqual(res_alias.json()["id"], 302)
+
+    def test_mcp_prompts_list_and_get(self):
+        """Verify prompts/list returns registered prompts and prompts/get handles missing."""
+        # 1. prompts/list
+        res = self.client.post("/mcp", json={"jsonrpc": "2.0", "id": 401, "method": "prompts/list"})
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["result"]["prompts"], MCP_PROMPTS_DEFINITIONS)
+
+        # 2. prompts/get for nonexistent prompt -> 404 with -32602
+        res_get = self.client.post("/mcp", json={
+            "jsonrpc": "2.0",
+            "id": 402,
+            "method": "prompts/get",
+            "params": {"name": "non_existent_prompt"}
+        })
+        self.assertEqual(res_get.status_code, 404)
+        self.assertEqual(res_get.json()["error"]["code"], -32602)
+
+    def test_mcp_notifications_roots_list_changed(self):
+        """Verify notifications/roots/list_changed and generic notifications with id=None return 200."""
+        # 1. notifications/roots/list_changed notification
+        res1 = self.client.post("/mcp", json={
+            "jsonrpc": "2.0",
+            "method": "notifications/roots/list_changed"
+        })
+        self.assertEqual(res1.status_code, 200)
+        self.assertEqual(res1.json()["result"], {})
+
+        # 2. Any client notification where id is omitted/None
+        res2 = self.client.post("/mcp", json={
+            "jsonrpc": "2.0",
+            "method": "notifications/custom_event"
+        })
+        self.assertEqual(res2.status_code, 200)
+        self.assertEqual(res2.json()["result"], {})
+
+    def test_mcp_oauth_protected_resource(self):
+        """Verify RFC 9728 /.well-known/oauth-protected-resource metadata endpoints."""
+        # 1. Base endpoint
+        res1 = self.client.get("/.well-known/oauth-protected-resource")
+        self.assertEqual(res1.status_code, 200)
+        data1 = res1.json()
+        self.assertTrue(data1["resource"].endswith("/mcp"))
+        self.assertEqual(data1["authorization_servers"], [])
+        self.assertIn("header", data1["bearer_methods_supported"])
+
+        # 2. Resource-suffixed endpoint (e.g. /.well-known/oauth-protected-resource/mcp)
+        res2 = self.client.get("/.well-known/oauth-protected-resource/mcp?token=test_token_123")
+        self.assertEqual(res2.status_code, 200)
+        data2 = res2.json()
+        self.assertTrue(data2["resource"].endswith("/mcp"))
+
+    def test_mcp_subscriptions_listen_and_cancel(self):
+        """Verify subscriptions/listen returns SSE stream or JSON ack, and subscriptions/cancel closes."""
+        req = {
+            "jsonrpc": "2.0",
+            "id": 501,
+            "method": "subscriptions/listen",
+            "params": {
+                "notifications": {
+                    "toolsListChanged": True
+                }
+            }
+        }
+        # 1. SSE streaming subscriptions/listen
+        res_sse = self.client.post("/mcp", json=req, headers={"Accept": "text/event-stream"})
+        self.assertEqual(res_sse.status_code, 200)
+        self.assertIn("text/event-stream", res_sse.headers.get("content-type", ""))
+        self.assertIn("notifications/subscriptions/acknowledged", res_sse.text)
+        self.assertIn("501", res_sse.text)
+
+        # 2. JSON-only subscriptions/listen
+        res_json = self.client.post("/mcp", json=req, headers={"Accept": "application/json"})
+        self.assertEqual(res_json.status_code, 200)
+        data = res_json.json()
+        self.assertEqual(data["id"], 501)
+        self.assertTrue(data["result"]["notifications"]["toolsListChanged"])
+        self.assertEqual(data["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 501)
+
+        # 3. subscriptions/cancel
+        cancel_req = {
+            "jsonrpc": "2.0",
+            "id": 502,
+            "method": "subscriptions/cancel",
+            "params": {"subscriptionId": 501}
+        }
+        res_cancel = self.client.post("/mcp", json=cancel_req)
+        self.assertEqual(res_cancel.status_code, 200)
+        self.assertEqual(res_cancel.json()["result"]["status"], "closed")
 
     def test_native_mcp_helpers(self):
         """Verify get_all_local_ips and start_native_mcp network functions."""
